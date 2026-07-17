@@ -430,11 +430,28 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	if (resource_ok && descriptor_ok && encoding_ok && format_ok && size != 0) {
 		return;
 	}
+	const bool shape_2d =
+	    resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D &&
+	    descriptor.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) &&
+	    descriptor.Depth() == 0;
+	const bool standard4_format = TileIsStandard4KBTextureSupported(descriptor.Format());
+	const bool tile_ok = descriptor.TileMode() == Prospero::GpuEnumValue(Prospero::TileMode::kLinear) ||
+	                     descriptor.TileMode() ==
+	                         Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) ||
+	                     (descriptor.TileMode() ==
+	                          Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB) &&
+	                      standard4_format);
+	const bool swizzle_ok =
+	    IsSupportedStorageSwizzle(descriptor.Format(), descriptor.DstSelXYZW()) &&
+	    (descriptor.DstSelXYZW() == DstSel(4, 5, 6, 7) || !resource.read);
 	EXIT("unsupported storage texture: resource=%d descriptor=%d encoding=%d format=%d "
 	     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
 	     " extent=%ux%ux%u type=%u format=%u tile=%u swizzle=0x%03x"
 	     " kind=%u dimension=%u mip_mode=%u base_level=%u last_level=%u max_mip=%u min_lod=%u"
-	     " read=%d written=%d atomic=%d\n",
+	     " read=%d written=%d atomic=%d"
+	     " gates(shape2d/tile/std4/swizzle)=%d/%d/%d/%d"
+	     " base_array=%u bc_swizzle=%u msaa_depth=%d"
+	     " fields=%08x/%08x/%08x/%08x/%08x/%08x/%08x/%08x\n",
 	     resource_ok, descriptor_ok, encoding_ok, format_ok, descriptor.Base40(), size,
 	     static_cast<uint32_t>(descriptor.Width5()) + 1u,
 	     static_cast<uint32_t>(descriptor.Height5()) + 1u,
@@ -442,7 +459,10 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	     descriptor.TileMode(), descriptor.DstSelXYZW(), static_cast<uint32_t>(resource.kind),
 	     static_cast<uint32_t>(resource.dimension), static_cast<uint32_t>(resource.mip_mode),
 	     descriptor.BaseLevel(), descriptor.LastLevel(), descriptor.MaxMip(), descriptor.MinLod(),
-	     resource.read, resource.written, resource.atomic);
+	     resource.read, resource.written, resource.atomic, shape_2d, tile_ok, standard4_format,
+	     swizzle_ok, descriptor.BaseArray5(), descriptor.BCSwizzle(), descriptor.MsaaDepth(),
+	     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
+	     descriptor.fields[4], descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
 }
 
 void ValidateMetadataReuseTexture(const ShaderRecompiler::IR::ImageResource& resource,

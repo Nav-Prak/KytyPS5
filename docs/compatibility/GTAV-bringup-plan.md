@@ -18,16 +18,22 @@ Status on 2026-07-17:
 
 - The loader enters guest main and the title completes substantial platform and asset
   initialization.
-- The renderer compiled nine observed shaders, executed hundreds of graphics dispatches in the
-  diagnostic run, streamed assets, and reached a 3840x2160 display-buffer render.
-- A 55-second trace-free run remained alive without a fatal error. Visual correctness, menu input,
-  and Story Mode entry have not yet been verified, so M3 and later milestones remain open.
+- The title renders its logos, language and calibration screens, front-end artwork, Story/Online
+  tabs, and settings pages. Controller navigation works and observed frame rates range from roughly
+  17 to 60 FPS. M3 is achieved; M4 remains partial until audio is verified.
+- Some front-end glyphs are missing or fragmented even though surrounding text and artwork render
+  correctly. This remains a separate graphics correctness issue.
+- Selecting Story Mode reached a deliberate guest fatal assertion after `sceKernelBatchMap`
+  returned `KERNEL_ERROR_ENOMEM` for a null-address direct-memory entry. The batch mapper now treats
+  a null address as an allocation request while preserving fixed placement for explicit addresses.
+  Two automated replays survived past the former assertion, but the automated environment could
+  not expose the SDL window; reaching player control still requires a visible M5 retest.
 - `VideoRecordingP_v1` is still an unresolved called stub. It has not yet been shown to block the
   offline startup path.
 - The host used for this run did not expose an SDL/WASAPI audio endpoint. Kyty continued with its
   timing fallback, so audible output remains untested.
 
-Three deterministic compatibility blockers were fixed generically during the first session:
+Four deterministic compatibility blockers were fixed generically during the first session:
 
 1. A host reservation occupied GTA V's fixed guest mapping range. Windows builds now reserve a
    bounded placeholder arena for fixed guest mappings and can transactionally replace overlapping
@@ -39,6 +45,9 @@ Three deterministic compatibility blockers were fixed generically during the fir
    `DECOMPRESS_ON_N_ZPLANES=5`. Kyty maps that exact control preset to its existing
    `SW_64KB_Z_X` depth representation while retaining strict rejection for other unsupported depth
    layouts.
+4. `sceKernelBatchMap` supplies fixed semantics for a batch that can contain null-address map
+   entries. Null direct and flexible map addresses now allow kernel-selected placement; non-null
+   addresses remain fixed. A focused direct-memory batch-map regression covers the distinction.
 
 Focused virtual-memory, image-alias, shared-tracker-page, and depth-preset regressions cover these
 changes. Raw logs and local paths remain outside the repository.

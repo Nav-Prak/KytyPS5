@@ -821,6 +821,42 @@ void TestFixedReserveReplacesPartialDirectMapping() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestBatchMapAllocatesNullDirectAddress() {
+	const char* test = "BatchMapAllocatesNullDirectAddress";
+
+	int64_t phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+	            SceKernelPageSize, SceKernelPageSize, SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+
+	Libs::LibKernel::Memory::KernelBatchMapEntry entry {};
+	entry.start      = nullptr;
+	entry.offset     = static_cast<uint64_t>(phys_addr);
+	entry.length     = SceKernelPageSize;
+	entry.protection = SceKernelProtCpuRw;
+	entry.operation  = 0;
+
+	int processed = -1;
+	CheckOk(test, Libs::LibKernel::Memory::KernelBatchMap(&entry, 1, &processed),
+	        "KernelBatchMap");
+	Check(test, processed == 1, "batch map did not report the mapped entry");
+	Check(test, entry.start != nullptr, "batch map left a null allocation address");
+
+	const auto base = reinterpret_cast<uint64_t>(entry.start);
+	ExpectRange(test, Query(test, base), base, base + SceKernelPageSize, SceKernelProtCpuRw, 0, 1,
+	            0, 1, "anon", static_cast<uint64_t>(phys_addr));
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize),
+	        "KernelMunmap");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, SceKernelPageSize),
+	        "KernelReleaseDirectMemory");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestFixedDirectReplacesPartialPlaceholderFlexibleMapping() {
 	const char*        test       = "FixedDirectReplacesPartialPlaceholderFlexibleMapping";
 	constexpr uint64_t part_size  = SceKernelPageSize * 32;
@@ -1614,6 +1650,7 @@ int main() {
 	RunTest(TestReleasedReserveCanBeReused);
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
+	RunTest(TestBatchMapAllocatesNullDirectAddress);
 	RunTest(TestNonzeroDirectOffsetAliasesSharedBacking);
 	RunTest(TestDirectPhysicalFreeRangeReuseAndCoalescing);
 	RunTest(TestDirectAlignmentStaysWithinSearchRange);

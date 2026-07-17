@@ -15,6 +15,7 @@
 #include <array>
 #include <atomic>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -3715,6 +3716,7 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 		MAP_OP_MAP_FLEXIBLE = 3,
 		MAP_OP_TYPE_PROTECT = 4,
 	};
+	constexpr int MAP_FIXED = 0x10;
 
 	if (entries == nullptr || num_entries < 0) {
 		return KERNEL_ERROR_EINVAL;
@@ -3737,10 +3739,13 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 		}
 
 		int result = OK;
+		// A null map address is an allocation request even when sceKernelBatchMap supplies
+		// MAP_FIXED for the batch. Preserve fixed placement for every explicit address.
+		const int map_flags = (entry->start == nullptr ? flags & ~MAP_FIXED : flags);
 		switch (entry->operation) {
 			case MAP_OP_MAP_DIRECT:
 				result = KernelMapNamedDirectMemory(&entry->start, entry->length, entry->protection,
-				                                    flags, static_cast<int64_t>(entry->offset), 0,
+				                                    map_flags, static_cast<int64_t>(entry->offset), 0,
 				                                    "anon");
 				break;
 			case MAP_OP_UNMAP:
@@ -3751,7 +3756,7 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 				break;
 			case MAP_OP_MAP_FLEXIBLE:
 				result = KernelMapNamedFlexibleMemory(&entry->start, entry->length,
-				                                      entry->protection, flags, "anon");
+				                                      entry->protection, map_flags, "anon");
 				break;
 			case MAP_OP_TYPE_PROTECT:
 				result =
@@ -3761,6 +3766,17 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 		}
 
 		if (result != OK) {
+			std::fprintf(stderr,
+			             "KernelBatchMap2 failed: result=0x%08" PRIx32
+			             " index=%d processed=%d count=%d flags=0x%08" PRIx32
+			             " start=%p offset=0x%016" PRIx64 " length=0x%016" PRIx64
+			             " protection=0x%02" PRIx32 " type=0x%02" PRIx32 " operation=%d\n",
+			             static_cast<uint32_t>(result), i, processed, num_entries,
+			             static_cast<uint32_t>(flags), entry->start, entry->offset, entry->length,
+			             static_cast<uint32_t>(static_cast<unsigned char>(entry->protection)),
+			             static_cast<uint32_t>(static_cast<unsigned char>(entry->type)),
+			             entry->operation);
+			std::fflush(stderr);
 			if (num_entries_out != nullptr) {
 				*num_entries_out = processed;
 			}

@@ -2238,10 +2238,14 @@ RenderTextureVulkanImage* TextureCache::FindRenderTarget(CommandBuffer*         
 		TileSizeAlign layout {};
 		TileGetTextureSize(format, info.width, info.height, expected_pitch, info.levels,
 		                   info.tile_mode, &layout, nullptr, nullptr);
-		if (expected_pitch != info.pitch || layout.align != 65536 || layout.size != info.size) {
+		const auto expected_size = static_cast<uint64_t>(layout.size) * info.layers;
+		if (expected_pitch != info.pitch || layout.align != 65536 ||
+		    expected_size != info.size) {
 			EXIT("TextureCache: invalid Standard64KB render-target layout,"
-			     " size=0x%016" PRIx64 " expected=0x%08x align=0x%08x pitch=%u/%u\n",
-			     info.size, layout.size, layout.align, info.pitch, expected_pitch);
+			     " size=0x%016" PRIx64 " expected=0x%016" PRIx64
+			     " slice=0x%08x layers=%u align=0x%08x pitch=%u/%u\n",
+			     info.size, expected_size, layout.size, info.layers, layout.align, info.pitch,
+			     expected_pitch);
 		}
 	}
 	const auto rows = static_cast<uint64_t>(info.height - 1);
@@ -3538,7 +3542,7 @@ void TextureCache::SynchronizeColorImageToBufferLocked(CachedImage& cached) {
 	TileSizeAlign exact {};
 	bool          single_slice = false;
 	if (IsSupportedStandard64RenderTarget(target)) {
-		exact        = {static_cast<uint32_t>(target.size), 65536};
+		exact        = {static_cast<uint32_t>(target.size / target.layers), 65536};
 		single_slice = true;
 	} else {
 		single_slice = TileGetRenderTargetSize(target.width, target.height, target.pitch,

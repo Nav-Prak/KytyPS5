@@ -34,13 +34,19 @@ Status on 2026-07-17:
   the bound Vulkan storage view, while retaining strict rejection for genuine multi-mip storage
   and read/write non-identity swizzles. The following resource used the same contract with a
   Standard4KB tile. Storage upload, binding, and coherent guest readback now support that one-level
-  layout as well. A visible M5 retest is pending.
+  layout as well. A visible retest cleared these storage-image blockers and reached 40% of Story
+  Mode loading.
+- GTA V then selected array layer 3 from a four-layer Standard64KB color target. Kyty now preserves
+  the full array backing while creating a single-layer attachment view and applies the existing
+  Standard64KB upload/readback tiler independently to each slice. Exact pitch, per-slice size,
+  total size, metadata, sample-count, and mip-count guards remain enforced. A visible retest of
+  this new path is pending.
 - `VideoRecordingP_v1` is still an unresolved called stub. It has not yet been shown to block the
   offline startup path.
 - The host used for this run did not expose an SDL/WASAPI audio endpoint. Kyty continued with its
   timing fallback, so audible output remains untested.
 
-Four deterministic compatibility blockers were fixed generically during the first session:
+Seven deterministic compatibility blockers have been fixed generically during bring-up:
 
 1. A host reservation occupied GTA V's fixed guest mapping range. Windows builds now reserve a
    bounded placeholder arena for fixed guest mappings and can transactionally replace overlapping
@@ -62,6 +68,9 @@ Four deterministic compatibility blockers were fixed generically during the firs
 6. One-level Standard4KB storage images now use the existing PS5 detiler on upload and a matching
    inverse tiler on GPU-to-guest readback. A deterministic `R8G8B8A8_UINT` round trip covers the exact
    layout class used during Story Mode loading.
+7. Standard64KB color-target arrays now reuse the established Vulkan array-image, attachment-view,
+   upload, and readback paths. A four-layer round trip and the observed layer-3 view contract guard
+   against slice crossing and accidental footprint relaxation.
 
 Focused virtual-memory, image-alias, shared-tracker-page, and depth-preset regressions cover these
 changes. Raw logs and local paths remain outside the repository.

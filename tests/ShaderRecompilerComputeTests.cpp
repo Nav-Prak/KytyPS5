@@ -10130,11 +10130,41 @@ void CheckStandard64RenderTargetTileRoundTrip() {
   Require("Standard64RenderTarget", "mip guard",
           !IsSupportedStandard64RenderTarget(unsupported),
           "unimplemented Standard64KB mip chain was accepted");
-  unsupported = info;
-  unsupported.layers = 2;
-  Require("Standard64RenderTarget", "layer guard",
+
+  constexpr uint32_t layers = 4;
+  auto layered = info;
+  layered.size *= layers;
+  layered.layers = layers;
+  Require("Standard64RenderTarget", "layered support boundary",
+          IsSupportedStandard64RenderTarget(layered) &&
+              IsTiledRenderTarget(layered),
+          "exact layered Standard64KB render target was not accepted");
+  unsupported = layered;
+  unsupported.size -= storage.size;
+  Require("Standard64RenderTarget", "layered size guard",
           !IsSupportedStandard64RenderTarget(unsupported),
-          "unimplemented Standard64KB array was accepted");
+          "truncated Standard64KB array backing was accepted");
+  const auto slice_view = ResolveTargetViewInfo(3, 3);
+  Require("Standard64RenderTarget", "array slice view",
+          slice_view.type == TargetViewType::Image2D &&
+              slice_view.base_layer == 3 && slice_view.layer_count == 1 &&
+              slice_view.image_layers == layers,
+          "single-slice render-target view lost its four-layer backing");
+  const auto layered_upload = TextureCalcUploadLayout(
+      format, width, height, 1, layers, pitch, tile, layered.size, false,
+      false, false, "Standard64RenderTarget test");
+  const auto layered_regions = TextureBuildUploadRegions(
+      layered_upload, info.format, width, height, layers, 1, true, false,
+      TextureUploadDestination::MipLevels,
+      TextureUploadSliceLayout::MipChainPerSlice);
+  Require("Standard64RenderTarget", "layered upload regions",
+          layered_upload.fmt_tiled_standard64kb &&
+              layered_upload.slice_stride == storage.size &&
+              layered_regions.size() == layers &&
+              layered_regions[0].offset == 0 &&
+              layered_regions[3].offset == storage.size * 3 &&
+              layered_regions[3].dst_layer == 3,
+          "Standard64KB upload layout did not preserve array-slice offsets");
 
   std::vector<uint32_t> linear(storage.size / sizeof(uint32_t), 0);
   for (uint32_t y = 0; y < height; y++) {
@@ -10159,6 +10189,39 @@ void CheckStandard64RenderTargetTileRoundTrip() {
   Require("Standard64RenderTarget", "padding",
           tiled.back() == 0,
           "Standard64KB render-target conversion retained stale padding");
+
+  std::vector<uint32_t> layered_linear(layered.size / sizeof(uint32_t), 0);
+  for (uint32_t layer = 0; layer < layers; layer++) {
+    for (uint32_t y = 0; y < height; y++) {
+      for (uint32_t x = 0; x < width; x++) {
+        layered_linear[static_cast<uint64_t>(storage.size / sizeof(uint32_t)) * layer +
+                       static_cast<uint64_t>(y) * pitch + x] =
+            (layer * 0x45d9f3bu) ^ (y * 0x1f123bb5u) ^
+            (x * 0x9e3779b9u) ^ 0xa55a3cc3u;
+      }
+    }
+  }
+  std::vector<uint32_t> layered_tiled(layered_linear.size(), 0xcdcdcdcdu);
+  std::vector<uint32_t> layered_restored(layered_linear.size(), 0xa5a5a5a5u);
+  tiler.TileImage(layered_tiled.data(), layered_linear.data(), layered);
+  for (uint32_t layer = 0; layer < layers; layer++) {
+    const auto slice_words = storage.size / sizeof(uint32_t);
+    TileConvertTiledToLinearStandard64KB32(
+        layered_restored.data() + slice_words * layer,
+        layered_tiled.data() + slice_words * layer, width, height, pitch,
+        storage.size);
+    for (uint32_t y = 0; y < height; y++) {
+      const auto row = slice_words * layer + static_cast<uint64_t>(y) * pitch;
+      Require("Standard64RenderTarget", "layered round trip",
+              std::memcmp(layered_linear.data() + row,
+                          layered_restored.data() + row,
+                          width * sizeof(uint32_t)) == 0,
+              "Standard64KB render-target conversion crossed array slices");
+    }
+  }
+  Require("Standard64RenderTarget", "layered padding",
+          layered_tiled.back() == 0,
+          "layered Standard64KB conversion retained stale padding");
 
   constexpr uint32_t block_width = 128;
   constexpr uint32_t block_height = 128;

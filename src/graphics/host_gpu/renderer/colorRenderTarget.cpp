@@ -402,8 +402,7 @@ void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 	}
 	if (standard64 &&
 	    (rt.attrib3.dimension != 1 || rt.attrib3.depth != 0 || levels != 1 ||
-	     rt.view.current_mip_level != 0 ||
-	     view.base_layer != 0 || view.image_layers != 1 || rt.attrib.num_samples != 0 ||
+	     rt.view.current_mip_level != 0 || rt.attrib.num_samples != 0 ||
 	     rt.attrib.num_fragments != 0 || bytes_per_element != 4 ||
 	     rt.pitch.pitch_div8_minus1 != 0 || (rt.base.addr & 0xffffu) != 0 ||
 	     rt.info.fmask_compression_enable || rt.info.fmask_data_compression_disable ||

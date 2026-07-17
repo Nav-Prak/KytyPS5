@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/objects/textureCommon.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -21,7 +22,8 @@ RenderTargetFormatInfo TextureGetRenderTargetFormat(uint32_t raw_layout, uint32_
 	const auto layout = static_cast<Prospero::ChannelLayout>(raw_layout);
 	const auto type   = static_cast<Prospero::ChannelType>(raw_type);
 	const auto order  = static_cast<Prospero::ChannelOrder>(raw_order);
-	const auto is     = [=](Prospero::ChannelLayout l, Prospero::ChannelType t, Prospero::ChannelOrder o) {
+	const auto is     = [=](Prospero::ChannelLayout l, Prospero::ChannelType t,
+	                        Prospero::ChannelOrder o) {
 		return layout == l && type == t && order == o;
 	};
 
@@ -29,79 +31,104 @@ RenderTargetFormatInfo TextureGetRenderTargetFormat(uint32_t raw_layout, uint32_
 	    raw_order <= Prospero::GpuEnumValue(Prospero::ChannelOrder::kAltReversed)) {
 		return {VK_FORMAT_R8_UNORM, 1};
 	}
-	if (is(Prospero::ChannelLayout::k8_8, Prospero::ChannelType::kUNorm, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k8_8, Prospero::ChannelType::kUNorm,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R8G8_UNORM, 2};
 	}
-	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kUNorm, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kUNorm,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R8G8B8A8_UNORM, 4};
 	}
-	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kSNorm, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kSNorm,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R8G8B8A8_SNORM, 4};
 	}
-	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kSrgb, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kSrgb,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R8G8B8A8_SRGB, 4};
 	}
-	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kUNorm, Prospero::ChannelOrder::kAlt)) {
+	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kUNorm,
+	       Prospero::ChannelOrder::kAlt)) {
 		return {VK_FORMAT_B8G8R8A8_UNORM, 4};
 	}
-	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kSNorm, Prospero::ChannelOrder::kAlt)) {
+	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kSNorm,
+	       Prospero::ChannelOrder::kAlt)) {
 		return {VK_FORMAT_B8G8R8A8_SNORM, 4};
 	}
-	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kSrgb, Prospero::ChannelOrder::kAlt)) {
+	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kSrgb,
+	       Prospero::ChannelOrder::kAlt)) {
 		return {VK_FORMAT_B8G8R8A8_SRGB, 4};
 	}
-	if (is(Prospero::ChannelLayout::k5_5_5_1, Prospero::ChannelType::kUNorm, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k5_5_5_1, Prospero::ChannelType::kUNorm,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R5G5B5A1_UNORM_PACK16, 2};
 	}
-	if (is(Prospero::ChannelLayout::k4_4_4_4, Prospero::ChannelType::kUNorm, Prospero::ChannelOrder::kReversed)) {
+	if (is(Prospero::ChannelLayout::k4_4_4_4, Prospero::ChannelType::kUNorm,
+	       Prospero::ChannelOrder::kReversed)) {
 		return {VK_FORMAT_B4G4R4A4_UNORM_PACK16, 2};
 	}
-	if (is(Prospero::ChannelLayout::k10_10_10_2, Prospero::ChannelType::kUNorm, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k10_10_10_2, Prospero::ChannelType::kUNorm,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_A2B10G10R10_UNORM_PACK32, 4};
 	}
-	if (is(Prospero::ChannelLayout::k10_10_10_2, Prospero::ChannelType::kUNorm, Prospero::ChannelOrder::kAlt)) {
+	if (is(Prospero::ChannelLayout::k10_10_10_2, Prospero::ChannelType::kUNorm,
+	       Prospero::ChannelOrder::kAlt)) {
 		return {VK_FORMAT_A2R10G10B10_UNORM_PACK32, 4};
 	}
-	if (is(Prospero::ChannelLayout::k11_11_10, Prospero::ChannelType::kFloat, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k11_11_10, Prospero::ChannelType::kFloat,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_B10G11R11_UFLOAT_PACK32, 4};
 	}
-	if (is(Prospero::ChannelLayout::k16, Prospero::ChannelType::kUNorm, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k16, Prospero::ChannelType::kUNorm,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R16_UNORM, 2};
 	}
-	if (is(Prospero::ChannelLayout::k16, Prospero::ChannelType::kUInt, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k16, Prospero::ChannelType::kUInt,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R16_UINT, 2};
 	}
-	if (is(Prospero::ChannelLayout::k16, Prospero::ChannelType::kFloat, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k16, Prospero::ChannelType::kFloat,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R16_SFLOAT, 2};
 	}
-	if (is(Prospero::ChannelLayout::k16_16, Prospero::ChannelType::kUNorm, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k16_16, Prospero::ChannelType::kUNorm,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R16G16_UNORM, 4};
 	}
-	if (is(Prospero::ChannelLayout::k16_16, Prospero::ChannelType::kSNorm, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k16_16, Prospero::ChannelType::kSNorm,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R16G16_SNORM, 4};
 	}
-	if (is(Prospero::ChannelLayout::k16_16, Prospero::ChannelType::kUInt, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k16_16, Prospero::ChannelType::kUInt,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R16G16_UINT, 4};
 	}
-	if (is(Prospero::ChannelLayout::k16_16, Prospero::ChannelType::kFloat, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k16_16, Prospero::ChannelType::kFloat,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R16G16_SFLOAT, 4};
 	}
-	if (is(Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kUNorm, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kUNorm,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R16G16B16A16_UNORM, 8};
 	}
-	if (is(Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R16G16B16A16_SFLOAT, 8};
 	}
-	if (is(Prospero::ChannelLayout::k32, Prospero::ChannelType::kFloat, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k32, Prospero::ChannelType::kFloat,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R32_SFLOAT, 4};
 	}
-	if (is(Prospero::ChannelLayout::k32_32, Prospero::ChannelType::kUInt, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k32_32, Prospero::ChannelType::kUInt,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R32G32_UINT, 8};
 	}
-	if (is(Prospero::ChannelLayout::k32_32, Prospero::ChannelType::kFloat, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k32_32, Prospero::ChannelType::kFloat,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R32G32_SFLOAT, 8};
 	}
-	if (is(Prospero::ChannelLayout::k32_32_32_32, Prospero::ChannelType::kFloat, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k32_32_32_32, Prospero::ChannelType::kFloat,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R32G32B32A32_SFLOAT, 16};
 	}
 	EXIT("unsupported render-target format combination: layout=%u type=%u order=%u\n", raw_layout,
@@ -450,7 +477,8 @@ bool TextureIsCubeTexture(uint64_t type) {
 
 bool TextureIsLayeredTexture(uint64_t type) {
 	const auto image_type = static_cast<Prospero::ImageType>(type);
-	return image_type == Prospero::ImageType::kCube || image_type == Prospero::ImageType::kColor1DArray ||
+	return image_type == Prospero::ImageType::kCube ||
+	       image_type == Prospero::ImageType::kColor1DArray ||
 	       image_type == Prospero::ImageType::kColor2DArray ||
 	       image_type == Prospero::ImageType::kColor2DMsaaArray;
 }
@@ -661,17 +689,71 @@ static uint64_t CalcTextureSliceStride(const TileSizeOffset* level_sizes, uint64
 }
 
 static uint64_t CalcLinearUploadLevelSize(uint32_t fmt, uint32_t pitch, uint32_t height) {
-	if (const uint32_t bytes_per_element = Prospero::NumBytesPerElement(fmt); bytes_per_element != 0) {
+	if (const uint32_t bytes_per_element = Prospero::NumBytesPerElement(fmt);
+	    bytes_per_element != 0) {
 		return static_cast<uint64_t>(pitch) * height * bytes_per_element;
 	}
 
-	if (const uint32_t bytes_per_block = Prospero::BlockCompressedBytesPerBlock(fmt); bytes_per_block != 0) {
+	if (const uint32_t bytes_per_block = Prospero::BlockCompressedBytesPerBlock(fmt);
+	    bytes_per_block != 0) {
 		const uint32_t blocks_w = std::max((pitch + 3u) / 4u, 1u);
 		const uint32_t blocks_h = std::max((height + 3u) / 4u, 1u);
 		return static_cast<uint64_t>(blocks_w) * blocks_h * bytes_per_block;
 	}
 
 	return 0;
+}
+
+static uint64_t HashBytesFnv1a(const void* data, uint64_t size) {
+	constexpr uint64_t offset_basis = 14695981039346656037ull;
+	constexpr uint64_t prime        = 1099511628211ull;
+
+	auto        hash  = offset_basis;
+	const auto* bytes = static_cast<const uint8_t*>(data);
+	for (uint64_t i = 0; i < size; i++) {
+		hash ^= bytes[i];
+		hash *= prime;
+	}
+	return hash;
+}
+
+static uint64_t HashLinearUploadRegions(const void* data, uint64_t size,
+                                        const std::vector<BufferImageCopy>& regions, uint32_t fmt) {
+	constexpr uint64_t offset_basis = 14695981039346656037ull;
+	constexpr uint64_t prime        = 1099511628211ull;
+
+	const uint32_t bytes_per_block = Prospero::BlockCompressedBytesPerBlock(fmt);
+	const uint32_t bytes_per_texel = Prospero::NumBytesPerElement(fmt);
+	if (bytes_per_block == 0 && bytes_per_texel == 0) {
+		return 0;
+	}
+
+	auto        hash  = offset_basis;
+	const auto* bytes = static_cast<const uint8_t*>(data);
+	for (const auto& region: regions) {
+		const uint32_t copy_height = (region.copy_height != 0 ? region.copy_height : region.height);
+		const uint64_t row_size =
+		    (bytes_per_block != 0
+		         ? static_cast<uint64_t>((region.width + 3u) / 4u) * bytes_per_block
+		         : static_cast<uint64_t>(region.width) * bytes_per_texel);
+		const uint64_t row_stride =
+		    (bytes_per_block != 0
+		         ? static_cast<uint64_t>((region.pitch + 3u) / 4u) * bytes_per_block
+		         : static_cast<uint64_t>(region.pitch) * bytes_per_texel);
+		const uint32_t rows = (bytes_per_block != 0 ? (copy_height + 3u) / 4u : copy_height);
+
+		for (uint32_t y = 0; y < rows; y++) {
+			const uint64_t offset = static_cast<uint64_t>(region.offset) + y * row_stride;
+			if (offset > size || row_size > size - offset) {
+				return 0;
+			}
+			for (uint64_t x = 0; x < row_size; x++) {
+				hash ^= bytes[offset + x];
+				hash *= prime;
+			}
+		}
+	}
+	return hash;
 }
 
 static uint64_t FillVolumeLinearUploadLevels(TileSizeOffset* level_sizes, uint32_t fmt,
@@ -734,7 +816,8 @@ TextureUploadLayout TextureCalcUploadLayout(uint32_t fmt, uint64_t width, uint64
 			    (TileIsStandard64KBTextureSupported(static_cast<uint32_t>(fmt)) &&
 			     tile_mode == Prospero::TileMode::kStandard64KB);
 			layout.fmt_tiled_depth =
-			    (allow_depth_tile && Prospero::RenderTargetBytesPerElement(static_cast<uint32_t>(fmt)) != 0 &&
+			    (allow_depth_tile &&
+			     Prospero::RenderTargetBytesPerElement(static_cast<uint32_t>(fmt)) != 0 &&
 			     tile_mode == Prospero::TileMode::kDepth);
 			if (!layout.fmt_tiled_render_target && !layout.fmt_tiled_standard256b &&
 			    !layout.fmt_tiled_standard4kb && !layout.fmt_tiled_standard64kb &&
@@ -824,7 +907,8 @@ TextureBuildUploadRegions(const TextureUploadLayout& layout, VkFormat image_form
 			if (layout.fmt_tiled_depth && layout.level_sizes[i].x != 0) {
 				regions[region_index].pitch = layout.level_sizes[i].x;
 			} else if (!layout.volume_texture &&
-			           static_cast<Prospero::TileMode>(layout.tile) == Prospero::TileMode::kLinear &&
+			           static_cast<Prospero::TileMode>(layout.tile) ==
+			               Prospero::TileMode::kLinear &&
 			           layout.padded_sizes[i].width != 0) {
 				regions[region_index].pitch = layout.padded_sizes[i].width;
 			} else {
@@ -955,7 +1039,8 @@ void TextureUploadGuestImage(GraphicContext* ctx, VulkanImage* vk_obj, const voi
 			UploadFmaskIdentity(ctx, vk_obj, regions, dst_layout, owner);
 			return;
 		}
-		const uint32_t bytes_per_element = Prospero::RenderTargetBytesPerElement(static_cast<uint32_t>(fmt));
+		const uint32_t bytes_per_element =
+		    Prospero::RenderTargetBytesPerElement(static_cast<uint32_t>(fmt));
 		if (bytes_per_element == 1) {
 			UtilFillImage(ctx, vk_obj, src_data, size, regions, dst_layout);
 		} else {
@@ -1094,7 +1179,29 @@ void TextureUploadGuestImage(GraphicContext* ctx, VulkanImage* vk_obj, const voi
 				    layout.level_sizes[i].x, layout.level_sizes[i].y);
 			}
 		}
+		if (Config::GraphicsDebugDumpEnabled()) {
+			LOGF("%s: Standard64KB upload fingerprint: fmt=%u extent=%" PRIu64 "x%" PRIu64
+			     " pitch=%u source_bytes=%" PRIu64 " source_fnv1a=0x%016" PRIx64
+			     " linear_fnv1a=0x%016" PRIx64 "\n",
+			     owner, static_cast<uint32_t>(fmt), width, height, layout.pitch, size,
+			     HashBytesFnv1a(src_data, size),
+			     HashLinearUploadRegions(temp_buf.Data(), size, regions, fmt));
+		}
 		UtilFillImage(ctx, vk_obj, temp_buf.Data(), size, regions, dst_layout);
+		if (Config::GraphicsDebugDumpEnabled() &&
+		    Prospero::BlockCompressedBytesPerBlock(fmt) != 0 && levels == 1 && depth == 1 &&
+		    vk_obj->extent.width == width && vk_obj->extent.height == height) {
+			static std::atomic_uint readback_count {0};
+			if (readback_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+				std::vector<uint8_t> readback(size, 0);
+				UtilFillBuffer(ctx, readback.data(), size, layout.pitch, vk_obj, dst_layout);
+				LOGF("%s: Standard64KB GPU readback fingerprint: image=%p fmt=%u extent=%" PRIu64
+				     "x%" PRIu64 " pitch=%u gpu_fnv1a=0x%016" PRIx64 "\n",
+				     owner, reinterpret_cast<void*>(vk_obj->image), static_cast<uint32_t>(fmt),
+				     width, height, layout.pitch,
+				     HashLinearUploadRegions(readback.data(), size, regions, fmt));
+			}
+		}
 	} else if (layout.tile != 0) {
 		EXIT("%s: typed tiled upload still unsupported after sizing, using linear fallback: fmt=%u "
 		     "tile=%u size=%" PRIu64 " extent=%" PRIu64 "x%" PRIu64 " pitch=%u levels=%" PRIu64

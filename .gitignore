@@ -2,4 +2,7 @@
 .vs/
 .idea/
 build/
-_Build/vscode-clang/
+_Build/
+_RenderDoc/
+_SaveData/
+_Shaders/

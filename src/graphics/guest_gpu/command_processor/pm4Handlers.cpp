@@ -2081,6 +2081,17 @@ KYTY_CP_OP_PARSER(CpOpPfpSyncMe) {
 	return 1;
 }
 
+KYTY_CP_OP_PARSER(CpOpRewind) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_NOT_IMPLEMENTED(buffer == nullptr || dw < 2u);
+	EXIT_NOT_IMPLEMENTED(!Pm4::IsSupportedRewindPacket(cmd_id, buffer[0]));
+
+	// REWIND controls a hardware command-buffer read pointer. CommandProcessor::Run parses a
+	// bounded submission once, so there is no persistent ring cursor to update here.
+	return 1;
+}
+
 KYTY_CP_OP_PARSER(CpOpSetPredication) {
 	KYTY_PROFILER_FUNCTION();
 

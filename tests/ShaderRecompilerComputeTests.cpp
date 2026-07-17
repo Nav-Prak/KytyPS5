@@ -1,6 +1,7 @@
 #include "common/threads.h"
 
 #include "common/emulatorConfig.h"
+#include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
@@ -489,6 +490,29 @@ void Require(const char *shader_name, const char *stage, bool value,
   if (!value) {
     Fail(shader_name, stage, message);
   }
+}
+
+void CheckPm4RewindPacket() {
+  constexpr uint32_t header = KYTY_PM4(2, Pm4::IT_REWIND, 0u);
+  Require("Pm4RewindPacket", "validation",
+          Pm4::IsSupportedRewindPacket(header, 0) &&
+              Pm4::IsSupportedRewindPacket(
+                  header, Pm4::REWIND_INITIAL_STATE_MASK) &&
+              !Pm4::IsSupportedRewindPacket(
+                  KYTY_PM4(3, Pm4::IT_REWIND, 0u), 0) &&
+              !Pm4::IsSupportedRewindPacket(header, 1),
+          "REWIND packet length or reserved-bit boundary changed");
+  GraphicsInitJmpTables();
+  uint32_t control = 0;
+  Require("Pm4RewindPacket", "dispatch",
+          g_cp_op_func[Pm4::IT_REWIND] == CpOpRewind &&
+              CpOpRewind(nullptr, header, &control, 2, 2) == 1,
+          "REWIND packet was not consumed by the command processor");
+  control = Pm4::REWIND_INITIAL_STATE_MASK;
+  Require("Pm4RewindPacket", "initial state",
+          CpOpRewind(nullptr, header, &control, 2, 2) == 1,
+          "REWIND initial-state marker was rejected");
+  std::printf("[host]    %-32s ok\n", "Pm4RewindPacket");
 }
 
 struct TestCase {
@@ -12621,6 +12645,10 @@ int main(int argc, char **argv) {
     CheckReferenceClockScale();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--pm4-rewind-only") == 0) {
+    CheckPm4RewindPacket();
+    return 0;
+  }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   if (argc == 2 && std::strcmp(argv[1], "--reverse-rt-death") == 0) {
     RunReverseRenderTargetDeathCase();
@@ -12709,6 +12737,7 @@ int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--metadata-descriptor-death") == 0) {
     RunMetadataDescriptorDeathCase(argv[2]);
   }
+  CheckPm4RewindPacket();
   CheckReverseRenderTargetFormatContract();
   CheckSampledColorViews();
   CheckSampledDepthResource();

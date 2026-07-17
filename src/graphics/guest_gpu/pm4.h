@@ -54,6 +54,7 @@ constexpr uint32_t IT_RELEASE_MEM               = 0x49;
 constexpr uint32_t IT_DMA_DATA                  = 0x50;
 constexpr uint32_t IT_ACQUIRE_MEM               = 0x58;
 constexpr uint32_t IT_REWIND                    = 0x59;
+constexpr uint32_t REWIND_INITIAL_STATE_MASK    = 0x80000000u;
 constexpr uint32_t IT_SET_SH_REG_INDIRECT       = 0x63;
 constexpr uint32_t IT_SET_UCONFIG_REG_INDIRECT  = 0x64;
 constexpr uint32_t IT_SET_CONFIG_REG            = 0x68;
@@ -89,6 +90,12 @@ constexpr uint32_t R_RELEASE_MEM    = 0x18;
 constexpr uint32_t R_DMA_DATA       = 0x19;
 
 constexpr uint32_t R_NUM = 0x3F + 1;
+
+[[nodiscard]] inline constexpr bool IsSupportedRewindPacket(uint32_t cmd_id,
+                                                             uint32_t control) noexcept {
+	return cmd_id == KYTY_PM4(2, IT_REWIND, 0u) &&
+	       (control & ~REWIND_INITIAL_STATE_MASK) == 0;
+}
 
 /* Context registers */
 

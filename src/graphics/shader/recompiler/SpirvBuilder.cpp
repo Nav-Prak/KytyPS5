@@ -98,6 +98,12 @@ void Builder::AddName(uint32_t target, const char* name) {
 	AppendInstruction(&m_debug, 5u, operands);
 }
 
+void Builder::AddString(uint32_t id, const char* value) {
+	std::vector<uint32_t> operands = {id};
+	AppendString(&operands, value);
+	AppendInstruction(&m_debug, 7u, operands);
+}
+
 void Builder::AddAnnotation(std::initializer_list<uint32_t> words) {
 	AppendInstructionWords(&m_annotations, words.begin(), words.size());
 }

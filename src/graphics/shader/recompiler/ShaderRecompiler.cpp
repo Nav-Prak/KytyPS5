@@ -132,6 +132,8 @@ enum class EmbeddedFetchValueType {
 	Attrib,
 	BufferTable,
 	Buffer,
+	VertexIndex,
+	InstanceIndex,
 	Index
 };
 
@@ -143,7 +145,9 @@ struct EmbeddedFetchSgprInfo {
 };
 
 struct EmbeddedFetchVgprInfo {
-	EmbeddedFetchValueType type = EmbeddedFetchValueType::Unknown;
+	EmbeddedFetchValueType type                   = EmbeddedFetchValueType::Unknown;
+	int32_t                vertex_offset_sgpr     = -1;
+	bool                   vertex_offset_conflict = false;
 };
 
 using EmbeddedFetchVectorLanes = std::map<uint64_t, EmbeddedFetchSgprInfo>;
@@ -308,8 +312,6 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 		return data;
 	}
 	data.loads.reserve(input_info->resources_num);
-	int32_t offset_candidate = -1;
-	bool    offset_conflict  = false;
 
 	const int shift_regs = 8;
 	const int attrib_reg = input_info->fetch_attrib_reg + shift_regs;
@@ -334,17 +336,57 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 	if (buffer_reg + 1 >= 0 && buffer_reg + 1 < static_cast<int>(sgprs.size())) {
 		sgprs[buffer_reg + 1].type = EmbeddedFetchValueType::BufferTable;
 	}
+	// Embedded fetch prologues select between the ABI-provided vertex and instance
+	// indices before using the result as a buffer index. Track both values so an
+	// offset applied before that selection is not lost when the fetch is rewritten
+	// as a fixed Vulkan vertex attribute.
+	vgprs[5].type = EmbeddedFetchValueType::VertexIndex;
+	vgprs[8].type = EmbeddedFetchValueType::InstanceIndex;
 
 	for (const auto& inst: decoded.instructions) {
-		if (data.loads.empty() && inst.opcode == Decoder::Opcode::VAddI32 &&
-		    IsDecodedVgpr(inst.dst) && inst.dst.reg == 0 && IsDecodedSgpr(inst.src0) &&
-		    IsDecodedVgpr(inst.src1) && inst.src1.reg == 0) {
-			const auto reg = DecodedSgprReg(inst.src0);
-			if (reg >= user_data_base && reg - user_data_base < user_data_count) {
-				if (offset_candidate >= 0 && offset_candidate != static_cast<int32_t>(reg)) {
-					offset_conflict = true;
-				} else {
-					offset_candidate = static_cast<int32_t>(reg);
+		if (data.loads.empty() &&
+		    (inst.opcode == Decoder::Opcode::VAddI32 ||
+		     inst.opcode == Decoder::Opcode::VSadU32) &&
+		    IsDecodedVgpr(inst.dst) && inst.dst.reg < vgprs.size()) {
+			const Decoder::Operand* index = nullptr;
+			const Decoder::Operand* offset = nullptr;
+			if (inst.opcode == Decoder::Opcode::VAddI32) {
+				if (IsDecodedVgpr(inst.src0) && IsDecodedSgpr(inst.src1)) {
+					index  = &inst.src0;
+					offset = &inst.src1;
+				} else if (IsDecodedSgpr(inst.src0) && IsDecodedVgpr(inst.src1)) {
+					index  = &inst.src1;
+					offset = &inst.src0;
+				}
+			} else if (IsDecodedVgpr(inst.src2)) {
+				uint32_t zero = 1;
+				index         = &inst.src2;
+				if (IsDecodedSgpr(inst.src0) &&
+				    TryDecodedOperandConstant(sgprs, inst.src1, zero) && zero == 0) {
+					offset = &inst.src0;
+				} else if (IsDecodedSgpr(inst.src1) &&
+				           TryDecodedOperandConstant(sgprs, inst.src0, zero) && zero == 0) {
+					offset = &inst.src1;
+				}
+			}
+			if (index != nullptr && offset != nullptr && index->reg < vgprs.size()) {
+				auto info = vgprs[index->reg];
+				if (info.type == EmbeddedFetchValueType::VertexIndex ||
+				    info.type == EmbeddedFetchValueType::Index) {
+					const auto reg = DecodedSgprReg(*offset);
+					if (reg >= user_data_base && reg - user_data_base < user_data_count) {
+						if (info.vertex_offset_sgpr >= 0 &&
+						    info.vertex_offset_sgpr != static_cast<int32_t>(reg)) {
+							info.vertex_offset_conflict = true;
+						} else {
+							info.vertex_offset_sgpr = static_cast<int32_t>(reg);
+						}
+					}
+				}
+				if (info.type == EmbeddedFetchValueType::VertexIndex ||
+				    info.type == EmbeddedFetchValueType::InstanceIndex ||
+				    info.type == EmbeddedFetchValueType::Index) {
+					vgprs[inst.dst.reg] = info;
 				}
 			}
 		}
@@ -457,13 +499,32 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 						ClearEmbeddedFetchSgprs(sgprs, inst.dst, DecodedDstSize(inst));
 					}
 				} else if (inst.opcode == Decoder::Opcode::VCndmaskB32) {
+					EmbeddedFetchVgprInfo src0_info {};
+					EmbeddedFetchVgprInfo src1_info {};
+					const bool valid_sources =
+					    IsDecodedVgpr(inst.src0) && inst.src0.reg < vgprs.size() &&
+					    IsDecodedVgpr(inst.src1) && inst.src1.reg < vgprs.size();
+					if (valid_sources) {
+						src0_info = vgprs[inst.src0.reg];
+						src1_info = vgprs[inst.src1.reg];
+					}
 					if (IsDecodedVgpr(inst.dst) && inst.dst.reg < vgprs.size()) {
 						ClearEmbeddedFetchVectorLanes(&vector_lanes, inst.dst.reg);
+						vgprs[inst.dst.reg] = {};
 					}
-					if (IsDecodedVgpr(inst.dst) && inst.dst.reg < vgprs.size() &&
-					    IsDecodedVgpr(inst.src0) && inst.src0.reg == 8 &&
-					    IsDecodedVgpr(inst.src1) && inst.src1.reg == 5) {
-						vgprs[inst.dst.reg].type = EmbeddedFetchValueType::Index;
+					if (IsDecodedVgpr(inst.dst) && inst.dst.reg < vgprs.size() && valid_sources) {
+						const auto* vertex =
+						    src0_info.type == EmbeddedFetchValueType::VertexIndex
+						        ? &src0_info
+						        : (src1_info.type == EmbeddedFetchValueType::VertexIndex ? &src1_info
+						                                                          : nullptr);
+						const bool has_instance =
+						    src0_info.type == EmbeddedFetchValueType::InstanceIndex ||
+						    src1_info.type == EmbeddedFetchValueType::InstanceIndex;
+						if (vertex != nullptr && has_instance) {
+							vgprs[inst.dst.reg]      = *vertex;
+							vgprs[inst.dst.reg].type = EmbeddedFetchValueType::Index;
+						}
 					}
 				} else if (IsEmbeddedFetchAttribPropagationAlu(inst)) {
 					if (IsDecodedSgpr(inst.dst) && IsDecodedSgpr(inst.src0) &&
@@ -503,8 +564,9 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 						load.attrib_id    = buffer.attrib_id;
 						load.components   = DecodedDstSize(inst);
 						load.prolog_loads = buffer.prolog_loads;
-						if (data.loads.empty() && !offset_conflict) {
-							data.vertex_offset_sgpr = offset_candidate;
+						if (data.loads.empty() &&
+						    !vgprs[inst.src0.reg].vertex_offset_conflict) {
+							data.vertex_offset_sgpr = vgprs[inst.src0.reg].vertex_offset_sgpr;
 						}
 						data.loads.push_back(load);
 					}

@@ -319,11 +319,21 @@ bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t grou
 	const auto& raw        = resources.buffers.front();
 	const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(raw);
 	if (!resource.formatted || !resource.written || resource.read || resource.atomic ||
-	    resource.scalar || resource.max_byte_extent != 16 || descriptor.Stride() != 16 ||
-	    descriptor.Format() != Prospero::GpuEnumValue(Prospero::BufferFormat::k32_32_32_32UInt) ||
-	    descriptor.SwizzleEnabled() || descriptor.IndexStride() != 0 || descriptor.AddTid() ||
-	    resource.packed_stride != descriptor.PackedStride() || raw.dword_count != 4 ||
-	    program.user_data_base != 0 || resources.user_data.size() != 8) {
+	    resource.scalar || descriptor.SwizzleEnabled() || descriptor.IndexStride() != 0 ||
+	    descriptor.AddTid() || resource.packed_stride != descriptor.PackedStride() ||
+	    raw.dword_count != 4 || program.user_data_base != 0) {
+		return false;
+	}
+	const bool vector_clear =
+	    resource.max_byte_extent == 16 && descriptor.Stride() == 16 &&
+	    descriptor.Format() ==
+	        Prospero::GpuEnumValue(Prospero::BufferFormat::k32_32_32_32UInt) &&
+	    descriptor.DstSelXYZW() == DstSel(4, 5, 6, 7) && resources.user_data.size() == 8;
+	const bool packed_scalar_clear =
+	    resource.source == 2 && resource.max_byte_extent == 4 && descriptor.Stride() == 4 &&
+	    descriptor.Format() == Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) &&
+	    descriptor.DstSelXYZW() == DstSel(4, 0, 0, 0) && resources.user_data.size() == 10;
+	if (!vector_clear && !packed_scalar_clear) {
 		return false;
 	}
 	for (uint32_t i = 0; i < raw.dword_count; i++) {
@@ -332,18 +342,31 @@ bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t grou
 		}
 	}
 	const uint32_t clear = resources.user_data[4];
-	if (resources.user_data[5] != clear || resources.user_data[6] != clear ||
-	    resources.user_data[7] != clear) {
+	if ((vector_clear && (resources.user_data[5] != clear || resources.user_data[6] != clear ||
+	                      resources.user_data[7] != clear)) ||
+	    (packed_scalar_clear &&
+	     (resources.user_data[5] != 0 || resources.user_data[6] != 0 ||
+	      resources.user_data[7] != 0x08000000u ||
+	      resources.user_data[8] != descriptor.NumRecords() || resources.user_data[9] != 1))) {
 		return false;
 	}
-	const bool full_dispatch =
-	    input.dispatch_thread_dimensions && input.threads_num[0] == 64 &&
-	    input.threads_num[1] == 1 && input.threads_num[2] == 1 && group_x != 0 && group_y == 1 &&
-	    group_z == 1 && input.dispatch_threads_num[0] == group_x &&
-	    input.dispatch_threads_num[1] == 1 && input.dispatch_threads_num[2] == 1 &&
+	const bool common_dispatch =
+	    input.threads_num[0] == 64 && input.threads_num[1] == 1 &&
+	    input.threads_num[2] == 1 && group_x != 0 && group_y == 1 && group_z == 1 &&
 	    input.group_id[0] && !input.group_id[1] && !input.group_id[2] &&
-	    input.thread_ids_num == 1 && input.wave_size == 32 && !input.tg_size_en && mode == 0x61u &&
+	    input.thread_ids_num == 1 && input.wave_size == 32 && !input.tg_size_en;
+	const bool vector_full_dispatch =
+	    vector_clear && input.dispatch_thread_dimensions &&
+	    input.dispatch_threads_num[0] == group_x && input.dispatch_threads_num[1] == 1 &&
+	    input.dispatch_threads_num[2] == 1 && mode == 0x61u &&
 	    group_x % input.threads_num[0] == 0 && descriptor.NumRecords() == group_x;
+	const bool scalar_full_dispatch =
+	    packed_scalar_clear && !input.dispatch_thread_dimensions &&
+	    input.dispatch_threads_num[0] == 0 && input.dispatch_threads_num[1] == 0 &&
+	    input.dispatch_threads_num[2] == 0 && mode == 0x41u &&
+	    static_cast<uint64_t>(group_x) * input.threads_num[0] == descriptor.NumRecords();
+	const bool full_dispatch =
+	    common_dispatch && (vector_full_dispatch || scalar_full_dispatch);
 	const auto size = BufferDescriptorSize(descriptor);
 	if (!full_dispatch || size == 0) {
 		return false;
@@ -376,6 +399,105 @@ static bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input, Com
 		     " addr=0x%016" PRIx64 " size=0x%016" PRIx64 " value=0x%08" PRIx32 "\n",
 		     input.stage.program->shader_hash, descriptor.Base48(), size, packed_clear);
 	}
+	return true;
+}
+
+bool ResolveVideoOutDccMetadataTransferDispatch(
+    const ShaderComputeInputInfo& input, uint32_t group_x, uint32_t group_y, uint32_t group_z,
+    uint32_t mode, ShaderBufferResource* source, ShaderBufferResource* destination,
+    uint64_t* transfer_size) {
+	if (source == nullptr || destination == nullptr || transfer_size == nullptr ||
+	    input.stage.program == nullptr || input.stage.resources == nullptr) {
+		return false;
+	}
+	const auto& program   = *input.stage.program;
+	const auto& resources = *input.stage.resources;
+	if (program.info.buffers.size() != 2 || resources.buffers.size() != 2 ||
+	    !program.info.images.empty() || !program.info.samplers.empty() ||
+	    !program.info.addresses.empty() || !resources.images.empty() ||
+	    !resources.samplers.empty() || !resources.addresses.empty()) {
+		return false;
+	}
+
+	const ShaderRecompiler::IR::BufferResource* source_resource      = nullptr;
+	const ShaderRecompiler::IR::BufferResource* destination_resource = nullptr;
+	ShaderBufferResource                        source_descriptor {};
+	ShaderBufferResource                        destination_descriptor {};
+	for (uint32_t i = 0; i < 2; i++) {
+		const auto& resource = program.info.buffers[i];
+		const auto& raw      = resources.buffers[i];
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(raw);
+		if (raw.dword_count != 4 || !resource.formatted || resource.atomic || resource.scalar ||
+		    resource.packed_stride != descriptor.PackedStride() || descriptor.SwizzleEnabled() ||
+		    descriptor.IndexStride() != 0 || descriptor.AddTid()) {
+			return false;
+		}
+		if (resource.read && !resource.written && source_resource == nullptr) {
+			source_resource   = &resource;
+			source_descriptor = descriptor;
+			continue;
+		}
+		if (!resource.read && resource.written && destination_resource == nullptr) {
+			destination_resource   = &resource;
+			destination_descriptor = descriptor;
+			continue;
+		}
+		return false;
+	}
+	if (source_resource == nullptr || destination_resource == nullptr ||
+	    source_resource->max_byte_extent != 4 || destination_resource->max_byte_extent != 8 ||
+	    source_descriptor.Stride() != 1 || destination_descriptor.Stride() != 2 ||
+	    source_descriptor.Format() != Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt) ||
+	    destination_descriptor.Format() !=
+	        Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8UInt) ||
+	    source_descriptor.DstSelXYZW() != 0x204 ||
+	    destination_descriptor.DstSelXYZW() != 0x22c) {
+		return false;
+	}
+	const auto source_size      = BufferDescriptorSize(source_descriptor);
+	const auto destination_size = BufferDescriptorSize(destination_descriptor);
+	if (source_size == 0 || source_size != destination_size) {
+		return false;
+	}
+	const bool dispatch_shape =
+	    !input.dispatch_thread_dimensions && input.dispatch_threads_num[0] == 0 &&
+	    input.dispatch_threads_num[1] == 0 && input.dispatch_threads_num[2] == 0 &&
+	    input.threads_num[0] == 8 && input.threads_num[1] == 8 && input.threads_num[2] == 1 &&
+	    input.group_id[0] && input.group_id[1] && !input.group_id[2] &&
+	    input.thread_ids_num == 2 && input.wave_size == 32 && !input.tg_size_en && group_x != 0 &&
+	    group_y != 0 && group_z == 1 && mode == 0x41u;
+	const uint64_t launched_threads =
+	    static_cast<uint64_t>(group_x) * group_y * input.threads_num[0] * input.threads_num[1];
+	if (!dispatch_shape || launched_threads > UINT32_MAX / 8u ||
+	    source_descriptor.NumRecords() != launched_threads * 8u ||
+	    destination_descriptor.NumRecords() != launched_threads * 4u) {
+		return false;
+	}
+	*source         = source_descriptor;
+	*destination    = destination_descriptor;
+	*transfer_size  = source_size;
+	return true;
+}
+
+static bool TryConsumeVideoOutDccMetadataTransfer(const ShaderComputeInputInfo& input,
+	                                               CommandBuffer* command, uint32_t group_x,
+	                                               uint32_t group_y, uint32_t group_z,
+	                                               uint32_t mode) {
+	ShaderBufferResource source {};
+	ShaderBufferResource destination {};
+	uint64_t             transfer_size = 0;
+	if (!ResolveVideoOutDccMetadataTransferDispatch(input, group_x, group_y, group_z, mode,
+	                                               &source, &destination, &transfer_size)) {
+		return false;
+	}
+	auto* cache = g_render_ctx->GetTextureCache();
+	if (!cache->ConsumeVideoOutDccMetadataTransfer(command, source.Base48(), transfer_size,
+	                                             destination.Base48(), transfer_size)) {
+		return false;
+	}
+	LOGF("GraphicsRenderDispatchDirect: virtual video-out DCC metadata transfer "
+	     "source=0x%016" PRIx64 " destination=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+	     source.Base48(), destination.Base48(), transfer_size);
 	return true;
 }
 
@@ -453,6 +575,10 @@ void RenderDispatchDirect(uint64_t submit_id, CommandBuffer* buffer, HW::Context
 	                                thread_group_z, mode)) {
 		return;
 	}
+	if (TryConsumeVideoOutDccMetadataTransfer(input_info, buffer, thread_group_x, thread_group_y,
+	                                         thread_group_z, mode)) {
+		return;
+	}
 	const auto sampled_images = std::count_if(
 	    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
 		    return image.kind == ShaderRecompiler::IR::ResourceKind::Image ||
@@ -460,7 +586,7 @@ void RenderDispatchDirect(uint64_t submit_id, CommandBuffer* buffer, HW::Context
 	    });
 	const bool                   has_sampler = !program.info.samplers.empty();
 	static std::atomic<uint32_t> dispatch_log_count {0};
-	if ((large_workgroup || has_sampler) &&
+	if ((graphics_debug_dump_enabled() || large_workgroup || has_sampler) &&
 	    dispatch_log_count.fetch_add(1, std::memory_order_relaxed) < 512) {
 		LOGF("GraphicsRenderDispatchDirect: frame=%u shader=0x%016" PRIx64
 		     " groups=%ux%ux%u mode=0x%08" PRIx32 " local=%ux%ux%u "
@@ -473,10 +599,13 @@ void RenderDispatchDirect(uint64_t submit_id, CommandBuffer* buffer, HW::Context
 		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 			const auto& buffer = program.info.buffers[i];
 			const auto  r      = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-			LOGF("  CS buffer[%u]: source=%u usage=%s addr=0x%012" PRIx64
-			     " stride=%u records=%u format=%u\n",
-			     i, buffer.source, buffer.written ? "read-write" : "read-only", r.Base48(),
-			     r.Stride(), r.NumRecords(), r.Format());
+			LOGF("  CS buffer[%u]: source=%u read=%d written=%d formatted=%d atomic=%d "
+			     "scalar=%d extent=%u packed_stride=0x%x dwords=%u addr=0x%012" PRIx64
+			     " stride=%u records=%u format=%u raw=%08x/%08x/%08x/%08x\n",
+			     i, buffer.source, buffer.read, buffer.written, buffer.formatted, buffer.atomic,
+			     buffer.scalar, buffer.max_byte_extent, buffer.packed_stride,
+			     resources.buffers[i].dword_count, r.Base48(), r.Stride(), r.NumRecords(), r.Format(),
+			     r.fields[0], r.fields[1], r.fields[2], r.fields[3]);
 		}
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			const auto& image = program.info.images[i];

@@ -71,6 +71,9 @@ public:
 	[[nodiscard]] bool HasPageOverlap(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// Discard CPU-current buffer bytes only when a verified full image write supersedes the exact
+	// guest range. GPU-current buffer bytes remain unsupported until queue ownership is explicit.
+	void SupersedeCpuRangeWithImage(uint64_t vaddr, uint64_t size);
 	void               PublishImageBacking(uint64_t vaddr, uint64_t size);
 	void ValidateGpuAccess(uint64_t vaddr, uint64_t size, bool is_read, bool is_written) const;
 	void SetTextureCache(TextureCache& texture_cache);

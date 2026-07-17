@@ -26,6 +26,7 @@
 #include "graphics/shader/recompiler/ShaderIR.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
@@ -52,6 +53,36 @@ static std::atomic<uint32_t> g_framebuffer_skip_log_count = 0;
 
 static bool ResolveColorTargets(uint64_t submit_id, CommandBuffer* buffer, const HW::Context& hw,
                                 uint32_t render_target_slice_offset);
+
+static bool ReadLogIndices(uint32_t index_type, const void* address, std::span<uint32_t> indices) {
+	if (address == nullptr || indices.empty()) {
+		return false;
+	}
+	const auto guest_address = reinterpret_cast<uint64_t>(address);
+	switch (static_cast<Prospero::IndexType>(index_type)) {
+		case Prospero::IndexType::kIndex8: {
+			std::vector<uint8_t> raw(indices.size());
+			if (!Libs::LibKernel::Memory::TryReadBacking(guest_address, raw.data(), raw.size())) {
+				return false;
+			}
+			std::copy(raw.begin(), raw.end(), indices.begin());
+			return true;
+		}
+		case Prospero::IndexType::kIndex16: {
+			std::vector<uint16_t> raw(indices.size());
+			if (!Libs::LibKernel::Memory::TryReadBacking(guest_address, raw.data(),
+			                                             raw.size() * sizeof(raw[0]))) {
+				return false;
+			}
+			std::copy(raw.begin(), raw.end(), indices.begin());
+			return true;
+		}
+		case Prospero::IndexType::kIndex32:
+			return Libs::LibKernel::Memory::TryReadBacking(guest_address, indices.data(),
+			                                               indices.size_bytes());
+		default: return false;
+	}
+}
 
 static const char* RenderColorTypeName(RenderColorType type) {
 	switch (type) {
@@ -209,9 +240,9 @@ static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& col
 static void LogDrawInputState(const RenderColorInfo&       color,
                               const ShaderVertexInputInfo& vs_input_info,
                               uint32_t index_type_and_size, uint32_t index_count,
-                              const void* index_addr) {
+                              const void* index_addr, int32_t vertex_offset) {
 	auto log_id = g_draw_input_log_count.fetch_add(1);
-	if (log_id >= 64 && color.type != RenderColorType::DisplayBuffer) {
+	if (log_id >= 512 && color.type != RenderColorType::DisplayBuffer) {
 		return;
 	}
 
@@ -222,6 +253,24 @@ static void LogDrawInputState(const RenderColorInfo&       color,
 	     index_type_and_size, index_count, reinterpret_cast<uint64_t>(index_addr),
 	     vs_input_info.resources_num, vs_input_info.buffers_num);
 
+	constexpr uint32_t    kIndexSampleLimit  = 64;
+	const auto            index_sample_count = std::min(index_count, kIndexSampleLimit);
+	std::vector<uint32_t> draw_indices(index_sample_count);
+	const bool have_draw_indices = ReadLogIndices(index_type_and_size, index_addr, draw_indices);
+	if (have_draw_indices) {
+		const auto [min_index, max_index] =
+		    std::minmax_element(draw_indices.begin(), draw_indices.end());
+		LOGF("DrawInputState[%u]: index_sample=%zu/%u min=%u max=%u vertex_offset=%" PRIi32
+		     " effective_min=%" PRIi64 " effective_max=%" PRIi64 "\n",
+		     log_id, draw_indices.size(), index_count, *min_index, *max_index, vertex_offset,
+		     static_cast<int64_t>(*min_index) + vertex_offset,
+		     static_cast<int64_t>(*max_index) + vertex_offset);
+		for (uint32_t i = 0; i < draw_indices.size(); i++) {
+			LOGF("DrawInputState[%u]: index[%u]=%u effective=%" PRIi64 "\n", log_id, i,
+			     draw_indices[i], static_cast<int64_t>(draw_indices[i]) + vertex_offset);
+		}
+	}
+
 	for (int bi = 0; bi < vs_input_info.buffers_num; bi++) {
 		const auto& b = vs_input_info.buffers[bi];
 		LOGF("DrawInputState[%u]: vb[%d] addr=0x%010" PRIx64
@@ -230,8 +279,7 @@ static void LogDrawInputState(const RenderColorInfo&       color,
 
 		const auto* bytes = reinterpret_cast<const uint8_t*>(b.addr);
 		if (bytes != nullptr && b.stride != 0) {
-			const uint32_t records = std::min<uint32_t>(b.num_records, 4u);
-			for (uint32_t rec = 0; rec < records; rec++) {
+			const auto log_record = [&](uint32_t rec) {
 				const auto* rec_bytes = bytes + static_cast<uint64_t>(rec) * b.stride;
 				const auto  dword_num = std::min<uint32_t>(b.stride / 4u, 12u);
 				uint32_t    raw[12]   = {};
@@ -253,6 +301,20 @@ static void LogDrawInputState(const RenderColorInfo&       color,
 					const auto& r         = vs_input_info.resources[res_index];
 					const auto& rd        = vs_input_info.resources_dst[res_index];
 					const auto  offset    = b.attr_offsets[ai];
+					if (offset < b.stride) {
+						uint32_t   attr_raw[4] = {};
+						float      attr_flt[4] = {};
+						const auto attr_bytes =
+						    std::min<uint32_t>(16u, static_cast<uint32_t>(b.stride - offset));
+						std::memcpy(attr_raw, rec_bytes + offset, attr_bytes);
+						std::memcpy(attr_flt, rec_bytes + offset, attr_bytes);
+						LOGF("DrawInputState[%u]: vb[%d].rec[%u].attr[%d] dst=v%d fmt=%u "
+						     "offset=%u bytes=%u raw=%08" PRIx32 " %08" PRIx32 " %08" PRIx32
+						     " %08" PRIx32 " f=(%.6f,%.6f,%.6f,%.6f)\n",
+						     log_id, bi, rec, ai, rd.register_start, r.Format(), offset, attr_bytes,
+						     attr_raw[0], attr_raw[1], attr_raw[2], attr_raw[3], attr_flt[0],
+						     attr_flt[1], attr_flt[2], attr_flt[3]);
+					}
 					if (offset + 4u <= b.stride &&
 					    r.Format() ==
 					        Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UNorm)) {
@@ -269,6 +331,34 @@ static void LogDrawInputState(const RenderColorInfo&       color,
 						     static_cast<double>(r8) / 255.0, static_cast<double>(g8) / 255.0,
 						     static_cast<double>(b8) / 255.0, static_cast<double>(a8) / 255.0);
 					}
+				}
+			};
+
+			std::vector<uint32_t> logged_records;
+			logged_records.reserve(draw_indices.size() + 4u);
+			const uint32_t records = std::min<uint32_t>(b.num_records, 4u);
+			for (uint32_t rec = 0; rec < records; rec++) {
+				log_record(rec);
+				logged_records.push_back(rec);
+			}
+
+			if (have_draw_indices) {
+				for (const auto index: draw_indices) {
+					const auto draw_offset = (b.fetch_index == 0 ? vertex_offset : 0);
+					const auto effective   = static_cast<int64_t>(index) + draw_offset;
+					if (effective < 0 || effective >= b.num_records) {
+						LOGF("DrawInputState[%u]: vb[%d] effective_index=%" PRIi64
+						     " outside records=%u\n",
+						     log_id, bi, effective, b.num_records);
+						continue;
+					}
+					const auto rec = static_cast<uint32_t>(effective);
+					if (std::find(logged_records.begin(), logged_records.end(), rec) !=
+					    logged_records.end()) {
+						continue;
+					}
+					logged_records.push_back(rec);
+					log_record(rec);
 				}
 			}
 		}
@@ -301,10 +391,10 @@ static void LogDrawInputState(const RenderColorInfo&       color,
 		    return image.kind == ShaderRecompiler::IR::ResourceKind::Image ||
 		           image.kind == ShaderRecompiler::IR::ResourceKind::ImageUint;
 	    });
-	LOGF("DrawTextureState[%u]: frame=%d %s target=%s addr=0x%010" PRIx64
+	LOGF("DrawTextureState[%u]: frame=%d %s target=%s addr=0x%010" PRIx64 " ps_hash=0x%016" PRIx64
 	     " textures=%zu sampled=%zu storage=%zu samplers=%zu\n",
 	     log_id, GraphicsRunGetFrameNum(), draw_name, RenderColorTypeName(color.type),
-	     color.base_addr, ps_program.info.images.size(), sampled_images,
+	     color.base_addr, ps_program.shader_hash, ps_program.info.images.size(), sampled_images,
 	     ps_program.info.images.size() - sampled_images, ps_program.info.samplers.size());
 
 	for (uint32_t i = 0; i < ps_program.info.images.size(); i++) {
@@ -544,6 +634,9 @@ struct DrawRenderState {
 	ShaderPixelInputInfo      ps_input_info;
 	std::span<const uint32_t> vs_shader;
 	std::span<const uint32_t> ps_shader;
+	bool                      presentation_viewport = false;
+	std::array<float, 2>      presentation_scale {};
+	std::array<float, 2>      presentation_offset {};
 };
 
 struct DrawCallInfo {
@@ -554,6 +647,495 @@ struct DrawCallInfo {
 	uint32_t             instance_count = 0;
 	uint32_t             first_instance = 0;
 };
+
+namespace {
+
+using IrInstruction  = ShaderRecompiler::IR::Instruction;
+using IrOpcode       = ShaderRecompiler::IR::Opcode;
+using IrOperand      = ShaderRecompiler::IR::Operand;
+using IrOperandKind  = ShaderRecompiler::IR::OperandKind;
+using IrRegister     = ShaderRecompiler::IR::Register;
+using IrRegisterFile = ShaderRecompiler::IR::RegisterFile;
+
+IrOperand IrReg(IrRegisterFile file, uint32_t index, bool negate = false) {
+	IrOperand operand {};
+	operand.kind   = IrOperandKind::Register;
+	operand.reg    = {file, index};
+	operand.negate = negate;
+	return operand;
+}
+
+IrOperand IrImm(uint32_t value) {
+	IrOperand operand {};
+	operand.kind = IrOperandKind::ImmediateU32;
+	operand.imm  = value;
+	return operand;
+}
+
+bool MatchIr(const IrInstruction& inst, IrOpcode op, const IrOperand& dst,
+             std::initializer_list<IrOperand> sources) {
+	if (inst.op != op || inst.dst != dst || inst.dst2.kind != IrOperandKind::Null ||
+	    inst.src_count != sources.size()) {
+		return false;
+	}
+	size_t index = 0;
+	for (const auto& source: sources) {
+		if (inst.src[index++] != source) {
+			return false;
+		}
+	}
+	return true;
+}
+
+const IrInstruction* FindLastIrWrite(const std::vector<IrInstruction>& instructions, size_t before,
+                                     const IrOperand& destination) {
+	for (size_t i = before; i-- > 0;) {
+		if (instructions[i].dst == destination || instructions[i].dst2 == destination) {
+			return &instructions[i];
+		}
+	}
+	return nullptr;
+}
+
+bool IsInputWrite(const IrInstruction* inst, uint32_t attr, uint32_t channel) {
+	return inst != nullptr && inst->op == IrOpcode::LoadInputF32 && inst->src_count == 0 &&
+	       inst->input_info.attr == attr && inst->input_info.chan == channel;
+}
+
+struct Affine2dProjectionTail {
+	uint32_t address_resource = 0;
+};
+
+bool MatchAffine2dProjectionTail(const ShaderRecompiler::IR::Program& program,
+                                 Affine2dProjectionTail*              proof) {
+	if (proof == nullptr || program.blocks.size() != 2 || program.dispatcher_fallback ||
+	    program.blocks[0].successors.size() != 1) {
+		return false;
+	}
+	const auto& instructions = program.blocks[0].instructions;
+	size_t      export_index = instructions.size();
+	for (size_t i = instructions.size(); i-- > 0;) {
+		const auto& inst = instructions[i];
+		if (inst.op == IrOpcode::Export &&
+		    inst.export_info.kind == ShaderRecompiler::IR::ExportTargetKind::Position &&
+		    inst.export_info.index == 0 && inst.export_info.en == 0x0f) {
+			export_index = i;
+			break;
+		}
+	}
+	if (export_index == instructions.size()) {
+		return false;
+	}
+
+	std::vector<const IrInstruction*> tail;
+	for (size_t i = export_index + 1; i-- > 0 && tail.size() < 19;) {
+		if (instructions[i].op != IrOpcode::Waitcnt) {
+			tail.push_back(&instructions[i]);
+		}
+	}
+	if (tail.size() != 19) {
+		return false;
+	}
+	std::reverse(tail.begin(), tail.end());
+
+	const auto v = [](uint32_t index, bool negate = false) {
+		return IrReg(IrRegisterFile::Vector, index, negate);
+	};
+	const auto vcc = [](uint32_t index) { return IrReg(IrRegisterFile::Vcc, index); };
+	const auto s   = [](uint32_t index) { return IrReg(IrRegisterFile::Scalar, index); };
+	const auto nil = IrOperand {};
+	bool       ok  = true;
+	ok &= MatchIr(*tail[0], IrOpcode::CompareGeF32, vcc(0), {IrImm(0), v(14)});
+	ok &= MatchIr(*tail[1], IrOpcode::SelectMaskU32, v(9), {vcc(0), IrImm(0x3f800000), IrImm(0)});
+	ok &= MatchIr(*tail[2], IrOpcode::SelectMaskU32, v(8), {vcc(0), IrImm(0), v(14)});
+	ok &= MatchIr(*tail[3], IrOpcode::FAddF32, v(8), {v(9), v(8)});
+	ok &= MatchIr(*tail[4], IrOpcode::ConvertF32ToI32, v(2), {v(9)});
+	ok &= MatchIr(*tail[5], IrOpcode::ShiftLeftLogicalU32, v(9), {v(2), IrImm(4)});
+	ok &= MatchIr(*tail[6], IrOpcode::RcpF32, v(2), {v(8)});
+	ok &= MatchIr(*tail[7], IrOpcode::FlatLoadDword, v(8), {v(9), s(16)});
+	ok &= tail[7]->memory.data_dwords == 4 && tail[7]->memory.data_bits == 32 &&
+	      tail[7]->memory.offset == 0 && tail[7]->memory.secondary_offset == 0;
+	ok &= MatchIr(*tail[8], IrOpcode::FAddF32, v(13), {v(13), v(11)});
+	ok &= MatchIr(*tail[9], IrOpcode::FAddF32, v(12), {v(12), v(10)});
+	ok &= MatchIr(*tail[10], IrOpcode::FAddF32, v(1), {v(1), v(11)});
+	ok &= MatchIr(*tail[11], IrOpcode::FAddF32, v(0), {v(0), v(10)});
+	ok &= MatchIr(*tail[12], IrOpcode::FMulF32, v(10), {v(9), v(13)});
+	ok &= MatchIr(*tail[13], IrOpcode::FMulF32, v(11), {v(8), v(12)});
+	ok &= MatchIr(*tail[14], IrOpcode::FMadF32, v(1), {v(9), v(1), v(10, true)});
+	ok &= MatchIr(*tail[15], IrOpcode::FMadF32, v(0), {v(8), v(0), v(11, true)});
+	ok &= MatchIr(*tail[16], IrOpcode::FMadF32, v(1), {v(10), v(2), v(1)});
+	ok &= MatchIr(*tail[17], IrOpcode::FMadF32, v(0), {v(11), v(2), v(0)});
+	ok &= MatchIr(*tail[18], IrOpcode::Export, nil, {v(0), v(1), v(3), v(17)});
+	ok &= tail[18]->export_info.kind == ShaderRecompiler::IR::ExportTargetKind::Position &&
+	      tail[18]->export_info.index == 0 && tail[18]->export_info.en == 0x0f;
+	if (!ok) {
+		return false;
+	}
+
+	const auto tail_start = static_cast<size_t>(tail[0] - instructions.data());
+	if (!IsInputWrite(FindLastIrWrite(instructions, tail_start, v(0)), 0, 0) ||
+	    !IsInputWrite(FindLastIrWrite(instructions, tail_start, v(1)), 0, 1) ||
+	    !IsInputWrite(FindLastIrWrite(instructions, tail_start, v(2)), 0, 2) ||
+	    !IsInputWrite(FindLastIrWrite(instructions, tail_start, v(3)), 0, 3) ||
+	    !IsInputWrite(FindLastIrWrite(instructions, tail_start, v(12)), 3, 0) ||
+	    !IsInputWrite(FindLastIrWrite(instructions, tail_start, v(13)), 3, 1) ||
+	    !IsInputWrite(FindLastIrWrite(instructions, tail_start, v(14)), 3, 2)) {
+		return false;
+	}
+	const auto* w_write = FindLastIrWrite(instructions, tail_start, v(17));
+	if (w_write == nullptr || !MatchIr(*w_write, IrOpcode::MoveU32, v(17), {IrImm(0x3f800000)})) {
+		return false;
+	}
+	proof->address_resource = tail[7]->memory.resource;
+	return true;
+}
+
+struct VertexAttributeView {
+	const ShaderVertexInputBuffer* buffer = nullptr;
+	uint32_t                       offset = 0;
+	uint32_t                       format = 0;
+};
+
+bool FindVertexAttribute(const ShaderVertexInputInfo& inputs, uint32_t attr,
+                         VertexAttributeView* result) {
+	if (result == nullptr) {
+		return false;
+	}
+	bool found = false;
+	for (int bi = 0; bi < inputs.buffers_num; bi++) {
+		const auto& buffer = inputs.buffers[bi];
+		for (int ai = 0; ai < buffer.attr_num; ai++) {
+			const auto resource_index = buffer.attr_indices[ai];
+			if (resource_index < 0 || resource_index >= inputs.resources_num ||
+			    inputs.resources_dst[resource_index].attr_id != static_cast<int>(attr)) {
+				continue;
+			}
+			if (found) {
+				return false;
+			}
+			found          = true;
+			result->buffer = &buffer;
+			result->offset = buffer.attr_offsets[ai];
+			result->format = inputs.resources[resource_index].Format();
+		}
+	}
+	return found;
+}
+
+bool ReadVertexFloats(const VertexAttributeView& view, int64_t vertex, uint32_t count,
+                      float* values) {
+	if (view.buffer == nullptr || values == nullptr || vertex < 0 ||
+	    static_cast<uint64_t>(vertex) >= view.buffer->num_records || view.buffer->stride == 0 ||
+	    view.offset > view.buffer->stride ||
+	    count * sizeof(float) > view.buffer->stride - view.offset) {
+		return false;
+	}
+	const auto address =
+	    view.buffer->addr + static_cast<uint64_t>(vertex) * view.buffer->stride + view.offset;
+	return Libs::LibKernel::Memory::TryReadBacking(address, values, count * sizeof(float));
+}
+
+struct ClipPosition {
+	float x = 0.0f;
+	float y = 0.0f;
+	float z = 0.0f;
+	float w = 0.0f;
+};
+
+bool EvaluateAffine2dPosition(const VertexAttributeView& position,
+                              const VertexAttributeView& auxiliary, int64_t vertex,
+                              uint64_t constants_address, ClipPosition* result) {
+	if (result == nullptr ||
+	    position.format != Prospero::GpuEnumValue(Prospero::BufferFormat::k32_32_32_32Float) ||
+	    auxiliary.format != Prospero::GpuEnumValue(Prospero::BufferFormat::k32_32_32Float)) {
+		return false;
+	}
+	float input[4] = {};
+	float aux[3]   = {};
+	if (!ReadVertexFloats(position, vertex, 4, input) ||
+	    !ReadVertexFloats(auxiliary, vertex, 3, aux) || !std::isfinite(aux[2])) {
+		return false;
+	}
+	const bool non_positive = 0.0f >= aux[2];
+	const auto byte_offset  = non_positive ? uint64_t {16} : uint64_t {0};
+	const auto divisor      = non_positive ? 1.0f : aux[2];
+	if (!std::isfinite(divisor) || std::abs(divisor) < std::numeric_limits<float>::epsilon() ||
+	    constants_address > UINT64_MAX - byte_offset) {
+		return false;
+	}
+	float constants[4] = {};
+	if (!Libs::LibKernel::Memory::TryReadBacking(constants_address + byte_offset, constants,
+	                                             sizeof(constants))) {
+		return false;
+	}
+	for (float value: constants) {
+		if (!std::isfinite(value)) {
+			return false;
+		}
+	}
+	const float inverse = 1.0f / divisor;
+	const float term_x  = constants[0] * (aux[0] + constants[2]);
+	const float term_y  = constants[1] * (aux[1] + constants[3]);
+	result->x           = std::fma(constants[0], input[0] + constants[2], -term_x);
+	result->y           = std::fma(constants[1], input[1] + constants[3], -term_y);
+	result->x           = std::fma(term_x, inverse, result->x);
+	result->y           = std::fma(term_y, inverse, result->y);
+	result->z           = input[3];
+	result->w           = 1.0f;
+	return std::isfinite(result->x) && std::isfinite(result->y) && std::isfinite(result->z);
+}
+
+bool ReadSixIndices(uint32_t index_type, const void* address, std::array<uint32_t, 6>* indices) {
+	if (address == nullptr || indices == nullptr) {
+		return false;
+	}
+	const auto guest_address = reinterpret_cast<uint64_t>(address);
+	switch (static_cast<Prospero::IndexType>(index_type)) {
+		case Prospero::IndexType::kIndex8: {
+			std::array<uint8_t, 6> raw {};
+			if (!Libs::LibKernel::Memory::TryReadBacking(guest_address, raw.data(), raw.size())) {
+				return false;
+			}
+			std::copy(raw.begin(), raw.end(), indices->begin());
+			return true;
+		}
+		case Prospero::IndexType::kIndex16: {
+			std::array<uint16_t, 6> raw {};
+			if (!Libs::LibKernel::Memory::TryReadBacking(guest_address, raw.data(), sizeof(raw))) {
+				return false;
+			}
+			std::copy(raw.begin(), raw.end(), indices->begin());
+			return true;
+		}
+		case Prospero::IndexType::kIndex32:
+			return Libs::LibKernel::Memory::TryReadBacking(guest_address, indices->data(),
+			                                               sizeof(*indices));
+		default: return false;
+	}
+}
+
+bool ProvesAxisAlignedQuadCoverage(const std::array<ClipPosition, 6>& clip,
+                                   const HW::Viewport& viewport, const ScissorRect& scissor) {
+	constexpr float epsilon = 0.01f;
+	struct Point {
+		float x = 0.0f;
+		float y = 0.0f;
+	};
+	std::array<Point, 6> screen {};
+	for (size_t i = 0; i < clip.size(); i++) {
+		if (!std::isfinite(clip[i].w) || clip[i].w <= 0.0f || clip[i].z < 0.0f ||
+		    clip[i].z > clip[i].w) {
+			return false;
+		}
+		screen[i].x = clip[i].x / clip[i].w * viewport.xscale + viewport.xoffset;
+		screen[i].y = clip[i].y / clip[i].w * viewport.yscale + viewport.yoffset;
+		if (!std::isfinite(screen[i].x) || !std::isfinite(screen[i].y)) {
+			return false;
+		}
+	}
+	std::array<Point, 4> unique {};
+	std::array<int, 6>   ids {};
+	uint32_t             unique_count = 0;
+	for (size_t i = 0; i < screen.size(); i++) {
+		ids[i] = -1;
+		for (uint32_t p = 0; p < unique_count; p++) {
+			if (std::abs(screen[i].x - unique[p].x) <= epsilon &&
+			    std::abs(screen[i].y - unique[p].y) <= epsilon) {
+				ids[i] = static_cast<int>(p);
+				break;
+			}
+		}
+		if (ids[i] < 0) {
+			if (unique_count == unique.size()) {
+				return false;
+			}
+			ids[i]                 = static_cast<int>(unique_count);
+			unique[unique_count++] = screen[i];
+		}
+	}
+	if (unique_count != 4 || ids[0] == ids[1] || ids[0] == ids[2] || ids[1] == ids[2] ||
+	    ids[3] == ids[4] || ids[3] == ids[5] || ids[4] == ids[5]) {
+		return false;
+	}
+	std::array<bool, 4> first {};
+	std::array<bool, 4> second {};
+	for (uint32_t i = 0; i < 3; i++) {
+		first[ids[i]]      = true;
+		second[ids[i + 3]] = true;
+	}
+	std::array<int, 2> shared {};
+	uint32_t           shared_count = 0;
+	for (uint32_t i = 0; i < 4; i++) {
+		if (first[i] && second[i]) {
+			if (shared_count == shared.size()) {
+				return false;
+			}
+			shared[shared_count++] = static_cast<int>(i);
+		}
+	}
+	if (shared_count != 2) {
+		return false;
+	}
+	float min_x = unique[0].x;
+	float max_x = unique[0].x;
+	float min_y = unique[0].y;
+	float max_y = unique[0].y;
+	for (uint32_t i = 1; i < 4; i++) {
+		min_x = std::min(min_x, unique[i].x);
+		max_x = std::max(max_x, unique[i].x);
+		min_y = std::min(min_y, unique[i].y);
+		max_y = std::max(max_y, unique[i].y);
+	}
+	if (min_x > static_cast<float>(scissor.left) + epsilon ||
+	    max_x < static_cast<float>(scissor.right) - epsilon ||
+	    min_y > static_cast<float>(scissor.top) + epsilon ||
+	    max_y < static_cast<float>(scissor.bottom) - epsilon) {
+		return false;
+	}
+	for (uint32_t i = 0; i < 4; i++) {
+		const bool edge_x =
+		    std::abs(unique[i].x - min_x) <= epsilon || std::abs(unique[i].x - max_x) <= epsilon;
+		const bool edge_y =
+		    std::abs(unique[i].y - min_y) <= epsilon || std::abs(unique[i].y - max_y) <= epsilon;
+		if (!edge_x || !edge_y) {
+			return false;
+		}
+	}
+	return std::abs(unique[shared[0]].x - unique[shared[1]].x) > epsilon &&
+	       std::abs(unique[shared[0]].y - unique[shared[1]].y) > epsilon;
+}
+
+} // namespace
+
+static bool ProvesFullDisplayOverwrite(const HW::Context& ctx, const HW::UserConfig& ucfg,
+                                       const DrawCallInfo& draw, const DrawRenderState& state,
+                                       uint32_t index_type, const void* index_address,
+                                       int32_t vertex_offset) {
+	auto reject = [&](const char* reason) {
+		if (graphics_debug_dump_enabled()) {
+			LOGF("DrawCoverageProof: rejected %s\n", reason);
+		}
+		return false;
+	};
+	if (state.color_count != 1 || state.color_info[0].type != RenderColorType::DisplayBuffer ||
+	    state.color_info[0].vulkan_buffer == nullptr || draw.index_count != 6 ||
+	    draw.instance_count != 1 || draw.flags != 0 ||
+	    ucfg.GetPrimType() != Prospero::GpuEnumValue(Prospero::PrimitiveType::kTriList)) {
+		return reject("draw shape");
+	}
+	const auto& color = state.color_info[0];
+	const auto  slot  = color.target_slot;
+	if (slot >= RENDER_COLOR_ATTACHMENTS_MAX) {
+		return reject("invalid color slot");
+	}
+	const auto  slot_bit = uint32_t {0x0f} << (slot * 4u);
+	const auto& rt       = ctx.GetRenderTarget(slot);
+	const auto& blend    = ctx.GetBlendControl(slot);
+	const auto& depth    = ctx.GetDepthControl();
+	const auto& mode     = ctx.GetModeControl();
+	const auto& clip     = ctx.GetClipControl();
+	const auto& scan     = ctx.GetScanModeControl();
+	const auto& eqaa     = ctx.GetEqaaControl();
+	const auto& aa       = ctx.GetAaConfig();
+	const auto& control  = ctx.GetColorControl();
+	const auto& shader   = ctx.GetShaderRegisters();
+	if (ctx.GetRenderTargetMask() != slot_bit || shader.m_cbShaderMask != slot_bit ||
+	    control.mode != 1 || control.op != 0xcc || blend.enable || depth.z_enable ||
+	    depth.z_write_enable || depth.stencil_enable || depth.depth_bounds_enable ||
+	    mode.cull_front || mode.cull_back || mode.poly_mode != 0 || scan.msaa_enable ||
+	    rt.attrib.num_samples != 0 || rt.attrib.num_fragments != 0 ||
+	    eqaa.max_anchor_samples != 0 || eqaa.ps_iter_samples != 0 ||
+	    eqaa.mask_export_num_samples != 0 || eqaa.alpha_to_mask_num_samples != 0 ||
+	    aa.msaa_num_samples != 0) {
+		return reject("destination-dependent fixed-function state");
+	}
+	if (!clip.dx_clip_space || clip.user_clip_planes != 0 || clip.vertex_kill_any ||
+	    clip.min_z_clip_disable || clip.max_z_clip_disable || clip.clip_disable ||
+	    clip.force_viewport_index_from_vs_enable) {
+		return reject("clip state");
+	}
+	if (!state.ps_active || !state.ps_input_info.stage ||
+	    state.ps_input_info.ps_pixel_kill_enable ||
+	    state.ps_input_info.ps_sample_mask_export_enable ||
+	    state.ps_input_info.target_output_mode[slot] == 0) {
+		return reject("pixel shader coverage");
+	}
+	for (uint32_t i = 0; i < RENDER_COLOR_ATTACHMENTS_MAX; i++) {
+		if (i != slot && state.ps_input_info.target_output_mode[i] != 0) {
+			return reject("multiple pixel outputs");
+		}
+	}
+	const auto& ps_program   = *state.ps_input_info.stage.program;
+	const auto& ps_resources = *state.ps_input_info.stage.resources;
+	if (!ps_program.info.buffers.empty() || !ps_program.info.addresses.empty() ||
+	    ps_program.info.images.size() != ps_resources.images.size()) {
+		return reject("pixel shader address dependency");
+	}
+	for (uint32_t i = 0; i < ps_program.info.images.size(); i++) {
+		const auto& use     = ps_program.info.images[i];
+		const auto resource = DecodeNativeDescriptor<ShaderTextureResource>(ps_resources.images[i]);
+		const auto address  = resource.Base40();
+		if (use.written || use.atomic ||
+		    (address >= color.base_addr && address < color.base_addr + color.buffer_size)) {
+			return reject("pixel shader destination alias");
+		}
+	}
+	const auto& viewport_state = ctx.GetScreenViewport();
+	const auto& viewport       = viewport_state.viewports[0];
+	const auto  scissor        = calc_final_scissor(viewport_state, scan, color.extent);
+	if (scissor.left != 0 || scissor.top != 0 ||
+	    scissor.right != static_cast<int>(color.extent.width) ||
+	    scissor.bottom != static_cast<int>(color.extent.height)) {
+		return reject("partial scissor");
+	}
+	if (!state.vs_input_info.stage) {
+		return reject("vertex shader runtime");
+	}
+	const auto&            vs_program   = *state.vs_input_info.stage.program;
+	const auto&            vs_resources = *state.vs_input_info.stage.resources;
+	Affine2dProjectionTail projection {};
+	if (!MatchAffine2dProjectionTail(vs_program, &projection) ||
+	    projection.address_resource >= vs_resources.addresses.size()) {
+		return reject("unsupported position program");
+	}
+	VertexAttributeView position {};
+	VertexAttributeView auxiliary {};
+	if (!FindVertexAttribute(state.vs_input_info, 0, &position) ||
+	    !FindVertexAttribute(state.vs_input_info, 3, &auxiliary)) {
+		return reject("vertex input mapping");
+	}
+	std::array<uint32_t, 6> indices {};
+	if (!ReadSixIndices(index_type, index_address, &indices)) {
+		return reject("index read");
+	}
+	std::array<ClipPosition, 6> positions {};
+	const auto constants = vs_resources.addresses[projection.address_resource].guest_base;
+	for (size_t i = 0; i < indices.size(); i++) {
+		const auto vertex = static_cast<int64_t>(indices[i]) + static_cast<int64_t>(vertex_offset);
+		if (!EvaluateAffine2dPosition(position, auxiliary, vertex, constants, &positions[i])) {
+			return reject("position evaluation");
+		}
+	}
+	if (graphics_debug_dump_enabled()) {
+		LOGF("DrawCoverageProof: indices=%u,%u,%u,%u,%u,%u "
+		     "clip=(%.4f,%.4f,%.4f,%.4f) (%.4f,%.4f,%.4f,%.4f) "
+		     "(%.4f,%.4f,%.4f,%.4f) (%.4f,%.4f,%.4f,%.4f) "
+		     "(%.4f,%.4f,%.4f,%.4f) (%.4f,%.4f,%.4f,%.4f)\n",
+		     indices[0], indices[1], indices[2], indices[3], indices[4], indices[5], positions[0].x,
+		     positions[0].y, positions[0].z, positions[0].w, positions[1].x, positions[1].y,
+		     positions[1].z, positions[1].w, positions[2].x, positions[2].y, positions[2].z,
+		     positions[2].w, positions[3].x, positions[3].y, positions[3].z, positions[3].w,
+		     positions[4].x, positions[4].y, positions[4].z, positions[4].w, positions[5].x,
+		     positions[5].y, positions[5].z, positions[5].w);
+	}
+	if (!ProvesAxisAlignedQuadCoverage(positions, viewport, scissor)) {
+		return reject("partial vertex coverage");
+	}
+	LOGF("DrawCoverageProof: full display overwrite proven by affine quad coverage, "
+	     "addr=0x%016" PRIx64 " extent=%ux%u constants=0x%016" PRIx64 "\n",
+	     color.base_addr, color.extent.width, color.extent.height, constants);
+	return true;
+}
 
 static bool DrawHasActivePixelShader(const HW::Context* ctx, const HW::Shader* sh_ctx,
                                      const DrawRenderState& state, const DrawCallInfo& draw) {
@@ -608,6 +1190,228 @@ struct DrawIndexBufferSource {
 	uint64_t    size      = 0;
 	VkIndexType type      = VK_INDEX_TYPE_UINT16;
 };
+
+static void AcquireDisplayColorTarget(const RenderColorInfo& target, VideoOutAccessIntent intent) {
+	if (target.type != RenderColorType::DisplayBuffer) {
+		return;
+	}
+	if (target.vulkan_buffer == nullptr || target.extent.width == 0 || target.extent.height == 0) {
+		EXIT("Render: invalid display color target acquisition\n");
+	}
+	VideoOutAccess access {};
+	access.intent           = intent;
+	access.base_mip_level   = target.base_mip_level;
+	access.base_array_layer = 0;
+	access.layer_count      = 1;
+	access.offset_x         = 0;
+	access.offset_y         = 0;
+	access.width            = target.extent.width;
+	access.height           = target.extent.height;
+	g_render_ctx->GetTextureCache()->AcquireVideoOut(
+	    static_cast<VideoOutVulkanImage*>(target.vulkan_buffer), access);
+}
+
+bool ResolveUnitQuadPresentationViewport(const std::array<std::array<float, 2>, 4>& ndc,
+                                         VkExtent2D extent, std::array<float, 2>* scale,
+                                         std::array<float, 2>* offset) {
+	if (scale == nullptr || offset == nullptr || extent.width == 0 || extent.height == 0) {
+		return false;
+	}
+	for (const auto& point: ndc) {
+		if (!std::isfinite(point[0]) || !std::isfinite(point[1])) {
+			return false;
+		}
+	}
+	const float left   = ndc[0][0];
+	const float right  = ndc[1][0];
+	const float top    = ndc[0][1];
+	const float bottom = ndc[2][1];
+	const float span_x = right - left;
+	const float span_y = bottom - top;
+	if (span_x <= std::numeric_limits<float>::epsilon() ||
+	    std::abs(span_y) <= std::numeric_limits<float>::epsilon()) {
+		return false;
+	}
+	const float epsilon = std::max(1.0e-6f, std::max(std::abs(span_x), std::abs(span_y)) * 1.0e-4f);
+	const auto  close = [epsilon](float lhs, float rhs) { return std::abs(lhs - rhs) <= epsilon; };
+	if (!close(ndc[0][0], left) || !close(ndc[0][1], top) || !close(ndc[1][0], right) ||
+	    !close(ndc[1][1], top) || !close(ndc[2][0], left) || !close(ndc[2][1], bottom) ||
+	    !close(ndc[3][0], right) || !close(ndc[3][1], bottom)) {
+		return false;
+	}
+	(*scale)[0]  = static_cast<float>(extent.width) / span_x;
+	(*scale)[1]  = static_cast<float>(extent.height) / span_y;
+	(*offset)[0] = -left * (*scale)[0];
+	(*offset)[1] = -top * (*scale)[1];
+	return std::isfinite((*scale)[0]) && std::isfinite((*scale)[1]) &&
+	       std::isfinite((*offset)[0]) && std::isfinite((*offset)[1]);
+}
+
+static bool IsUnitPresentationQuad(const ShaderVertexInputInfo& inputs, uint32_t index_type,
+                                   const void* index_address, int32_t vertex_offset) {
+	std::array<uint32_t, 6> indices {};
+	if (!ReadSixIndices(index_type, index_address, &indices) ||
+	    indices != std::array<uint32_t, 6> {0, 1, 2, 1, 3, 2}) {
+		return false;
+	}
+	VertexAttributeView position {};
+	if (!FindVertexAttribute(inputs, 0, &position) ||
+	    position.format != Prospero::GpuEnumValue(Prospero::BufferFormat::k32_32_32_32Float)) {
+		return false;
+	}
+	constexpr std::array<std::array<float, 2>, 4> expected {
+	    {{0.0f, 0.0f}, {1.0f, 0.0f}, {0.0f, 1.0f}, {1.0f, 1.0f}}};
+	for (uint32_t i = 0; i < expected.size(); i++) {
+		float values[2] = {};
+		if (!ReadVertexFloats(position, static_cast<int64_t>(i) + vertex_offset, 2, values) ||
+		    values[0] != expected[i][0] || values[1] != expected[i][1]) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool TryPrepareDisplayPresentationViewport(const HW::Context&    ctx,
+                                                  const HW::UserConfig& ucfg,
+                                                  const DrawCallInfo& draw, DrawRenderState* state,
+                                                  uint32_t index_type, const void* index_address,
+                                                  int32_t vertex_offset) {
+	if (state == nullptr || state->color_count != 1 ||
+	    state->color_info[0].type != RenderColorType::DisplayBuffer ||
+	    state->color_info[0].vulkan_buffer == nullptr || !state->ps_active ||
+	    !state->ps_input_info.stage || !state->vs_input_info.stage || draw.index_count != 6 ||
+	    draw.instance_count != 1 || draw.flags != 0 || draw.first_instance != 0 ||
+	    ucfg.GetPrimType() != Prospero::GpuEnumValue(Prospero::PrimitiveType::kTriList) ||
+	    !IsUnitPresentationQuad(state->vs_input_info, index_type, index_address, vertex_offset)) {
+		return false;
+	}
+
+	const auto& target = state->color_info[0];
+	const auto  slot   = target.target_slot;
+	if (slot >= RENDER_COLOR_ATTACHMENTS_MAX) {
+		return false;
+	}
+	const auto  slot_bit       = uint32_t {0x0f} << (slot * 4u);
+	const auto& blend          = ctx.GetBlendControl(slot);
+	const auto& depth          = ctx.GetDepthControl();
+	const auto& control        = ctx.GetColorControl();
+	const auto& shader         = ctx.GetShaderRegisters();
+	const auto& scan           = ctx.GetScanModeControl();
+	const auto& viewport_state = ctx.GetScreenViewport();
+	const auto  scissor        = calc_final_scissor(viewport_state, scan, target.extent);
+	if (ctx.GetRenderTargetMask() != slot_bit || shader.m_cbShaderMask != slot_bit ||
+	    control.mode != 1 || control.op != 0xcc || blend.enable || depth.z_enable ||
+	    depth.z_write_enable || depth.stencil_enable || depth.depth_bounds_enable ||
+	    state->ps_input_info.ps_pixel_kill_enable ||
+	    state->ps_input_info.ps_sample_mask_export_enable ||
+	    state->ps_input_info.target_output_mode[slot] == 0 || scissor.left != 0 ||
+	    scissor.top != 0 || scissor.right != static_cast<int>(target.extent.width) ||
+	    scissor.bottom != static_cast<int>(target.extent.height)) {
+		return false;
+	}
+
+	const auto& program   = *state->ps_input_info.stage.program;
+	const auto& resources = *state->ps_input_info.stage.resources;
+	if (program.info.images.size() != 1 || resources.images.size() != 1 ||
+	    program.info.samplers.size() != 1 || resources.samplers.size() != 1 ||
+	    !program.info.buffers.empty() || !resources.buffers.empty() ||
+	    !program.info.addresses.empty() || !resources.addresses.empty()) {
+		return false;
+	}
+	const auto& use = program.info.images[0];
+	if (use.kind != ShaderRecompiler::IR::ResourceKind::Image || !use.read || use.written ||
+	    use.atomic || use.depth_compare) {
+		return false;
+	}
+	const auto source_descriptor =
+	    DecodeNativeDescriptor<ShaderTextureResource>(resources.images[0]);
+	const auto source_width  = static_cast<uint32_t>(source_descriptor.Width5()) + 1u;
+	const auto source_height = static_cast<uint32_t>(source_descriptor.Height5()) + 1u;
+	const auto source_levels = static_cast<uint32_t>(source_descriptor.MaxMip()) + 1u;
+	if (source_descriptor.IsNull() || source_width != target.extent.width ||
+	    source_height != target.extent.height || source_descriptor.Depth() != 0 ||
+	    source_descriptor.BaseLevel() != 0 || source_descriptor.LastLevel() != 0 ||
+	    source_levels != 1 || source_descriptor.BaseArray5() != 0 ||
+	    source_descriptor.Type() != Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) ||
+	    source_descriptor.TileMode() != Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) ||
+	    source_descriptor.DstSelXYZW() != DstSel(4, 5, 6, 7)) {
+		return false;
+	}
+	if (source_descriptor.Base40() == target.base_addr) {
+		return false;
+	}
+
+	const auto&            vs_program   = *state->vs_input_info.stage.program;
+	const auto&            vs_resources = *state->vs_input_info.stage.resources;
+	Affine2dProjectionTail projection {};
+	if (!MatchAffine2dProjectionTail(vs_program, &projection) ||
+	    projection.address_resource >= vs_resources.addresses.size()) {
+		return false;
+	}
+	VertexAttributeView position {};
+	VertexAttributeView auxiliary {};
+	if (!FindVertexAttribute(state->vs_input_info, 0, &position) ||
+	    !FindVertexAttribute(state->vs_input_info, 3, &auxiliary)) {
+		return false;
+	}
+	std::array<std::array<float, 2>, 4> ndc {};
+	const auto constants = vs_resources.addresses[projection.address_resource].guest_base;
+	for (uint32_t i = 0; i < ndc.size(); i++) {
+		ClipPosition clip {};
+		if (!EvaluateAffine2dPosition(position, auxiliary, static_cast<int64_t>(i) + vertex_offset,
+		                              constants, &clip) ||
+		    !std::isfinite(clip.w) || clip.w <= 0.0f || clip.z < 0.0f || clip.z > clip.w) {
+			return false;
+		}
+		ndc[i] = {clip.x / clip.w, clip.y / clip.w};
+	}
+	if (!ResolveUnitQuadPresentationViewport(ndc, target.extent, &state->presentation_scale,
+	                                         &state->presentation_offset)) {
+		return false;
+	}
+	state->presentation_viewport = true;
+	static std::atomic<uint32_t> log_count {0};
+	if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+		LOGF("Render: expanded unit-quad presentation source=0x%016" PRIx64
+		     " destination=0x%016" PRIx64 " extent=%ux%u scale=%.3f,%.3f offset=%.3f,%.3f\n",
+		     source_descriptor.Base40(), target.base_addr, source_width, source_height,
+		     state->presentation_scale[0], state->presentation_scale[1],
+		     state->presentation_offset[0], state->presentation_offset[1]);
+	}
+	return true;
+}
+
+static void FinalizeDrawColorTargetAccess(DrawRenderState*     state,
+                                          VideoOutAccessIntent display_intent) {
+	EXIT_IF(state == nullptr);
+	for (uint32_t i = 0; i < state->color_count; i++) {
+		state->color_info[i].color_load_discard =
+		    state->color_info[i].type == RenderColorType::DisplayBuffer &&
+		    display_intent == VideoOutAccessIntent::FullOverwrite;
+		AcquireDisplayColorTarget(state->color_info[i], display_intent);
+		MarkRenderTargetGpuWritten(state->color_info[i]);
+	}
+}
+
+static bool CreateDrawFramebuffer(CommandBuffer* buffer, const DrawCallInfo& draw,
+                                  bool skip_null_framebuffer, bool log_setup_phases,
+                                  DrawRenderState* state) {
+	EXIT_IF(buffer == nullptr);
+	EXIT_IF(draw.name == nullptr);
+	EXIT_IF(state == nullptr);
+	if (log_setup_phases) {
+		LogDrawPhase(draw.name, "CreateFramebuffer");
+	}
+	state->framebuffer = g_render_ctx->GetFramebufferCache()->CreateFramebuffer(
+	    state->color_info, state->color_count, &state->depth_info);
+	if (state->framebuffer == nullptr && skip_null_framebuffer) {
+		return false;
+	}
+	EXIT_NOT_IMPLEMENTED(state->framebuffer == nullptr);
+	EXIT_NOT_IMPLEMENTED(state->framebuffer->render_pass == nullptr);
+	state->vk_buffer = buffer->GetPool()->buffers[buffer->GetIndex()];
+	return true;
+}
 
 static uint64_t VertexBufferDescriptorSize(const ShaderVertexInputBuffer& buffer) {
 	return (buffer.stride != 0 ? static_cast<uint64_t>(buffer.stride) * buffer.num_records
@@ -671,7 +1475,7 @@ static bool PrepareDrawRenderState(uint64_t submit_id, CommandBuffer* buffer, HW
                                    HW::UserConfig* ucfg, HW::Shader* sh_ctx,
                                    const DrawCallInfo& draw, uint32_t render_target_slice_offset,
                                    bool skip_null_framebuffer, bool log_setup_phases,
-                                   DrawRenderState* state) {
+                                   bool defer_color_target_access, DrawRenderState* state) {
 	EXIT_IF(buffer == nullptr);
 	EXIT_IF(ctx == nullptr);
 	EXIT_IF(ucfg == nullptr);
@@ -700,7 +1504,11 @@ static bool PrepareDrawRenderState(uint64_t submit_id, CommandBuffer* buffer, HW
 			                         &state->color_info[state->color_count],
 			                         render_target_slice_offset, slot);
 			if (state->color_info[state->color_count].vulkan_buffer != nullptr) {
-				MarkRenderTargetGpuWritten(state->color_info[state->color_count]);
+				if (!defer_color_target_access) {
+					AcquireDisplayColorTarget(state->color_info[state->color_count],
+					                          VideoOutAccessIntent::Preserve);
+					MarkRenderTargetGpuWritten(state->color_info[state->color_count]);
+				}
 				state->color_count++;
 			}
 		}
@@ -714,23 +1522,14 @@ static bool PrepareDrawRenderState(uint64_t submit_id, CommandBuffer* buffer, HW
 		return false;
 	}
 	state->ps_active = DrawHasActivePixelShader(ctx, sh_ctx, *state, draw);
-
-	if (log_setup_phases) {
-		LogDrawPhase(draw.name, "CreateFramebuffer");
+	if (defer_color_target_access) {
+		return true;
 	}
-	state->framebuffer = g_render_ctx->GetFramebufferCache()->CreateFramebuffer(
-	    state->color_info, state->color_count, &state->depth_info);
-
-	if (state->framebuffer == nullptr && skip_null_framebuffer) {
+	if (!CreateDrawFramebuffer(buffer, draw, skip_null_framebuffer, log_setup_phases, state)) {
 		LogFramebufferSkip(draw.name, state->color_info[0], state->depth_info, ctx, ucfg,
 		                   draw.index_count, draw.flags);
 		return false;
 	}
-	EXIT_NOT_IMPLEMENTED(state->framebuffer == nullptr);
-	EXIT_NOT_IMPLEMENTED(state->framebuffer->render_pass == nullptr);
-
-	state->vk_buffer = buffer->GetPool()->buffers[buffer->GetIndex()];
-
 	return true;
 }
 
@@ -830,7 +1629,7 @@ static void BindDrawIndexBuffer(CommandBuffer* buffer, VkCommandBuffer vk_buffer
 static void LogDrawStateIfNeeded(HW::Context* ctx, HW::UserConfig* ucfg, const DrawCallInfo& draw,
                                  const DrawRenderState& state, bool always_log,
                                  bool force_legacy_rect_log, uint32_t index_type_and_size,
-                                 const void* index_addr) {
+                                 const void* index_addr, int32_t vertex_offset) {
 	EXIT_IF(ctx == nullptr);
 	EXIT_IF(ucfg == nullptr);
 	EXIT_IF(draw.name == nullptr);
@@ -846,8 +1645,10 @@ static void LogDrawStateIfNeeded(HW::Context* ctx, HW::UserConfig* ucfg, const D
 	LogDrawTargetState(draw.name, state.color_info[0], state.depth_info, ctx, ucfg,
 	                   state.ps_input_info, draw.index_count, draw.flags);
 	LogDrawInputState(state.color_info[0], state.vs_input_info, index_type_and_size,
-	                  draw.index_count, index_addr);
-	// LogDrawTextureState(draw.name, state.color_info[0], state.ps_input_info);
+	                  draw.index_count, index_addr, vertex_offset);
+	if (state.ps_active && state.ps_input_info.stage) {
+		LogDrawTextureState(draw.name, state.color_info[0], state.ps_input_info);
+	}
 }
 
 static bool IsHostExpandedRectListDrawSupported(const ShaderVertexInputInfo& vs_input_info,
@@ -869,7 +1670,6 @@ static void EmitDrawPrimitives(const HW::UserConfig* ucfg, VkCommandBuffer vk_bu
                                const DrawEmitInfo& emit) {
 	EXIT_IF(ucfg == nullptr);
 	EXIT_IF(draw.name == nullptr);
-
 	switch (static_cast<Prospero::PrimitiveType>(ucfg->GetPrimType())) {
 		case Prospero::PrimitiveType::kPointList:
 		case Prospero::PrimitiveType::kLineList:
@@ -946,8 +1746,14 @@ static void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer* buffer, HW::C
 			SetDrawDebugPhase(buffer, submit_id, draw, 0x100u);
 		}
 		vkCmdBindPipeline(state->vk_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline);
-		const auto dynamic_params = BuildGraphicsDynamicParams(
+		auto dynamic_params = BuildGraphicsDynamicParams(
 		    *ctx, state->color_info, state->color_count, state->depth_info);
+		if (state->presentation_viewport) {
+			dynamic_params.viewport_scale[0]  = state->presentation_scale[0];
+			dynamic_params.viewport_scale[1]  = state->presentation_scale[1];
+			dynamic_params.viewport_offset[0] = state->presentation_offset[0];
+			dynamic_params.viewport_offset[1] = state->presentation_offset[1];
+		}
 		SetDynamicParams(state->vk_buffer, dynamic_params);
 
 		// EXIT_NOT_IMPLEMENTED(vs_input_info.buffers_num > 1);
@@ -1140,16 +1946,28 @@ void RenderDrawIndex(uint64_t submit_id, CommandBuffer* buffer, HW::Context* ctx
 
 	DrawRenderState state {};
 	if (!PrepareDrawRenderState(submit_id, buffer, ctx, ucfg, sh_ctx, draw,
-	                            render_target_slice_offset, false, true, &state)) {
+	                            render_target_slice_offset, false, true, true, &state)) {
 		return;
 	}
 
 	RefreshShaders(ctx, sh_ctx, draw, true, &state);
 
-	LogDrawStateIfNeeded(ctx, ucfg, draw, state, true, false, index_type_and_size, index_addr);
-
 	const auto vertex_offset =
 	    ResolveVertexOffset(ucfg->GetIndexOffset(), state.vs_input_info) + vertex_offset_add;
+	LogDrawStateIfNeeded(ctx, ucfg, draw, state, true, false, index_type_and_size, index_addr,
+	                     vertex_offset);
+	const bool presentation_viewport = TryPrepareDisplayPresentationViewport(
+	    *ctx, *ucfg, draw, &state, index_type_and_size, index_addr, vertex_offset);
+	const bool full_display_overwrite =
+	    presentation_viewport ||
+	    ProvesFullDisplayOverwrite(*ctx, *ucfg, draw, state, index_type_and_size, index_addr,
+	                               vertex_offset);
+	const auto display_intent = full_display_overwrite ? VideoOutAccessIntent::FullOverwrite
+	                                                   : VideoOutAccessIntent::Preserve;
+	FinalizeDrawColorTargetAccess(&state, display_intent);
+	if (!CreateDrawFramebuffer(buffer, draw, false, true, &state)) {
+		return;
+	}
 
 	DrawEmitInfo emit {};
 	emit.indexed       = true;
@@ -1223,7 +2041,7 @@ void RenderDrawIndexAuto(uint64_t submit_id, CommandBuffer* buffer, HW::Context*
 
 	DrawRenderState state {};
 	if (!PrepareDrawRenderState(submit_id, buffer, ctx, ucfg, sh_ctx, draw,
-	                            render_target_slice_offset, true, false, &state)) {
+	                            render_target_slice_offset, true, false, false, &state)) {
 		return;
 	}
 
@@ -1250,14 +2068,13 @@ void RenderDrawIndexAuto(uint64_t submit_id, CommandBuffer* buffer, HW::Context*
 		return;
 	}
 
+	const uint32_t draw_vertex_count = (draw_prim7_as_ngg ? 4u : index_count);
+	const auto vertex_offset = ResolveVertexOffset(ucfg->GetIndexOffset(), state.vs_input_info) +
+	                           static_cast<int32_t>(first_vertex);
 	LogDrawStateIfNeeded(ctx, ucfg, draw, state, false,
 	                     ucfg->GetPrimType() ==
 	                         Prospero::GpuEnumValue(Prospero::PrimitiveType::kRectListLegacy),
-	                     0, nullptr);
-
-	const uint32_t draw_vertex_count = (draw_prim7_as_ngg ? 4u : index_count);
-	const auto   vertex_offset = ResolveVertexOffset(ucfg->GetIndexOffset(), state.vs_input_info) +
-	                             static_cast<int32_t>(first_vertex);
+	                     0, nullptr, vertex_offset);
 	DrawEmitInfo emit {};
 	emit.draw_prim7_as_ngg = draw_prim7_as_ngg;
 	emit.draw_vertex_count = draw_vertex_count;
@@ -1307,6 +2124,7 @@ static bool ResolveColorTargets(uint64_t submit_id, CommandBuffer* buffer, const
 	    src.type == RenderColorType::NoColorOutput || dst.type == RenderColorType::NoColorOutput) {
 		return false;
 	}
+	AcquireDisplayColorTarget(src, VideoOutAccessIntent::Preserve);
 	if (IsSameColorResolveSubresource(src, dst)) {
 		return true;
 	}
@@ -1316,11 +2134,17 @@ static bool ResolveColorTargets(uint64_t submit_id, CommandBuffer* buffer, const
 	if (width == 0 || height == 0) {
 		return false;
 	}
+	const bool full_destination =
+	    dst.base_mip_level == 0 && width == dst.extent.width && height == dst.extent.height &&
+	    src.extent.width == dst.extent.width && src.extent.height == dst.extent.height &&
+	    src.format == dst.format;
+	AcquireDisplayColorTarget(dst, full_destination ? VideoOutAccessIntent::FullOverwrite
+	                                                : VideoOutAccessIntent::Preserve);
 
 	const std::array regions {MakeColorResolveCopy(src, dst, width, height)};
 
-	MarkRenderTargetGpuWritten(dst);
 	UtilImageToImage(buffer, regions, dst.vulkan_buffer, dst.vulkan_buffer->layout);
+	MarkRenderTargetGpuWritten(dst);
 	return true;
 }
 

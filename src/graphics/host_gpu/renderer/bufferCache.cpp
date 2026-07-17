@@ -698,9 +698,11 @@ std::pair<VulkanBuffer*, uint64_t> BufferCache::ObtainBuffer(CommandBuffer*  com
 		}
 	}
 	if (m_texture_cache->HasMetaOverlap(begin, end - begin)) {
-		EXIT("BufferCache: buffer aliases metadata pages, addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     "\n",
-		     begin, end - begin);
+		EXIT("BufferCache: buffer aliases metadata pages, request=0x%016" PRIx64
+		     "+0x%016" PRIx64 " cache=0x%016" PRIx64 "+0x%016" PRIx64
+		     " read=%d written=%d formatted=%d metadata_gpu_owned=%d\n",
+		     vaddr, size, begin, end - begin, is_read, is_written, is_formatted,
+		     m_texture_cache->IsMetaGpuModified(vaddr, size));
 	}
 	// Cache allocations are tracker-page aligned, but byte-disjoint buffers and images may share
 	// an edge page. Clean read-only buffer and image views may coexist; Kyty retains a hard failure
@@ -1240,6 +1242,41 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
+}
+
+void BufferCache::SupersedeCpuRangeWithImage(uint64_t vaddr, uint64_t size) {
+	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
+	    size > TRACKER_ADDRESS_SIZE - vaddr) {
+		EXIT("BufferCache: invalid image-superseded range, addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 "\n",
+		     vaddr, size);
+	}
+	FaultSafeCacheLock lock(this, m_mutex);
+	const bool         gpu_modified = m_memory_tracker.IsRegionGpuModified(vaddr, size);
+	const auto         dirty_ranges = m_gpu_modified_ranges.Intersections(vaddr, size);
+	if (gpu_modified || !dirty_ranges.empty()) {
+		EXIT("BufferCache: image overwrite cannot supersede GPU-current buffer bytes, "
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " tracker_dirty=%d byte_ranges=%zu\n",
+		     vaddr, size, gpu_modified, dirty_ranges.size());
+	}
+	const bool cpu_modified = m_memory_tracker.IsRegionCpuModified(vaddr, size);
+	if (cpu_modified) {
+		m_memory_tracker.ForEachUploadRange(
+		    vaddr, size, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+	}
+	if (m_memory_tracker.IsRegionCpuModified(vaddr, size) ||
+	    m_memory_tracker.IsRegionGpuModified(vaddr, size) ||
+	    !m_gpu_modified_ranges.Intersections(vaddr, size).empty()) {
+		EXIT("BufferCache: image overwrite did not retire buffer ownership, addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 "\n",
+		     vaddr, size);
+	}
+	if (cpu_modified) {
+		LOGF("BufferCache: full image overwrite superseded CPU-current bytes, addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 "\n",
+		     vaddr, size);
+	}
 }
 
 void BufferCache::PublishImageBacking(uint64_t vaddr, uint64_t size) {

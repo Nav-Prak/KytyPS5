@@ -46,7 +46,11 @@ public:
 	FindDepthTarget(CommandBuffer* command, GraphicContext* ctx, const DepthTargetInfo& info);
 	[[nodiscard]] std::vector<VideoOutVulkanImage*>
 	     RegisterVideoOutSurfaces(GraphicContext* ctx, const std::vector<VideoOutInfo>& infos);
-	void RefreshVideoOut(VideoOutVulkanImage* image, bool render_target = false);
+	void AcquireVideoOut(VideoOutVulkanImage* image, const VideoOutAccess& access);
+	void BindVideoOutRenderMetadata(VideoOutVulkanImage* image, uint64_t metadata_address);
+	[[nodiscard]] bool ConsumeVideoOutDccMetadataTransfer(
+	    CommandBuffer* command, uint64_t source_address, uint64_t source_size,
+	    uint64_t destination_address, uint64_t destination_size);
 	void UnregisterVideoOutSurfaces(const std::vector<VideoOutVulkanImage*>& images);
 	[[nodiscard]] bool ClearColorImageFromBuffer(CommandBuffer* command, uint64_t vaddr,
 	                                             uint64_t size, uint32_t packed_clear);
@@ -93,6 +97,7 @@ public:
 	[[nodiscard]] bool IsMetaRange(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasMetaRangeOverlap(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasMetaOverlap(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] uint64_t BufferCompatiblePrefixSize(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMetaGpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMetaCleared(uint64_t vaddr, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t vaddr);

@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/spirvEmitter/spirvEmitterInternal.h"
 
+#include <fmt/format.h>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 const IR::DescriptorBinding* DescriptorBinding(const EmitterState&       state,
@@ -489,6 +491,10 @@ void EmitHeaderAndTypes(EmitterState* state) {
 	state->main_func                                     = state->builder.AllocateId();
 	state->entry_label                                   = state->builder.AllocateId();
 	state->glsl_std450                                   = state->builder.AllocateId();
+	if (state->debug_printf_enabled) {
+		state->debug_printf_import          = state->builder.AllocateId();
+		state->debug_printf_position_format = state->builder.AllocateId();
+	}
 
 	state->builder.AddCapability({CapabilityShader});
 	state->builder.AddCapability({CapabilityImageQuery});
@@ -513,6 +519,13 @@ void EmitHeaderAndTypes(EmitterState* state) {
 	if (state->needs_compute_derivatives && state->stage == ShaderType::Compute) {
 		state->builder.AddCapability({CapabilityComputeDerivativeGroupQuadsKHR});
 		state->builder.AddExtension("SPV_KHR_compute_shader_derivatives");
+	}
+	if (state->debug_printf_enabled) {
+		state->builder.AddExtension("SPV_KHR_non_semantic_info");
+		state->builder.AddExtInstImport(state->debug_printf_import, "NonSemantic.DebugPrintf");
+		const auto format = fmt::format("VS hash=0x{:016x} vertex=%d position=(%f,%f,%f,%f)",
+		                                state->program->shader_hash);
+		state->builder.AddString(state->debug_printf_position_format, format.c_str());
 	}
 	state->builder.AddExtInstImport(state->glsl_std450, "GLSL.std.450");
 	state->builder.AddMemoryModel({AddressingModelLogical, MemoryModelGLSL450});

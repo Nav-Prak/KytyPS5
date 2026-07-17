@@ -94,6 +94,8 @@ VulkanFramebuffer* FramebufferCache::CreateFramebuffer(RenderColorInfo* colors,
 			        (i < color_count && with_color[i] ? colors[i].vulkan_view : nullptr) &&
 			    f.color_clear_enable[i] ==
 			        (i < color_count && with_color[i] && colors[i].color_clear_enable) &&
+			    f.color_load_discard[i] ==
+			        (i < color_count && with_color[i] && colors[i].color_load_discard) &&
 			    f.color_layout[i] == color_layout[i];
 		}
 		if (color_match &&
@@ -139,8 +141,10 @@ VulkanFramebuffer* FramebufferCache::CreateFramebuffer(RenderColorInfo* colors,
 		attachments[i].flags          = 0;
 		attachments[i].format         = colors[i].format;
 		attachments[i].samples        = VK_SAMPLE_COUNT_1_BIT;
-		attachments[i].loadOp         = (colors[i].color_clear_enable ? VK_ATTACHMENT_LOAD_OP_CLEAR
-		                                                              : VK_ATTACHMENT_LOAD_OP_LOAD);
+		attachments[i].loadOp =
+		    (colors[i].color_clear_enable   ? VK_ATTACHMENT_LOAD_OP_CLEAR
+		     : colors[i].color_load_discard ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
+		                                    : VK_ATTACHMENT_LOAD_OP_LOAD);
 		attachments[i].storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
 		attachments[i].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
 		attachments[i].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
@@ -270,6 +274,8 @@ VulkanFramebuffer* FramebufferCache::CreateFramebuffer(RenderColorInfo* colors,
 		fnew.color_view[i] = (i < color_count && with_color[i] ? colors[i].vulkan_view : nullptr);
 		fnew.color_clear_enable[i] =
 		    (i < color_count && with_color[i] && colors[i].color_clear_enable);
+		fnew.color_load_discard[i] =
+		    (i < color_count && with_color[i] && colors[i].color_load_discard);
 		fnew.color_layout[i] = color_layout[i];
 	}
 	fnew.depth_id             = (with_depth ? depth->vulkan_buffer->memory.unique_id : 0);

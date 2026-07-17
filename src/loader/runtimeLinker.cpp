@@ -344,6 +344,10 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		guest_root_frame[0]    = 0;
 		guest_root_frame[1]    = 0;
 
+		// r12 and r13 are used as scratch registers before all input operands are consumed.
+		// Declare them as clobbers even though the assembly restores their original values, or
+		// the compiler may allocate func/guest_rsp/guest_rbp to a register that is overwritten
+		// before it is read.
 		asm volatile("pushq %%r12\n\t"
 		             "pushq %%r13\n\t"
 		             "movq %%rsp, %%r12\n\t"
@@ -358,7 +362,8 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		             :
 		             : [func] "r"(func), "D"(params),
 		               "S"(atexit_func), [guest_rsp] "r"(guest_rsp), [guest_rbp] "r"(guest_rbp)
-		             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0",
+		             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12",
+		               "r13", "xmm0",
 		               "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9",
 		               "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
 		return;
@@ -377,9 +382,9 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 	             :
 	             : [func] "r"(func), "D"(params),
 	               "S"(atexit_func), [guest_rbp] "r"(guest_root_frame)
-	             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1",
-	               "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
-	               "xmm12", "xmm13", "xmm14", "xmm15");
+	             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "r13",
+	               "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9",
+	               "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
 #else
 	(void)stack_top;
 	reinterpret_cast<entry_func_t>(addr)(params, atexit_func);
@@ -729,19 +734,32 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		dump_guest_qwords("guest r14", info->r14);
 		dump_guest_qwords("guest r15", info->r15);
 
-		if (info->exception_address == 0x000000090064364e && info->rbx != 0) {
-			auto* local = reinterpret_cast<const uint64_t*>(info->rbx);
-			dump_guest_qwords("vorbis obj", local[0]);
-			dump_guest_qwords("vorbis len", info->rcx);
-		}
-
-		EXIT("Access violation: %s [%016" PRIx64 "] %s\n",
+		auto* fault_program = Common::Singleton<Loader::RuntimeLinker>::Instance()->FindProgramByAddr(
+		    info->exception_address);
+		const auto fault_offset =
+		    fault_program != nullptr ? info->exception_address - fault_program->base_vaddr : 0;
+		const auto fault_module =
+		    fault_program != nullptr
+		        ? Common::FilenameWithoutDirectory(Common::PathToGenericString(fault_program->file_name))
+		        : std::string("???");
+		EXIT("Access violation: %s [%016" PRIx64 "] ip=%016" PRIx64
+		     " module=%s+0x%016" PRIx64 " thread=%d"
+		     " rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64
+		     " rdx=%016" PRIx64 " rdi=%016" PRIx64 " rsi=%016" PRIx64
+		     " rbp=%016" PRIx64 " r8=%016" PRIx64 " r9=%016" PRIx64
+		     " rsp=%016" PRIx64 " %s\n",
 		     Common::EnumName(info->access_violation_type).c_str(), info->access_violation_vaddr,
+		     info->exception_address, fault_module.c_str(), fault_offset,
+		     Common::Thread::GetThreadIdUnique(), info->rax, info->rbx, info->rcx, info->rdx,
+		     info->rdi, info->rsi, info->rbp, info->r8, info->r9, info->rsp,
 		     (info->access_violation_vaddr == g_invalid_memory ? "(Unpatched object)" : ""));
 		return false;
 	}
 
-	EXIT("Unknown exception!!! (%08" PRIx32 ")", info->native_code);
+	EXIT("Unknown exception!!! (%08" PRIx32 ") ip=%016" PRIx64 " rax=%016" PRIx64
+	     " rdi=%016" PRIx64 " rsi=%016" PRIx64 " rdx=%016" PRIx64 " rcx=%016" PRIx64,
+	     info->native_code, info->exception_address, info->rax, info->rdi, info->rsi, info->rdx,
+	     info->rcx);
 	return false;
 }
 

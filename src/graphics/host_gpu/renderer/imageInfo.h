@@ -91,12 +91,57 @@ struct DepthTargetInfo {
 	bool     stencil_htile_compressed = false;
 };
 
-enum class VideoOutCompression : uint8_t { Uncompressed, Dcc256_64_64, Unsupported };
+// These modes identify validated guest DCC register layouts. They do not authorize decoding or
+// uploading compressed guest memory; that remains guarded by the native-image ownership checks.
+enum class VideoOutCompression : uint8_t {
+	Uncompressed,
+	Dcc256_64_64,
+	Dcc256_256,
+	Unsupported
+};
+
+// DCC metadata encodings whose decoded pixel contents can be established without reading the
+// compressed color payload. Keep this list narrower than the hardware encoding list: each admitted
+// value must have an exact native-image initialization path.
+enum class VideoOutDccInitialContent : uint8_t { Unsupported, Clear0000 };
+
+[[nodiscard]] inline constexpr VideoOutDccInitialContent
+ClassifyVideoOutDccInitialContent(uint8_t metadata_code) noexcept {
+	return metadata_code == 0x00 ? VideoOutDccInitialContent::Clear0000
+	                             : VideoOutDccInitialContent::Unsupported;
+}
+
+enum class SurfaceContentState : uint8_t { Uninitialized, GuestCurrent, NativeCurrent, Coherent };
+
+enum class VideoOutAccessIntent : uint8_t { Preserve, FullOverwrite, Present };
+
+struct VideoOutAccess {
+	VideoOutAccessIntent intent           = VideoOutAccessIntent::Preserve;
+	uint32_t             base_mip_level   = 0;
+	uint32_t             base_array_layer = 0;
+	uint32_t             layer_count      = 1;
+	uint32_t             offset_x         = 0;
+	uint32_t             offset_y         = 0;
+	uint32_t             width            = 0;
+	uint32_t             height           = 0;
+};
+
+struct DccMetadataPlane {
+	uint64_t address = 0;
+	uint64_t size    = 0;
+};
+
+[[nodiscard]] inline constexpr bool
+IsKnownCompressedVideoOut(VideoOutCompression compression) noexcept {
+	return compression == VideoOutCompression::Dcc256_64_64 ||
+	       compression == VideoOutCompression::Dcc256_256;
+}
 
 struct VideoOutInfo {
 	uint64_t            address           = 0;
 	uint64_t            size              = 0;
 	uint64_t            metadata_address  = 0;
+	uint64_t            metadata_size     = 0;
 	VkFormat            format            = VK_FORMAT_UNDEFINED;
 	uint32_t            guest_format      = 0;
 	uint32_t            width             = 0;
@@ -108,25 +153,80 @@ struct VideoOutInfo {
 	VideoOutCompression compression       = VideoOutCompression::Unsupported;
 };
 
+// Prospero video-out DCC modes covered here use one metadata byte per 256 bytes of color data.
+// Metadata allocations are surface-aligned so adjacent render/display DCC planes remain distinct.
+[[nodiscard]] inline constexpr uint64_t
+ComputeVideoOutDccMetadataSize(uint64_t color_size, VideoOutCompression compression) noexcept {
+	constexpr uint64_t DCC_DATA_BYTES_PER_META_BYTE = 256;
+	constexpr uint64_t DCC_METADATA_ALIGNMENT       = 64 * 1024;
+	if (!IsKnownCompressedVideoOut(compression) || color_size == 0) {
+		return 0;
+	}
+	if (color_size > UINT64_MAX - (DCC_DATA_BYTES_PER_META_BYTE - 1)) {
+		return 0;
+	}
+	const auto metadata_bytes =
+	    (color_size + DCC_DATA_BYTES_PER_META_BYTE - 1) / DCC_DATA_BYTES_PER_META_BYTE;
+	if (metadata_bytes > UINT64_MAX - (DCC_METADATA_ALIGNMENT - 1)) {
+		return 0;
+	}
+	return (metadata_bytes + DCC_METADATA_ALIGNMENT - 1) & ~(DCC_METADATA_ALIGNMENT - 1);
+}
+
+// Prospero's render-to-display DCC repacking kernels describe the meaningful metadata bytes in
+// 16 KiB buffer-cache units; the separately registered plane retains its larger allocation
+// alignment.
+[[nodiscard]] inline constexpr uint64_t
+ComputeVideoOutDccActiveMetadataSize(uint64_t color_size,
+                                     VideoOutCompression compression) noexcept {
+	constexpr uint64_t DCC_DATA_BYTES_PER_META_BYTE = 256;
+	constexpr uint64_t ACTIVE_METADATA_ALIGNMENT     = 16 * 1024;
+	if (!IsKnownCompressedVideoOut(compression) || color_size == 0 ||
+	    color_size > UINT64_MAX - (DCC_DATA_BYTES_PER_META_BYTE - 1)) {
+		return 0;
+	}
+	const auto metadata_bytes =
+	    (color_size + DCC_DATA_BYTES_PER_META_BYTE - 1) / DCC_DATA_BYTES_PER_META_BYTE;
+	if (metadata_bytes > UINT64_MAX - (ACTIVE_METADATA_ALIGNMENT - 1)) {
+		return 0;
+	}
+	return (metadata_bytes + ACTIVE_METADATA_ALIGNMENT - 1) &
+	       ~(ACTIVE_METADATA_ALIGNMENT - 1);
+}
+
+[[nodiscard]] inline constexpr bool IsFullVideoOutOverwrite(const VideoOutInfo&   info,
+                                                            const VideoOutAccess& access) noexcept {
+	return access.intent == VideoOutAccessIntent::FullOverwrite && access.base_mip_level == 0 &&
+	       access.base_array_layer == 0 && access.layer_count == 1 && access.offset_x == 0 &&
+	       access.offset_y == 0 && access.width == info.width && access.height == info.height;
+}
+
 [[nodiscard]] inline VideoOutCompression
 ClassifyVideoOutCompression(bool compressed, uint64_t metadata_address, uint32_t dcc_control,
                             uint64_t dcc_clear_color) noexcept {
 	constexpr uint32_t VIDEO_OUT_DCC_CONTROL_256_64_64 = 0x00000208u;
+	constexpr uint32_t VIDEO_OUT_DCC_CONTROL_256_256   = 0x00000048u;
 	if (!compressed) {
 		return metadata_address == 0 && dcc_control == 0 && dcc_clear_color == 0
 		           ? VideoOutCompression::Uncompressed
 		           : VideoOutCompression::Unsupported;
 	}
-	return metadata_address != 0 && (metadata_address & 0xffu) == 0 &&
-	               dcc_control == VIDEO_OUT_DCC_CONTROL_256_64_64 && dcc_clear_color == 0
-	           ? VideoOutCompression::Dcc256_64_64
-	           : VideoOutCompression::Unsupported;
+	if (metadata_address == 0 || (metadata_address & 0xffu) != 0 || dcc_clear_color != 0) {
+		return VideoOutCompression::Unsupported;
+	}
+	if (dcc_control == VIDEO_OUT_DCC_CONTROL_256_64_64) {
+		return VideoOutCompression::Dcc256_64_64;
+	}
+	if (dcc_control == VIDEO_OUT_DCC_CONTROL_256_256) {
+		return VideoOutCompression::Dcc256_256;
+	}
+	return VideoOutCompression::Unsupported;
 }
 
 [[nodiscard]] inline constexpr bool
 CanUseVideoOutNativeWithoutUpload(VideoOutCompression compression, bool render_target,
                                   bool gpu_modified, bool guest_modified) noexcept {
-	return compression == VideoOutCompression::Dcc256_64_64 && !guest_modified &&
+	return IsKnownCompressedVideoOut(compression) && !guest_modified &&
 	       (render_target || gpu_modified);
 }
 
@@ -385,6 +485,29 @@ SelectDepthTransitionSource(bool depth_load_clear, bool sampled_native_available
 	const auto right_first = right / TRACKER_PAGE_SIZE;
 	const auto right_last  = (right + right_size - 1) / TRACKER_PAGE_SIZE;
 	return left_first <= right_last && right_first <= left_last;
+}
+
+// Returns the largest prefix of `address` that does not share tracker pages with `blocked`.
+// A native storage-buffer descriptor cannot represent holes, so callers can expose this prefix
+// while the shader's ordinary descriptor bounds checks reject accesses beyond it.
+[[nodiscard]] inline uint64_t ImagePageRangePrefixBefore(uint64_t address, uint64_t size,
+                                                        uint64_t blocked_address,
+                                                        uint64_t blocked_size) {
+	if (size == 0 || blocked_size == 0 || address > UINT64_MAX - size ||
+	    blocked_address > UINT64_MAX - blocked_size) {
+		EXIT("invalid image page-prefix range\n");
+	}
+	const auto first_page         = address / TRACKER_PAGE_SIZE;
+	const auto last_page          = (address + size - 1) / TRACKER_PAGE_SIZE;
+	const auto blocked_first_page = blocked_address / TRACKER_PAGE_SIZE;
+	const auto blocked_last_page  = (blocked_address + blocked_size - 1) / TRACKER_PAGE_SIZE;
+	if (blocked_last_page < first_page || blocked_first_page > last_page) {
+		return size;
+	}
+	if (blocked_first_page <= first_page) {
+		return 0;
+	}
+	return blocked_first_page * TRACKER_PAGE_SIZE - address;
 }
 
 [[nodiscard]] inline SampledOverlap ClassifySampledOverlap(const ImageInfo& requested,

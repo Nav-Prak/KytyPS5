@@ -399,7 +399,9 @@ PreparedFrame* WindowPrepareFrame(CommandBuffer* buffer, VideoOutVulkanImage* im
 
 	auto*             frame = GetPreparedFramePool()->Acquire();
 	Common::LockGuard render_lock(g_render_ctx->GetMutex());
-	g_render_ctx->GetTextureCache()->RefreshVideoOut(image);
+	VideoOutAccess access {};
+	access.intent = VideoOutAccessIntent::Present;
+	g_render_ctx->GetTextureCache()->AcquireVideoOut(image, access);
 	ConfigurePreparedFrame(frame, image->extent, image->format);
 	const std::array copies {ImageImageCopy {
 	    .src_image = image, .width = image->extent.width, .height = image->extent.height}};

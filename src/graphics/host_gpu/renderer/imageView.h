@@ -32,6 +32,17 @@ namespace Libs::Graphics {
 	       height == 1 && depth == 1;
 }
 
+[[nodiscard]] inline bool IsSupportedCachedRenderTargetImageType(
+    bool storage, Prospero::ImageType type, uint32_t height) noexcept {
+	if (type == Prospero::ImageType::kColor2D) {
+		return true;
+	}
+	// Resource materialization represents guest 1D images with the Vulkan 2D binding used by
+	// render targets. Reuse that view only for a sampled, single-row descriptor; storage images
+	// retain the stricter 2D contract.
+	return !storage && type == Prospero::ImageType::kColor1D && height == 1;
+}
+
 [[noreturn]] inline void UnsupportedColorView(const char* usage, VkFormat image_format,
                                               VkFormat view_format, uint32_t swizzle) noexcept {
 	EXIT("unsupported %s color image view: image_format=%d view_format=%d swizzle=0x%03x\n", usage,

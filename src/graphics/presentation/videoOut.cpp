@@ -212,7 +212,7 @@ public:
 	VideoOutConfig* Get(int handle);
 	bool            IsOpened(int handle);
 
-	Presentation::DisplayBufferImage FindImage(const void* buffer, bool render_target);
+	Presentation::DisplayBufferImage FindImage(const void* buffer);
 
 	void Init(uint32_t width, uint32_t height);
 
@@ -325,6 +325,7 @@ static Graphics::VideoOutInfo MakeVideoOutInfo(const VideoOutBufferAttribute2& a
 	info.tile_mode         = tile_mode;
 	info.dcc_control       = attribute.dcc_control;
 	info.compression       = compression;
+	info.metadata_size     = Graphics::ComputeVideoOutDccMetadataSize(info.size, compression);
 	return info;
 }
 
@@ -540,8 +541,7 @@ void VideoOutContext::VblankEnd() {
 	}
 }
 
-Presentation::DisplayBufferImage VideoOutContext::FindImage(const void* buffer,
-                                                            bool        render_target) {
+Presentation::DisplayBufferImage VideoOutContext::FindImage(const void* buffer) {
 	Presentation::DisplayBufferImage ret;
 	Common::LockGuard                lock(m_mutex);
 	for (auto& ctx: m_video_out_ctx) {
@@ -562,8 +562,6 @@ Presentation::DisplayBufferImage VideoOutContext::FindImage(const void* buffer,
 					ret.size  = ctx.buffers[j].buffer_size;
 					ret.pitch = ctx.buffers[j].buffer_pitch;
 					ret.index = j - set.start_index;
-					Graphics::g_render_ctx->GetTextureCache()->RefreshVideoOut(ret.image,
-					                                                           render_target);
 					return ret;
 				}
 			}
@@ -1528,8 +1526,8 @@ namespace Libs::Presentation {
 
 DisplayBufferImage DisplayBufferFind(uint64_t addr, bool render_target) {
 	EXIT_IF(VideoOut::g_video_out_context == nullptr);
-
-	return VideoOut::g_video_out_context->FindImage(reinterpret_cast<void*>(addr), render_target);
+	(void)render_target;
+	return VideoOut::g_video_out_context->FindImage(reinterpret_cast<void*>(addr));
 }
 
 } // namespace Libs::Presentation

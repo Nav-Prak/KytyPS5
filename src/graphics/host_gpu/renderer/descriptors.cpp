@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -210,6 +211,22 @@ NativeAddressBuffer(uint64_t submit_id, CommandBuffer* command_buffer,
 		EXIT("address resource is not host-accessible: base=0x%016" PRIx64 "\n",
 		     address.binding_base);
 	}
+	const auto mapped_size = size;
+	size = g_render_ctx->GetTextureCache()->BufferCompatiblePrefixSize(address.binding_base,
+	                                                                  mapped_size);
+	if (size == 0) {
+		LOGF("address resource begins in an image or metadata range, binding a null read view: "
+		     "base=0x%016" PRIx64 " mapped_size=0x%016" PRIx64 " kind=%u\n",
+		     address.binding_base, mapped_size, static_cast<uint32_t>(resource.kind));
+		BindNullStorageBuffer(command_buffer, &result);
+		return result;
+	}
+	if (size != mapped_size) {
+		LOGF("address resource range clipped before an image or metadata range: "
+		     "base=0x%016" PRIx64 " mapped_size=0x%016" PRIx64
+		     " bound_size=0x%016" PRIx64 " kind=%u\n",
+		     address.binding_base, mapped_size, size, static_cast<uint32_t>(resource.kind));
+	}
 	auto* const ctx       = g_render_ctx->GetGraphicCtx();
 	const auto  alignment = ctx->StorageMinAlignment();
 	if (alignment == 0 || size > ctx->GetPhysicalDeviceProperties().limits.maxStorageBufferRange ||
@@ -259,10 +276,18 @@ struct TargetTextureViewInfo {
 
 static TargetTextureViewInfo
 ResolveTargetTextureView(const ShaderRecompiler::IR::ImageResource& resource,
-                         Prospero::ImageType type, uint32_t base_layer, uint32_t image_layers) {
+                         Prospero::ImageType type, bool storage, uint32_t height,
+                         uint32_t base_layer, uint32_t image_layers) {
 	switch (type) {
+		case Prospero::ImageType::kColor1D:
+			return IsSupportedCachedRenderTargetImageType(storage, type, height) &&
+			               resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D &&
+			               base_layer == 0 && image_layers == 1
+			           ? TargetTextureViewInfo {VK_IMAGE_VIEW_TYPE_2D, 0, 1}
+			           : TargetTextureViewInfo {};
 		case Prospero::ImageType::kColor2D:
-			return resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D &&
+			return IsSupportedCachedRenderTargetImageType(storage, type, height) &&
+			               resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D &&
 			               base_layer == 0 && image_layers == 1
 			           ? TargetTextureViewInfo {VK_IMAGE_VIEW_TYPE_2D, 0, 1}
 			           : TargetTextureViewInfo {};
@@ -458,7 +483,7 @@ NativeTexture(uint64_t submit_id, CommandBuffer* command_buffer,
 	                                                          : TextureFormatUsage::Sampled);
 	const auto type        = static_cast<Prospero::ImageType>(descriptor.Type());
 	const auto target_view =
-	    ResolveTargetTextureView(resource, type, descriptor.BaseArray5(), depth);
+	    ResolveTargetTextureView(resource, type, storage, height, descriptor.BaseArray5(), depth);
 	const auto    pitch   = TileGetTexturePitch(format, width, levels, tile);
 	const auto    swizzle = descriptor.DstSelXYZW();
 	TileSizeAlign size;
@@ -545,6 +570,9 @@ NativeTexture(uint64_t submit_id, CommandBuffer* command_buffer,
 			if (storage) {
 				EXIT("storage access to a video-out surface is unsupported\n");
 			}
+			VideoOutAccess access {};
+			access.intent = VideoOutAccessIntent::Preserve;
+			g_render_ctx->GetTextureCache()->AcquireVideoOut(video.image, access);
 			image = video.image;
 			if (!storage && swizzle == DstSel(6, 5, 4, 7)) {
 				view = VulkanImage::VIEW_BGRA;
@@ -595,6 +623,18 @@ NativeTexture(uint64_t submit_id, CommandBuffer* command_buffer,
 	if (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray) {
 		view = SelectSampledTextureArrayView(image, view);
 	}
+	if (graphics_debug_dump_enabled() && Prospero::BlockCompressedBytesPerBlock(format) != 0) {
+		static std::atomic_uint log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 256) {
+			const auto selected_view =
+			    (image_view != nullptr ? image_view : image->image_view[view]);
+			LOGF("NativeTextureBinding: addr=0x%016" PRIx64 " fmt=%u image_obj=%p image=%p "
+			     "view_index=%d view=%p layout=%d type=%d extent=%ux%u\n",
+			     address, format, static_cast<void*>(image), reinterpret_cast<void*>(image->image),
+			     view, reinterpret_cast<void*>(selected_view), static_cast<int>(image->layout),
+			     static_cast<int>(image->type), image->extent.width, image->extent.height);
+		}
+	}
 	return {image, view, image_view};
 }
 
@@ -622,6 +662,45 @@ static BufferView NativeUpload(CommandBuffer* command_buffer, std::span<const ui
 	return result;
 }
 
+static const char* NativeShaderStageName(ShaderType stage) {
+	switch (stage) {
+		case ShaderType::Vertex: return "vertex";
+		case ShaderType::Pixel: return "pixel";
+		case ShaderType::Fetch: return "fetch";
+		case ShaderType::Compute: return "compute";
+		default: return "unknown";
+	}
+}
+
+static void LogNativeShaderRuntime(const ShaderRecompiler::IR::Program&          program,
+                                   const ShaderRecompiler::IR::ResourceSnapshot& snapshot) {
+	if (!graphics_debug_dump_enabled()) {
+		return;
+	}
+	static std::atomic_uint log_count {0};
+	const auto              log_index = log_count.fetch_add(1, std::memory_order_relaxed);
+	if (log_index >= 256) {
+		return;
+	}
+	LOGF("NativeShaderRuntime[%u]: stage=%s hash=0x%016" PRIx64
+	     " flattened_srt=%zu user_data=%zu bound_user_data=%zu\n",
+	     log_index, NativeShaderStageName(program.stage), program.shader_hash,
+	     snapshot.flattened_srt.size(), snapshot.user_data.size(),
+	     program.bindings.user_data_registers.size());
+	for (uint32_t i = 0; i < snapshot.flattened_srt.size(); i++) {
+		const auto& read = program.srt.reads[i];
+		LOGF("  srt[%u]: flat_offset_dw=%u use_pc=0x%08x value=0x%08x\n", i, read.flat_offset,
+		     read.use_pc, snapshot.flattened_srt[i]);
+	}
+	for (const auto reg: program.bindings.user_data_registers) {
+		const auto index = reg - program.user_data_base;
+		if (index < snapshot.user_data.size()) {
+			LOGF("  user_data[s%u]: index=%u value=0x%08x\n", reg, index,
+			     snapshot.user_data[index]);
+		}
+	}
+}
+
 std::vector<ShaderAddressWriteRange>
 BindDescriptors(uint64_t submit_id, CommandBuffer* buffer, VkPipelineBindPoint pipeline_bind_point,
                 VkPipelineLayout layout, const ShaderStageRuntime& runtime,
@@ -634,6 +713,7 @@ BindDescriptors(uint64_t submit_id, CommandBuffer* buffer, VkPipelineBindPoint p
 	if (!ShaderRecompiler::IR::ValidateResourceSpecialization(program, snapshot, &error)) {
 		EXIT("invalid native shader runtime snapshot: %s\n", error.c_str());
 	}
+	LogNativeShaderRuntime(program, snapshot);
 	auto*      vk_buffer     = buffer->GetPool()->buffers[buffer->GetIndex()];
 	const auto shader_stages = ShaderPipelineStages(vk_stage);
 

@@ -36,6 +36,20 @@ namespace {
 thread_local const void* g_texture_cache_lock_owner = nullptr;
 thread_local const void* g_texture_fault_owner      = nullptr;
 
+std::optional<uint8_t> UniformGuestByte(uint64_t address, uint64_t size) {
+	if (address == 0 || size == 0 || size > SIZE_MAX) {
+		return {};
+	}
+	std::vector<uint8_t> bytes(static_cast<size_t>(size));
+	if (!Libs::LibKernel::Memory::TryReadBacking(address, bytes.data(), size)) {
+		return {};
+	}
+	if (!std::all_of(bytes.begin(), bytes.end(), [&](uint8_t value) { return value == bytes[0]; })) {
+		return {};
+	}
+	return bytes[0];
+}
+
 class FaultSafeTextureLock final {
 public:
 	FaultSafeTextureLock(const void* owner, TrackingSpinLock& mutex): m_mutex(mutex) {
@@ -94,6 +108,9 @@ struct TextureCache::CachedImage {
 	bool             gpu_modified        = false;
 	bool             buffer_modified     = false;
 	bool             stencil_initialized = false;
+	SurfaceContentState  video_out_state = SurfaceContentState::Uninitialized;
+	DccMetadataPlane     video_out_render_dcc;
+	std::optional<uint8_t> video_out_dcc_clear_code;
 
 	~CachedImage() {
 		if (ctx == nullptr || image == nullptr) {
@@ -1144,10 +1161,17 @@ void ValidateVideoOutInfo(GraphicContext* ctx, const VideoOutInfo& info) {
 	const auto compression =
 	    ClassifyVideoOutCompression(info.compression != VideoOutCompression::Uncompressed,
 	                                info.metadata_address, info.dcc_control, 0);
-	const bool metadata_invalid = compression == VideoOutCompression::Dcc256_64_64 &&
-	                              (info.metadata_address >= TRACKER_ADDRESS_SIZE ||
-	                               (info.metadata_address >= info.address &&
-	                                info.metadata_address < info.address + info.size));
+	const auto expected_metadata_size = ComputeVideoOutDccMetadataSize(info.size, compression);
+	const bool compressed             = IsKnownCompressedVideoOut(compression);
+	const bool metadata_invalid =
+	    compressed
+	        ? info.metadata_address == 0 || info.metadata_size == 0 ||
+	              info.metadata_size != expected_metadata_size ||
+	              (info.metadata_address & 0xffffu) != 0 ||
+	              info.metadata_address >= TRACKER_ADDRESS_SIZE ||
+	              info.metadata_size > TRACKER_ADDRESS_SIZE - info.metadata_address ||
+	              Overlaps(info.address, info.size, info.metadata_address, info.metadata_size)
+	        : info.metadata_address != 0 || info.metadata_size != 0;
 	if (ctx == nullptr || info.address == 0 || info.size == 0 ||
 	    info.address >= TRACKER_ADDRESS_SIZE || info.size > TRACKER_ADDRESS_SIZE - info.address ||
 	    (info.address & 0xffffu) != 0 || info.width == 0 || info.height == 0 ||
@@ -1157,10 +1181,11 @@ void ValidateVideoOutInfo(GraphicContext* ctx, const VideoOutInfo& info) {
 	    compression != info.compression || metadata_invalid ||
 	    !IsSupportedVideoOutFormat(info.guest_format, info.format)) {
 		EXIT("TextureCache: unsupported video-out surface, ctx=%p addr=0x%016" PRIx64
-		     " size=0x%016" PRIx64 " metadata=0x%016" PRIx64 " dcc=0x%08" PRIx32
+		     " size=0x%016" PRIx64 " metadata=0x%016" PRIx64 "+0x%016" PRIx64
+		     " dcc=0x%08" PRIx32
 		     " extent=%ux%u pitch=%u tile=%u guest_format=%u bpe=%u vk_format=%d\n",
 		     static_cast<const void*>(ctx), info.address, info.size, info.metadata_address,
-		     info.dcc_control, info.width, info.height, info.pitch, info.tile_mode,
+		     info.metadata_size, info.dcc_control, info.width, info.height, info.pitch, info.tile_mode,
 		     info.guest_format, info.bytes_per_element, static_cast<int>(info.format));
 	}
 	TileSizeAlign exact {};
@@ -1222,6 +1247,20 @@ void UploadVideoOut(GraphicContext* ctx, VideoOutVulkanImage* image, const Video
 	TileConvertTiledToLinearRenderTarget(
 	    scratch.Data(), reinterpret_cast<const void*>(info.address), info.width, info.height,
 	    info.pitch, info.bytes_per_element, info.size);
+	UtilFillImage(ctx, image, scratch.Data(), info.size, info.pitch,
+	              static_cast<uint64_t>(VK_IMAGE_LAYOUT_GENERAL));
+}
+
+void InitializeVideoOutDccContent(GraphicContext* ctx, VideoOutVulkanImage* image,
+                                  const VideoOutInfo& info,
+                                  VideoOutDccInitialContent content) {
+	if (content != VideoOutDccInitialContent::Clear0000) {
+		EXIT("TextureCache: unsupported DCC native initialization, content=%u\n",
+		     static_cast<uint32_t>(content));
+	}
+	image->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+	UtilScratchBuffer scratch(info.size);
+	std::memset(scratch.Data(), 0, static_cast<size_t>(info.size));
 	UtilFillImage(ctx, image, scratch.Data(), info.size, info.pitch,
 	              static_cast<uint64_t>(VK_IMAGE_LAYOUT_GENERAL));
 }
@@ -2579,6 +2618,23 @@ TextureCache::RegisterVideoOutSurfaces(GraphicContext*                  ctx,
 			if (PageOverlaps(infos[i].address, infos[i].size, infos[j].address, infos[j].size)) {
 				EXIT("TextureCache: video-out surfaces share pages, first=%zu second=%zu\n", i, j);
 			}
+			if ((infos[i].metadata_size != 0 &&
+			     PageOverlaps(infos[i].metadata_address, infos[i].metadata_size, infos[j].address,
+			                  infos[j].size)) ||
+			    (infos[j].metadata_size != 0 &&
+			     PageOverlaps(infos[j].metadata_address, infos[j].metadata_size, infos[i].address,
+			                  infos[i].size)) ||
+			    (infos[i].metadata_size != 0 && infos[j].metadata_size != 0 &&
+			     PageOverlaps(infos[i].metadata_address, infos[i].metadata_size,
+			                  infos[j].metadata_address, infos[j].metadata_size))) {
+				EXIT("TextureCache: video-out data/metadata planes overlap, first=%zu second=%zu\n", i,
+				     j);
+			}
+		}
+	}
+	for (const auto& info: infos) {
+		if (info.metadata_size != 0) {
+			RegisterMeta(info.metadata_address, info.metadata_size);
 		}
 	}
 	std::lock_guard transaction(m_resource_mutex);
@@ -2617,13 +2673,38 @@ TextureCache::RegisterVideoOutSurfaces(GraphicContext*                  ctx,
 				    UploadVideoOut(ctx, static_cast<VideoOutVulkanImage*>(cached->image), info,
 				                   false);
 			    });
+			cached->video_out_state = SurfaceContentState::Coherent;
 		} else {
-			// A compressed guest surface cannot be decoded without its DCC metadata. Establish the
-			// normal tracked range, but leave the shared native image to be initialized by a GPU
-			// render/clear before any sampled or presentation read.
+			std::optional<uint8_t> metadata_code;
+			m_metadata_tracker.ForEachUploadRange(
+			    info.metadata_address, info.metadata_size, false,
+			    [](uint64_t, uint64_t) noexcept {},
+			    [&]() noexcept {
+				    metadata_code = UniformGuestByte(info.metadata_address, info.metadata_size);
+			    });
+			const auto initial_content =
+			    metadata_code.has_value()
+			        ? ClassifyVideoOutDccInitialContent(*metadata_code)
+			        : VideoOutDccInitialContent::Unsupported;
+			// The color payload is irrelevant for a recognized whole-surface DCC clear, but it still
+			// needs a tracked baseline so a later guest write invalidates native coherence.
 			m_memory_tracker.ForEachUploadRange(
 			    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
 			    []() noexcept {});
+			if (initial_content == VideoOutDccInitialContent::Unsupported) {
+				cached->video_out_state = SurfaceContentState::GuestCurrent;
+			} else {
+				InitializeVideoOutDccContent(ctx, static_cast<VideoOutVulkanImage*>(cached->image),
+				                             info, initial_content);
+				cached->video_out_state          = SurfaceContentState::Coherent;
+				cached->video_out_dcc_clear_code = *metadata_code;
+			}
+			if (graphics_debug_dump_enabled()) {
+				LOGF("TextureCache: video-out display DCC metadata addr=0x%016" PRIx64
+				     " size=0x%016" PRIx64 " uniform=%d code=0x%02x content=%u\n",
+				     info.metadata_address, info.metadata_size, metadata_code.has_value(),
+				     metadata_code.value_or(0), static_cast<uint32_t>(initial_content));
+			}
 		}
 		result.push_back(static_cast<VideoOutVulkanImage*>(cached->image));
 		m_images.push_back(std::move(cached));
@@ -2631,9 +2712,9 @@ TextureCache::RegisterVideoOutSurfaces(GraphicContext*                  ctx,
 	return result;
 }
 
-void TextureCache::RefreshVideoOut(VideoOutVulkanImage* image, bool render_target) {
+void TextureCache::AcquireVideoOut(VideoOutVulkanImage* image, const VideoOutAccess& access) {
 	if (image == nullptr) {
-		EXIT("TextureCache: invalid video-out refresh, image=%p\n",
+		EXIT("TextureCache: invalid video-out acquisition, image=%p\n",
 		     static_cast<const void*>(image));
 	}
 	std::lock_guard      transaction(m_resource_mutex);
@@ -2641,32 +2722,96 @@ void TextureCache::RefreshVideoOut(VideoOutVulkanImage* image, bool render_targe
 	const auto it = std::find_if(m_images.begin(), m_images.end(),
 	                             [image](const auto& cached) { return cached->image == image; });
 	if (it == m_images.end() || (*it)->kind != CachedImage::Kind::VideoOut) {
-		EXIT("TextureCache: video-out image is not registered, image=%p\n",
+		EXIT("TextureCache: acquired video-out image is not registered, image=%p\n",
 		     static_cast<const void*>(image));
 	}
 	auto& cached = **it;
-	if (cached.gpu_modified) {
-		return;
-	}
-	const auto& info         = cached.video_out;
-	const bool  image_dirty  = m_memory_tracker.IsRegionCpuModified(info.address, info.size);
-	const bool  buffer_dirty = cached.buffer_modified ||
-	                           m_buffer_cache.IsRegionCpuModified(info.address, info.size) ||
-	                           m_buffer_cache.IsRegionGpuModified(info.address, info.size);
-	if (!image_dirty && !buffer_dirty) {
-		if (info.compression == VideoOutCompression::Uncompressed ||
-		    CanUseVideoOutNativeWithoutUpload(info.compression, render_target, false, false)) {
-			return;
-		}
-		EXIT("TextureCache: compressed video-out read requires native GPU contents, "
+	const auto& info                = cached.video_out;
+	const bool  image_dirty         = m_memory_tracker.IsRegionCpuModified(info.address, info.size);
+	const bool  cached_buffer_dirty = cached.buffer_modified;
+	const bool  buffer_overlap      = m_buffer_cache.HasPageOverlap(info.address, info.size);
+	const bool  buffer_cpu_dirty =
+	    buffer_overlap && m_buffer_cache.IsRegionCpuModified(info.address, info.size);
+	const bool buffer_gpu_dirty =
+	    buffer_overlap && m_buffer_cache.IsRegionGpuModified(info.address, info.size);
+	const bool compressed = IsKnownCompressedVideoOut(info.compression);
+	const bool display_metadata_dirty =
+	    compressed && m_metadata_tracker.IsRegionCpuModified(info.metadata_address,
+	                                                        info.metadata_size);
+	const bool render_metadata_dirty =
+	    compressed && cached.video_out_render_dcc.address != 0 &&
+	    m_metadata_tracker.IsRegionCpuModified(cached.video_out_render_dcc.address,
+	                                           cached.video_out_render_dcc.size);
+	const bool metadata_dirty = display_metadata_dirty || render_metadata_dirty;
+	if (cached_buffer_dirty && !buffer_overlap) {
+		EXIT("TextureCache: video-out buffer ownership has no cached overlap, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     info.address, info.size);
 	}
+	const bool  buffer_dirty = cached_buffer_dirty || buffer_cpu_dirty || buffer_gpu_dirty;
+	const bool  guest_dirty  = image_dirty || buffer_dirty || metadata_dirty;
+	if (access.intent == VideoOutAccessIntent::FullOverwrite) {
+		if (!IsFullVideoOutOverwrite(info, access)) {
+			EXIT("TextureCache: video-out overwrite is not a full surface, addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64
+			     " mip=%u layer=%u layers=%u offset=%u,%u extent=%ux%u surface=%ux%u\n",
+			     info.address, info.size, access.base_mip_level, access.base_array_layer,
+			     access.layer_count, access.offset_x, access.offset_y, access.width, access.height,
+			     info.width, info.height);
+		}
+		m_buffer_cache.ValidateGpuAccess(info.address, info.size, false, true);
+		if (buffer_gpu_dirty) {
+			EXIT("TextureCache: full image overwrite requires ordered GPU buffer retirement, "
+			     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+			     info.address, info.size);
+		}
+		if (buffer_overlap) {
+			m_buffer_cache.SupersedeCpuRangeWithImage(info.address, info.size);
+		}
+		if (image_dirty) {
+			m_memory_tracker.ForEachUploadRange(
+			    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
+			    []() noexcept {});
+		}
+		cached.buffer_modified = false;
+		cached.video_out_dcc_clear_code.reset();
+		cached.video_out_state = cached.gpu_modified ? SurfaceContentState::NativeCurrent
+		                                                 : SurfaceContentState::Uninitialized;
+		if (guest_dirty) {
+			LOGF("TextureCache: full video-out overwrite retired guest contents, "
+			     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
+			     " image_dirty=%d cached_buffer_dirty=%d buffer_cpu_dirty=%d\n",
+			     info.address, info.size, image_dirty, cached_buffer_dirty, buffer_cpu_dirty);
+		}
+		return;
+	}
+	if (cached.gpu_modified || cached.video_out_state == SurfaceContentState::NativeCurrent) {
+		if (guest_dirty) {
+			EXIT("TextureCache: native-current video-out surface also has guest changes, "
+			     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " intent=%u\n",
+			     info.address, info.size, static_cast<uint32_t>(access.intent));
+		}
+		return;
+	}
+	if (!image_dirty && !buffer_dirty && !metadata_dirty) {
+		if (cached.video_out_state == SurfaceContentState::Coherent) {
+			return;
+		}
+		EXIT("TextureCache: compressed video-out access requires native contents, "
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " intent=%u state=%u\n",
+		     info.address, info.size, static_cast<uint32_t>(access.intent),
+		     static_cast<uint32_t>(cached.video_out_state));
+	}
 	if (info.compression != VideoOutCompression::Uncompressed) {
-		EXIT("TextureCache: compressed video-out guest refresh is unsupported, "
+		EXIT("TextureCache: compressed video-out preserve/present is unsupported, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " image_dirty=%d buffer_dirty=%d render_target=%d\n",
-		     info.address, info.size, image_dirty, buffer_dirty, render_target);
+		     " image_dirty=%d cached_buffer_dirty=%d buffer_cpu_dirty=%d"
+		     " buffer_gpu_dirty=%d display_metadata_dirty=%d render_metadata_dirty=%d"
+		     " intent=%u state=%u\n",
+		     info.address, info.size, image_dirty, cached_buffer_dirty, buffer_cpu_dirty,
+		     buffer_gpu_dirty, display_metadata_dirty, render_metadata_dirty,
+		     static_cast<uint32_t>(access.intent),
+		     static_cast<uint32_t>(cached.video_out_state));
 	}
 	if (buffer_dirty) {
 		const auto source = m_buffer_cache.ObtainBufferForImage(info.address, info.size);
@@ -2682,6 +2827,133 @@ void TextureCache::RefreshVideoOut(VideoOutVulkanImage* image, bool render_targe
 	m_memory_tracker.ForEachUploadRange(
 	    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
 	    [&]() noexcept { UploadVideoOut(cached.ctx, image, info, true); });
+	cached.video_out_state = SurfaceContentState::Coherent;
+}
+
+void TextureCache::BindVideoOutRenderMetadata(VideoOutVulkanImage* image,
+	                                            uint64_t             metadata_address) {
+	if (image == nullptr || metadata_address == 0) {
+		EXIT("TextureCache: invalid video-out render metadata binding, image=%p addr=0x%016" PRIx64
+		     "\n",
+		     static_cast<const void*>(image), metadata_address);
+	}
+	uint64_t metadata_size = 0;
+	{
+		std::lock_guard      transaction(m_resource_mutex);
+		FaultSafeTextureLock lock(this, m_lock);
+		const auto it = std::find_if(m_images.begin(), m_images.end(),
+		                             [image](const auto& cached) { return cached->image == image; });
+		if (it == m_images.end() || (*it)->kind != CachedImage::Kind::VideoOut ||
+		    !IsKnownCompressedVideoOut((*it)->video_out.compression)) {
+			EXIT("TextureCache: render DCC binding requires a compressed video-out image\n");
+		}
+		metadata_size = (*it)->video_out.metadata_size;
+		if ((*it)->video_out_render_dcc.address != 0) {
+			if ((*it)->video_out_render_dcc.address != metadata_address ||
+			    (*it)->video_out_render_dcc.size != metadata_size) {
+				EXIT("TextureCache: video-out render DCC address changed, previous=0x%016" PRIx64
+				     "+0x%016" PRIx64 " requested=0x%016" PRIx64 "+0x%016" PRIx64 "\n",
+				     (*it)->video_out_render_dcc.address, (*it)->video_out_render_dcc.size,
+				     metadata_address, metadata_size);
+			}
+			return;
+		}
+		if (metadata_size == 0 || (metadata_address & 0xffffu) != 0 ||
+		    metadata_address >= TRACKER_ADDRESS_SIZE ||
+		    metadata_size > TRACKER_ADDRESS_SIZE - metadata_address ||
+		    Overlaps((*it)->video_out.address, (*it)->video_out.size, metadata_address,
+		             metadata_size) ||
+		    Overlaps((*it)->video_out.metadata_address, (*it)->video_out.metadata_size,
+		             metadata_address, metadata_size)) {
+			EXIT("TextureCache: invalid video-out render DCC range, addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 "\n",
+			     metadata_address, metadata_size);
+		}
+	}
+	RegisterMeta(metadata_address, metadata_size);
+	if (IsMetaGpuModified(metadata_address, metadata_size)) {
+		EXIT("TextureCache: video-out render DCC is already GPU-owned, addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 "\n",
+		     metadata_address, metadata_size);
+	}
+	std::optional<uint8_t> metadata_code;
+	m_metadata_tracker.ForEachUploadRange(
+	    metadata_address, metadata_size, false, [](uint64_t, uint64_t) noexcept {},
+	    [&]() noexcept { metadata_code = UniformGuestByte(metadata_address, metadata_size); });
+	if (graphics_debug_dump_enabled()) {
+		LOGF("TextureCache: video-out render DCC metadata addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 " uniform=%d code=0x%02x\n",
+		     metadata_address, metadata_size, metadata_code.has_value(),
+		     metadata_code.value_or(0));
+	}
+	std::lock_guard      transaction(m_resource_mutex);
+	FaultSafeTextureLock lock(this, m_lock);
+	const auto it = std::find_if(m_images.begin(), m_images.end(),
+	                             [image](const auto& cached) { return cached->image == image; });
+	if (it == m_images.end() || (*it)->kind != CachedImage::Kind::VideoOut ||
+	    (*it)->video_out_render_dcc.address != 0) {
+		EXIT("TextureCache: video-out render DCC binding raced image state\n");
+	}
+	if ((*it)->video_out_state == SurfaceContentState::Coherent &&
+	    (!(*it)->video_out_dcc_clear_code.has_value() || !metadata_code.has_value() ||
+	     *(*it)->video_out_dcc_clear_code != *metadata_code)) {
+		EXIT("TextureCache: coherent video-out render/display DCC contents differ, "
+		     "display_uniform=%d display_code=0x%02x render_uniform=%d render_code=0x%02x\n",
+		     (*it)->video_out_dcc_clear_code.has_value(),
+		     (*it)->video_out_dcc_clear_code.value_or(0), metadata_code.has_value(),
+		     metadata_code.value_or(0));
+	}
+	(*it)->video_out_render_dcc = {metadata_address, metadata_size};
+}
+
+bool TextureCache::ConsumeVideoOutDccMetadataTransfer(
+    CommandBuffer* command, uint64_t source_address, uint64_t source_size,
+    uint64_t destination_address, uint64_t destination_size) {
+	if (command == nullptr || command->IsInvalid() || source_address == 0 || source_size == 0 ||
+	    destination_address == 0 || destination_size == 0) {
+		return false;
+	}
+	std::lock_guard      transaction(m_resource_mutex);
+	FaultSafeTextureLock lock(this, m_lock);
+	for (const auto& cached: m_images) {
+		if (cached->kind != CachedImage::Kind::VideoOut ||
+		    !IsKnownCompressedVideoOut(cached->video_out.compression) ||
+		    cached->video_out_render_dcc.address != source_address ||
+		    cached->video_out.metadata_address != destination_address) {
+			continue;
+		}
+		const auto active_size = ComputeVideoOutDccActiveMetadataSize(
+		    cached->video_out.size, cached->video_out.compression);
+		if (active_size == 0 || source_size != active_size || destination_size != active_size ||
+		    source_size > cached->video_out_render_dcc.size ||
+		    destination_size > cached->video_out.metadata_size) {
+			EXIT("TextureCache: video-out DCC transfer has invalid active coverage, "
+			     "source=0x%016" PRIx64 "+0x%016" PRIx64
+			     " destination=0x%016" PRIx64 "+0x%016" PRIx64
+			     " expected=0x%016" PRIx64 "\n",
+			     source_address, source_size, destination_address, destination_size, active_size);
+		}
+		const auto source_meta      = m_surface_metas.find(source_address);
+		const auto destination_meta = m_surface_metas.find(destination_address);
+		if (source_meta == m_surface_metas.end() || destination_meta == m_surface_metas.end() ||
+		    source_meta->second.size != cached->video_out_render_dcc.size ||
+		    destination_meta->second.size != cached->video_out.metadata_size ||
+		    !source_meta->second.gpu_modified || !destination_meta->second.gpu_modified ||
+		    !m_metadata_tracker.IsRegionGpuModified(source_address, source_size) ||
+		    !m_metadata_tracker.IsRegionGpuModified(destination_address, destination_size) ||
+		    m_metadata_tracker.IsRegionCpuModified(source_address, source_size) ||
+		    m_metadata_tracker.IsRegionCpuModified(destination_address, destination_size) ||
+		    !cached->gpu_modified ||
+		    cached->video_out_state != SurfaceContentState::NativeCurrent) {
+			EXIT("TextureCache: video-out DCC transfer requires one native-current image and "
+			     "GPU-owned metadata planes\n");
+		}
+		// Both guest planes encode the same native-current pixels. Their byte-level repacking has no
+		// host operation, but retaining the image preserves the command's ownership lifetime.
+		command->RetainResourceUntilFence(cached);
+		return true;
+	}
+	return false;
 }
 
 void TextureCache::UnregisterVideoOutSurfaces(const std::vector<VideoOutVulkanImage*>& images) {
@@ -3024,11 +3296,51 @@ void TextureCache::MarkGpuWritten(VulkanImage* image) {
 				meta->second.gpu_modified = true;
 			}
 		}
+		if (cached->kind == CachedImage::Kind::VideoOut &&
+		    IsKnownCompressedVideoOut(cached->video_out.compression)) {
+			const DccMetadataPlane planes[] = {
+			    {cached->video_out.metadata_address, cached->video_out.metadata_size},
+			    cached->video_out_render_dcc,
+			};
+			for (const auto& plane: planes) {
+				if (plane.address == 0 && plane.size == 0) {
+					continue;
+				}
+				if (plane.address == 0 || plane.size == 0) {
+					EXIT("TextureCache: video-out has an incomplete DCC metadata plane\n");
+				}
+				auto meta = m_surface_metas.find(plane.address);
+				if (meta == m_surface_metas.end() || meta->second.size != plane.size) {
+					EXIT("TextureCache: video-out DCC metadata is missing or mismatched, "
+					     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+					     plane.address, plane.size);
+				}
+				m_buffer_cache.ValidateGpuAccess(plane.address, plane.size, false, true);
+				const bool cpu_modified =
+				    m_metadata_tracker.IsRegionCpuModified(plane.address, plane.size);
+				if (meta->second.gpu_modified && cpu_modified) {
+					EXIT("TextureCache: video-out write races CPU-modified DCC metadata, "
+					     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+					     plane.address, plane.size);
+				}
+				if (!meta->second.gpu_modified) {
+					m_metadata_tracker.ForEachUploadRange(
+					    plane.address, plane.size, true, [](uint64_t, uint64_t) noexcept {},
+					    []() noexcept {});
+					meta->second.gpu_modified = true;
+				}
+				meta->second.clear_mask = 0;
+			}
+		}
 		if (!cached->gpu_modified) {
 			for (uint32_t i = 0; i < cached->RangeCount(); i++) {
 				m_memory_tracker.MarkRegionAsGpuModified(cached->Address(i), cached->Size(i));
 			}
 			cached->gpu_modified = true;
+		}
+		if (cached->kind == CachedImage::Kind::VideoOut) {
+			cached->video_out_state = SurfaceContentState::NativeCurrent;
+			cached->video_out_dcc_clear_code.reset();
 		}
 		return;
 	}
@@ -3485,6 +3797,28 @@ bool TextureCache::HasMetaOverlap(uint64_t vaddr, uint64_t size) {
 		}
 	}
 	return false;
+}
+
+uint64_t TextureCache::BufferCompatiblePrefixSize(uint64_t vaddr, uint64_t size) {
+	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
+	    size > TRACKER_ADDRESS_SIZE - vaddr) {
+		EXIT("TextureCache: invalid buffer-compatible prefix query, addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 "\n",
+		     vaddr, size);
+	}
+	FaultSafeTextureLock lock(this, m_lock);
+	auto                 prefix = size;
+	for (const auto& cached: m_images) {
+		for (uint32_t range = 0; range < cached->RangeCount(); range++) {
+			prefix = std::min(prefix,
+			                  ImagePageRangePrefixBefore(vaddr, size, cached->Address(range),
+			                                             cached->Size(range)));
+		}
+	}
+	for (const auto& [address, meta]: m_surface_metas) {
+		prefix = std::min(prefix, ImagePageRangePrefixBefore(vaddr, size, address, meta.size));
+	}
+	return prefix;
 }
 
 bool TextureCache::IsMetaGpuModified(uint64_t vaddr, uint64_t size) {

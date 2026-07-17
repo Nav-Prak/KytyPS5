@@ -503,6 +503,13 @@ void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 		}
 		EXIT_NOT_IMPLEMENTED(video_image.size < size);
 		EXIT_NOT_IMPLEMENTED(video_image.pitch != pitch);
+		auto* texture_cache = g_render_ctx->GetTextureCache();
+		if (rt.info.dcc_compression_enable) {
+			if (rt.dcc_addr.addr == 0) {
+				EXIT("compressed display render target has no render DCC address\n");
+			}
+			texture_cache->BindVideoOutRenderMetadata(video_image.image, rt.dcc_addr.addr);
+		}
 		r->type           = RenderColorType::DisplayBuffer;
 		r->base_addr      = rt.base.addr;
 		r->vulkan_buffer  = video_image.image;

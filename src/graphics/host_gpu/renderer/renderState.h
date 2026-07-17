@@ -242,6 +242,7 @@ struct RenderColorInfo {
 	uint64_t          buffer_size        = 0;
 	uint32_t          target_slot        = 0;
 	bool              color_clear_enable = false;
+	bool              color_load_discard = false;
 	VkClearColorValue color_clear_value {};
 };
 

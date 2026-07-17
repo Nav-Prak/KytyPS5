@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/streamBuffer.h"
 #include "kernel/eventQueue.h"
 
+#include <array>
 #include <memory>
 #include <vector>
 #include <vulkan/vulkan_core.h>
@@ -134,11 +135,18 @@ void GraphicsRenderCreateContext();
 [[nodiscard]] bool     GraphicsScaleReferenceClock(uint64_t host_ticks, uint64_t host_frequency,
                                                    uint64_t* value);
 [[nodiscard]] uint64_t GraphicsRenderReadReferenceClock();
+[[nodiscard]] bool ResolveUnitQuadPresentationViewport(
+    const std::array<std::array<float, 2>, 4>& ndc, VkExtent2D extent,
+    std::array<float, 2>* scale, std::array<float, 2>* offset);
 
 [[nodiscard]] bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t group_x,
-                                            uint32_t group_y, uint32_t group_z, uint32_t mode,
-                                            ShaderBufferResource* descriptor,
-                                            uint32_t* packed_clear, uint64_t* size);
+                                             uint32_t group_y, uint32_t group_z, uint32_t mode,
+                                             ShaderBufferResource* descriptor,
+                                             uint32_t* packed_clear, uint64_t* size);
+[[nodiscard]] bool ResolveVideoOutDccMetadataTransferDispatch(
+    const ShaderComputeInputInfo& input, uint32_t group_x, uint32_t group_y, uint32_t group_z,
+    uint32_t mode, ShaderBufferResource* source, ShaderBufferResource* destination,
+    uint64_t* transfer_size);
 [[nodiscard]] bool ResolveHtileClearTarget(const HW::DepthRenderTarget& target,
                                            uint64_t descriptor_size, HtileClearTarget* resolved);
 

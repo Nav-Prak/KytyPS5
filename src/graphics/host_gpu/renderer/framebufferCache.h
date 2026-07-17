@@ -65,6 +65,7 @@ private:
 		uint64_t           depth_id                                         = 0;
 		VkImageView        depth_view                                       = nullptr;
 		bool               color_clear_enable[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+		bool               color_load_discard[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 		VkImageLayout      color_layout[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
 		bool               depth_clear_enable                               = false;
 		bool               stencil_clear_enable                             = false;

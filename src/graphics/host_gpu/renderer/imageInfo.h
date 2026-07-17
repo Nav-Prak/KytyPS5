@@ -436,7 +436,13 @@ enum class RenderTargetOverlap : uint8_t {
 enum class SampledOverlap : uint8_t { None, ReadOnlyAlias, Unsupported };
 enum class StorageSampledOverlap : uint8_t { None, ExactImage, Unsupported };
 enum class StorageSampledViewShape : uint8_t { Image2D, Image2DArray, Image3D, Unsupported };
-enum class StorageImageOverlap : uint8_t { None, RetireSampled, PageNeighbor, Unsupported };
+enum class StorageImageOverlap : uint8_t {
+	None,
+	RetireSampled,
+	RetireTarget,
+	PageNeighbor,
+	Unsupported
+};
 enum class HostWriteOverlap : uint8_t { None, InvalidateImage, Unsupported };
 enum class BufferImageBinding : uint8_t { Texture, VideoOut, RenderTarget, Unsupported };
 enum class BufferImageWrite : uint8_t {
@@ -877,16 +883,23 @@ ClassifySampledRenderTargetOverlap(const ImageInfo& sampled, const RenderTargetI
 [[nodiscard]] inline StorageImageOverlap
 ClassifyStorageImageOverlap(uint64_t requested_address, uint64_t requested_size,
                             uint64_t cached_address, uint64_t cached_size, bool sampled,
-                            bool same_context, bool gpu_modified, bool buffer_modified,
-                            bool tracker_gpu_modified) {
+                            bool render_target, bool same_context, bool gpu_modified,
+                            bool buffer_modified, bool tracker_gpu_modified) {
 	if (!ImagePageRangesOverlap(requested_address, requested_size, cached_address, cached_size)) {
 		return StorageImageOverlap::None;
 	}
 	if (!ImageRangeOverlaps(requested_address, requested_size, cached_address, cached_size)) {
 		return StorageImageOverlap::PageNeighbor;
 	}
-	return sampled && same_context && !gpu_modified && !buffer_modified && !tracker_gpu_modified
-	           ? StorageImageOverlap::RetireSampled
+	if (sampled && same_context && !gpu_modified && !buffer_modified && !tracker_gpu_modified) {
+		return StorageImageOverlap::RetireSampled;
+	}
+	const auto delta = cached_address >= requested_address ? cached_address - requested_address
+	                                                     : UINT64_MAX;
+	const bool contained = delta <= requested_size && cached_size <= requested_size - delta;
+	return render_target && contained && same_context && !buffer_modified &&
+	               gpu_modified == tracker_gpu_modified
+	           ? StorageImageOverlap::RetireTarget
 	           : StorageImageOverlap::Unsupported;
 }
 
@@ -945,6 +958,10 @@ ClassifyRenderTargetOverlap(const RenderTargetInfo& cached, bool cached_gpu_modi
                             const RenderTargetInfo& requested) {
 	if (!ImagePageRangesOverlap(cached.address, cached.size, requested.address, requested.size)) {
 		return RenderTargetOverlap::None;
+	}
+	if (!ImageRangeOverlaps(cached.address, cached.size, requested.address, requested.size)) {
+		return same_context && !cached_buffer_modified ? RenderTargetOverlap::RetireTarget
+		                                                : RenderTargetOverlap::Unsupported;
 	}
 	const bool expand = requested.layers > cached.layers &&
 	                    IsCompatibleRenderTargetBacking(requested, cached) &&

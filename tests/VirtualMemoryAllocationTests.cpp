@@ -264,6 +264,10 @@ void TestReserveMapFixedAndNoOverwrite() {
 	            base + SceKernelPageSize * 2, SceKernelProtCpuRead, 1, 0, 0, 1, "fixed_mid");
 	ExpectRange(test, Query(test, base + SceKernelPageSize * 2), base + SceKernelPageSize * 2,
 	            base + SceKernelPageSize * 3, 0, 0, 0, 0, 0);
+	Check(test,
+	      Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(base + SceKernelPageSize * 2,
+	                                                          SceKernelPageSize),
+	      "right reserve is missing from placeholder bookkeeping before cleanup");
 
 	void* blocked = reinterpret_cast<void*>(base + SceKernelPageSize);
 	CheckFailed(test,
@@ -279,6 +283,10 @@ void TestReserveMapFixedAndNoOverwrite() {
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
 	        "KernelMunmap(fixed cleanup)");
+	Check(test,
+	      Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(base + SceKernelPageSize * 2,
+	                                                          SceKernelPageSize),
+	      "right reserve was lost from placeholder bookkeeping during cleanup");
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize * 2, SceKernelPageSize),
 	        "KernelMunmap(right reserve cleanup)");
@@ -813,6 +821,144 @@ void TestFixedReserveReplacesPartialDirectMapping() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestFixedDirectReplacesPartialPlaceholderFlexibleMapping() {
+	const char*        test       = "FixedDirectReplacesPartialPlaceholderFlexibleMapping";
+	constexpr uint64_t part_size  = SceKernelPageSize * 32;
+	constexpr uint64_t total_size = part_size * 3;
+
+	void* reserve = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&reserve, total_size, 0,
+	                                                           SceKernelPageSize),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(reserve);
+
+	void* flexible = reserve;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &flexible, total_size, SceKernelProtCpuRw,
+	            SceKernelMapFixed | SceKernelMapNoCoalesce, "partial_flexible"),
+	        "KernelMapNamedFlexibleMemory");
+	*reinterpret_cast<uint64_t*>(base) = 0x4b595459464c4558ull; // "KTYFLEX"
+	*reinterpret_cast<uint64_t*>(base + part_size * 2) =
+	    0x4b5954595441494cull; // "KTYTAIL"
+
+	int64_t phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+	            part_size, SceKernelPageSize, SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+
+	void* direct = reinterpret_cast<void*>(base + part_size);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &direct, part_size, SceKernelProtCpuRw,
+	            SceKernelMapFixed | SceKernelMapNoCoalesce, phys_addr, SceKernelPageSize,
+	            "partial_flexible_direct"),
+	        "KernelMapNamedDirectMemory");
+	Check(test, reinterpret_cast<uint64_t>(direct) == base + part_size,
+	      "fixed direct mapping moved");
+	Check(test, *reinterpret_cast<uint64_t*>(base) == 0x4b595459464c4558ull,
+	      "fixed direct mapping damaged the flexible prefix");
+	Check(test, *reinterpret_cast<uint64_t*>(base + part_size * 2) == 0x4b5954595441494cull,
+	      "fixed direct mapping damaged the flexible suffix");
+	ExpectRange(test, Query(test, base), base, base + part_size, SceKernelProtCpuRw, 1, 0, 0, 1,
+	            "partial_flexible");
+	ExpectRange(test, Query(test, base + part_size), base + part_size, base + part_size * 2,
+	            SceKernelProtCpuRw, 0, 1, 0, 1, "partial_flexible_direct");
+	ExpectRange(test, Query(test, base + part_size * 2), base + part_size * 2,
+	            base + total_size, SceKernelProtCpuRw, 1, 0, 0, 1, "partial_flexible");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, part_size),
+	        "KernelMunmap(flexible prefix)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base + part_size, part_size),
+	        "KernelMunmap(direct middle)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base + part_size * 2, part_size),
+	        "KernelMunmap(flexible suffix)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, part_size),
+	        "KernelReleaseDirectMemory");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestFixedDirectReplacesPartialFlexibleMapping() {
+	const char*        test       = "FixedDirectReplacesPartialFlexibleMapping";
+	constexpr uint64_t part_size  = SceKernelPageSize * 32;
+	constexpr uint64_t total_size = part_size * 3;
+
+	void* flexible = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &flexible, total_size, SceKernelProtCpuRw, 0, "partial_owned_flexible"),
+	        "KernelMapNamedFlexibleMemory");
+	const auto base = reinterpret_cast<uint64_t>(flexible);
+	*reinterpret_cast<uint64_t*>(base) = 0x4b5954594f574e44ull; // "KTYOWND"
+	*reinterpret_cast<uint64_t*>(base + part_size * 2) =
+	    0x4b5954595441494cull; // "KTYTAIL"
+
+	int64_t phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+	            part_size, SceKernelPageSize, SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+	void* direct = reinterpret_cast<void*>(base + part_size);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &direct, part_size, SceKernelProtCpuRw,
+	            SceKernelMapFixed | SceKernelMapNoCoalesce, phys_addr, SceKernelPageSize,
+	            "partial_owned_direct"),
+	        "KernelMapNamedDirectMemory");
+	Check(test, reinterpret_cast<uint64_t>(direct) == base + part_size,
+	      "fixed direct mapping moved");
+	Check(test, *reinterpret_cast<uint64_t*>(base) == 0x4b5954594f574e44ull,
+	      "fixed direct mapping damaged the flexible prefix");
+	Check(test, *reinterpret_cast<uint64_t*>(base + part_size * 2) == 0x4b5954595441494cull,
+	      "fixed direct mapping damaged the flexible suffix");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, part_size),
+	        "KernelMunmap(flexible prefix)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base + part_size, part_size),
+	        "KernelMunmap(direct middle)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base + part_size * 2, part_size),
+	        "KernelMunmap(flexible suffix)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, part_size),
+	        "KernelReleaseDirectMemory");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestFixedDirectReclaimsUntrackedPlaceholderAllocation() {
+	const char*        test = "FixedDirectReclaimsUntrackedPlaceholderAllocation";
+	constexpr uint64_t size = SceKernelPageSize * 32;
+	const auto vaddr = Libs::LibKernel::Memory::TestCreateUntrackedPlaceholderAllocation(size);
+	Check(test, vaddr != 0, "failed to create untracked placeholder allocation");
+
+	int64_t phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+	            size, SceKernelPageSize, SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+	void* direct = reinterpret_cast<void*>(vaddr);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &direct, size, SceKernelProtCpuRw, SceKernelMapFixed | SceKernelMapNoCoalesce,
+	            phys_addr, SceKernelPageSize, "orphan_placeholder_direct"),
+	        "KernelMapNamedDirectMemory");
+	Check(test, reinterpret_cast<uint64_t>(direct) == vaddr, "fixed direct mapping moved");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(vaddr, size),
+	        "KernelMunmap(direct)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(vaddr, size),
+	        "KernelMunmap(restored reserve)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, size),
+	        "KernelReleaseDirectMemory");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestFixedReserveRollbackSkipsUntouchedChunks() {
 	const char*        test       = "FixedReserveRollbackSkipsUntouchedChunks";
 	constexpr uint64_t part_size  = SceKernelPageSize * 2;
@@ -929,6 +1075,7 @@ void TestFixedReserveRollbackRestoresDecommittedHostPages() {
 	constexpr uint64_t size   = SceKernelPageSize * 3;
 	void*              mapped = nullptr;
 
+	Libs::LibKernel::Memory::TestUseLegacyHostAllocationForNextFlexibleMap();
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(&mapped, size, SceKernelProtCpuRw,
 	                                                              0, "host_reserve_rollback"),
@@ -1474,6 +1621,9 @@ int main() {
 	RunTest(TestLargeDirectMapAliasesAcrossChunks);
 	RunTest(TestDirectMapUnmapReusesHostAddress);
 	RunTest(TestFixedReserveReplacesPartialDirectMapping);
+	RunTest(TestFixedDirectReplacesPartialPlaceholderFlexibleMapping);
+	RunTest(TestFixedDirectReplacesPartialFlexibleMapping);
+	RunTest(TestFixedDirectReclaimsUntrackedPlaceholderAllocation);
 	RunTest(TestFixedReserveRollbackConsumesRestoredPlaceholder);
 	RunTest(TestFixedReserveRollbackSkipsUntouchedChunks);
 	RunTest(TestFixedReserveRollbackRestoresDecommittedHostPages);

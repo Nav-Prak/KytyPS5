@@ -1069,6 +1069,26 @@ public:
 		SYSTEM_INFO info {};
 		GetSystemInfo(&info);
 		m_granularity = info.dwAllocationGranularity;
+
+		// Keep the primary PS5 user-address window away from large host reservations made by
+		// graphics drivers and the Windows heap. Games commonly use fixed mappings in this range.
+		constexpr uint64_t GUEST_USER_ARENA_BASE = 0x1000000000ull;
+		constexpr uint64_t GUEST_USER_ARENA_SIZE = 0x1000000000ull;
+		auto* arena = VirtualAlloc2(GetCurrentProcess(),
+		                            reinterpret_cast<void*>(GUEST_USER_ARENA_BASE),
+		                            GUEST_USER_ARENA_SIZE,
+		                            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+		if (arena != nullptr && reinterpret_cast<uint64_t>(arena) == GUEST_USER_ARENA_BASE) {
+			m_free.emplace(GUEST_USER_ARENA_BASE, GUEST_USER_ARENA_SIZE);
+		} else {
+			if (arena != nullptr) {
+				VirtualFree(arena, 0, MEM_RELEASE);
+			}
+			LOGF_COLOR(Log::Color::Yellow,
+			           "\t primary guest placeholder arena unavailable: base=0x%016" PRIx64
+			           " size=0x%016" PRIx64 "\n",
+			           GUEST_USER_ARENA_BASE, GUEST_USER_ARENA_SIZE);
+		}
 #endif
 	}
 
@@ -1102,6 +1122,17 @@ public:
 			                    MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, &param, 1);
 		}
 		if (ptr == nullptr) {
+			std::lock_guard lock(m_mutex);
+			const auto search_start =
+			    AlignUp(search_addr != 0 ? search_addr : HOST_SYSTEM_MANAGED_MIN, alignment);
+			for (auto it = m_free.begin(); it != m_free.end(); ++it) {
+				const auto candidate = AlignUp(std::max(search_start, it->first), alignment);
+				if (candidate >= it->first && candidate <= it->first + it->second &&
+				    size <= it->first + it->second - candidate &&
+				    SplitUnlocked(it, candidate, size)) {
+					return candidate;
+				}
+			}
 			return 0;
 		}
 

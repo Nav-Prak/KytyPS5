@@ -141,6 +141,9 @@ void ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 	    z.stencil_info.format != Prospero::GpuEnumValue(Prospero::StencilFormat::kInvalid);
 	const bool has_htile            = z.z_info.tile_surface_enable;
 	const bool msaa_compat          = depth_msaa_single_sample_compatible(z.z_info.num_samples);
+	const bool single_sample_metadata_compat = depth_single_sample_metadata_compatible(
+	    z.z_info.tile_mode_index, z.z_info.num_samples, z.z_info.embedded_sample_locations,
+	    z.z_info.plane_compression);
 	const bool htile_stencil_compat = depth_htile_stencil_acceleration_compatible(
 	    has_stencil, has_htile, z.stencil_info.tile_stencil_disable);
 	const auto view = ResolveTargetViewInfo(z.depth_view.slice_start, z.depth_view.slice_max);
@@ -155,23 +158,80 @@ void ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 	}
 	// Prospero defines the compression-disable bits as tile writeback policy. Vulkan attachments
 	// expose the same logical depth/stencil values regardless of the driver's backing compression.
-	if ((stencil_active && !has_stencil) || rc.resummarize_enable || rc.copy_centroid ||
-	    rc.copy_sample != 0 || z.z_info.expclear_enabled || z.stencil_info.expclear_enabled ||
-	    z.z_info.embedded_sample_locations || z.z_info.partially_resident ||
-	    z.stencil_info.partially_resident || z.z_info.plane_compression != 0 ||
+	if (stencil_active && !has_stencil) {
+		DepthFatal("stencil is active without a stencil attachment");
+	}
+	if (rc.resummarize_enable || rc.copy_centroid || rc.copy_sample != 0) {
+		DepthFatal("unsupported depth render control: resummarize=%u copy_centroid=%u "
+		           "copy_sample=%u",
+		           static_cast<unsigned>(rc.resummarize_enable),
+		           static_cast<unsigned>(rc.copy_centroid), static_cast<unsigned>(rc.copy_sample));
+	}
+	if (z.z_info.expclear_enabled || z.stencil_info.expclear_enabled ||
+	    z.z_info.partially_resident || z.stencil_info.partially_resident ||
 	    (z.z_info.num_samples != 0 && !msaa_compat) || z.z_info.num_mip_levels != 0 ||
-	    z.z_info.tile_mode_index != 0 || z.z_info.zrange_precision > 1 ||
-	    z.depth_view.current_mip_level != 0 || z.depth_info.addr5_swizzle_mask != 0 ||
+	    ((z.z_info.embedded_sample_locations || z.z_info.plane_compression != 0 ||
+	      z.z_info.tile_mode_index != 0) &&
+	     !single_sample_metadata_compat) ||
+	    z.z_info.zrange_precision > 1) {
+		DepthFatal("unsupported depth format state: z_expclear=%u stencil_expclear=%u "
+		           "embedded_samples=%u z_partially_resident=%u stencil_partially_resident=%u "
+		           "plane_compression=%u samples=%u mip_levels=%u tile_mode=%u "
+		           "zrange_precision=%u",
+		           static_cast<unsigned>(z.z_info.expclear_enabled),
+		           static_cast<unsigned>(z.stencil_info.expclear_enabled),
+		           static_cast<unsigned>(z.z_info.embedded_sample_locations),
+		           static_cast<unsigned>(z.z_info.partially_resident),
+		           static_cast<unsigned>(z.stencil_info.partially_resident),
+		           static_cast<unsigned>(z.z_info.plane_compression),
+		           static_cast<unsigned>(z.z_info.num_samples),
+		           static_cast<unsigned>(z.z_info.num_mip_levels),
+		           static_cast<unsigned>(z.z_info.tile_mode_index),
+		           static_cast<unsigned>(z.z_info.zrange_precision));
+	}
+	if (single_sample_metadata_compat) {
+		static std::atomic_bool logged = false;
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("DepthTarget: compatibility: mapping PS5 single-sample depth preset "
+			     "tile_mode=1 iterate_flush=1 decompress_zplanes=5 to SW_64KB_Z_X\n");
+		}
+	}
+	if (z.depth_view.current_mip_level != 0 || z.depth_info.addr5_swizzle_mask != 0 ||
 	    z.depth_info.array_mode != 0 || z.depth_info.pipe_config != 0 ||
 	    z.depth_info.bank_width != 0 || z.depth_info.bank_height != 0 ||
-	    z.depth_info.macro_tile_aspect != 0 || z.depth_info.num_banks != 0 ||
-	    z.htile_surface.linear != 0 || z.htile_surface.full_cache != 0 ||
+	    z.depth_info.macro_tile_aspect != 0 || z.depth_info.num_banks != 0) {
+		DepthFatal("unsupported depth layout: mip=%u addr5_swizzle=%u array_mode=%u "
+		           "pipe_config=%u bank_width=%u bank_height=%u macro_tile_aspect=%u banks=%u",
+		           static_cast<unsigned>(z.depth_view.current_mip_level),
+		           static_cast<unsigned>(z.depth_info.addr5_swizzle_mask),
+		           static_cast<unsigned>(z.depth_info.array_mode),
+		           static_cast<unsigned>(z.depth_info.pipe_config),
+		           static_cast<unsigned>(z.depth_info.bank_width),
+		           static_cast<unsigned>(z.depth_info.bank_height),
+		           static_cast<unsigned>(z.depth_info.macro_tile_aspect),
+		           static_cast<unsigned>(z.depth_info.num_banks));
+	}
+	if (z.htile_surface.linear != 0 || z.htile_surface.full_cache != 0 ||
 	    z.htile_surface.htile_uses_preload_win != 0 || z.htile_surface.preload != 0 ||
 	    z.htile_surface.prefetch_width != 0 || z.htile_surface.prefetch_height != 0 ||
-	    z.htile_surface.dst_outside_zero_to_one != 0 || z.z_read_base_addr == 0 ||
-	    z.z_write_base_addr != z.z_read_base_addr || (z.z_read_base_addr & 0xffffu) != 0 ||
-	    dc.zfunc > static_cast<uint8_t>(VK_COMPARE_OP_ALWAYS)) {
-		DepthFatal("unsupported depth register state");
+	    z.htile_surface.dst_outside_zero_to_one != 0) {
+		DepthFatal("unsupported HTile surface: linear=%u full_cache=%u preload_win=%u preload=%u "
+		           "prefetch_width=%u prefetch_height=%u outside_zero_to_one=%u",
+		           static_cast<unsigned>(z.htile_surface.linear),
+		           static_cast<unsigned>(z.htile_surface.full_cache),
+		           static_cast<unsigned>(z.htile_surface.htile_uses_preload_win),
+		           static_cast<unsigned>(z.htile_surface.preload),
+		           static_cast<unsigned>(z.htile_surface.prefetch_width),
+		           static_cast<unsigned>(z.htile_surface.prefetch_height),
+		           static_cast<unsigned>(z.htile_surface.dst_outside_zero_to_one));
+	}
+	if (z.z_read_base_addr == 0 || z.z_write_base_addr != z.z_read_base_addr ||
+	    (z.z_read_base_addr & 0xffffu) != 0) {
+		DepthFatal("unsupported depth addresses: read=0x%016" PRIx64 " write=0x%016" PRIx64,
+		           z.z_read_base_addr, z.z_write_base_addr);
+	}
+	if (dc.zfunc > static_cast<uint8_t>(VK_COMPARE_OP_ALWAYS)) {
+		DepthFatal("unsupported depth compare function: %u", static_cast<unsigned>(dc.zfunc));
 	}
 	if (msaa_compat) {
 		static std::atomic<uint32_t> logged_fragments = 0;

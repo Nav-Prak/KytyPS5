@@ -11147,15 +11147,28 @@ void CheckImageOverlapResolution() {
   Require("ImageOverlapResolution", "storage retires clean sampled backing",
           ClassifyStorageImageOverlap(storage_subrange, storage_subrange_size,
                                       sampled_backing, sampled_backing_size,
-                                      true, true, false, false, false) ==
+                                      true, false, true, false, false, false) ==
               StorageImageOverlap::RetireSampled,
           "clean sampled subrange was not retired before storage creation");
   Require("ImageOverlapResolution", "storage preserves dirty sampled backing",
           ClassifyStorageImageOverlap(storage_subrange, storage_subrange_size,
                                       sampled_backing, sampled_backing_size,
-                                      true, true, true, false, true) ==
+                                      true, false, true, true, false, true) ==
               StorageImageOverlap::Unsupported,
           "GPU-owned sampled subrange was admitted as storage backing");
+	constexpr uint64_t containing_storage_address = 0x6000000000ull;
+	constexpr uint64_t containing_storage_size    = 0x200000;
+	Require("ImageOverlapResolution", "storage retires contained render target",
+	        ClassifyStorageImageOverlap(containing_storage_address, containing_storage_size,
+	                                    containing_storage_address, 0x10000, false, true, true, true,
+	                                    false, true) == StorageImageOverlap::RetireTarget,
+	        "GPU-owned render target was not retired before containing storage creation");
+	Require("ImageOverlapResolution", "storage rejects partial render-target overlap",
+	        ClassifyStorageImageOverlap(containing_storage_address + 0x8000,
+	                                    containing_storage_size, containing_storage_address, 0x10000,
+	                                    false, true, true, true,
+	                                    false, true) == StorageImageOverlap::Unsupported,
+	        "partially covered render target was admitted as storage backing");
   ImageInfo page_left = sampled;
   page_left.size = TRACKER_PAGE_SIZE / 2;
   ImageInfo same_page = page_left;
@@ -11643,6 +11656,22 @@ void CheckImageOverlapResolution() {
           ClassifyRenderTargetOverlap(old_target, false, false, true, adjacent_target) ==
               RenderTargetOverlap::None,
           "adjacent render targets were treated as allocation-pool replacement");
+	RenderTargetInfo page_neighbor{};
+	page_neighbor.address = 0x6000010100ull;
+	page_neighbor.size    = 0x10000;
+	auto page_neighbor_request = page_neighbor;
+	page_neighbor_request.address = 0x6000020200ull;
+	Require("ImageOverlapResolution", "render-target shared page",
+	        !ImageRangeOverlaps(page_neighbor.address, page_neighbor.size,
+	                            page_neighbor_request.address, page_neighbor_request.size) &&
+	            ClassifyRenderTargetOverlap(page_neighbor, true, false, true,
+	                                        page_neighbor_request) ==
+	                RenderTargetOverlap::RetireTarget,
+	        "GPU-owned byte-disjoint render-target page neighbor was not retired");
+	Require("ImageOverlapResolution", "render-target shared page buffer owner",
+	        ClassifyRenderTargetOverlap(page_neighbor, true, true, true, page_neighbor_request) ==
+	            RenderTargetOverlap::Unsupported,
+	        "buffer-owned render-target page neighbor was retired");
 
   Require("ImageOverlapResolution", "metadata retains sampled image",
           ClassifyMetaImageOverlap(true, false, false, false) ==
@@ -11904,6 +11933,20 @@ void CheckDepthHtileStencilCompatibility() {
   Require("DepthHtileStencilCompatibility", "missing HTile metadata",
           !depth_htile_stencil_acceleration_compatible(true, false, false),
           "Hi-Stencil without HTile metadata was silently admitted");
+
+  Require("DepthHtileStencilCompatibility", "single-sample metadata preset",
+          depth_single_sample_metadata_compatible(1, 0, true, 5),
+          "supported single-sample depth metadata was rejected");
+  Require("DepthHtileStencilCompatibility", "preset requires single sample",
+          !depth_single_sample_metadata_compatible(1, 1, true, 5),
+          "metadata compatibility admitted a multisampled target");
+  Require("DepthHtileStencilCompatibility", "preset requires exact tile mode",
+          !depth_single_sample_metadata_compatible(0, 0, true, 5),
+          "metadata compatibility admitted an unrelated tile mode");
+  Require("DepthHtileStencilCompatibility", "preset requires exact controls",
+          !depth_single_sample_metadata_compatible(1, 0, false, 5) &&
+              !depth_single_sample_metadata_compatible(1, 0, true, 4),
+          "metadata compatibility admitted unrelated depth-pipe controls");
   std::printf("[host]    %-32s ok\n", "DepthHtileStencilCompatibility");
 }
 

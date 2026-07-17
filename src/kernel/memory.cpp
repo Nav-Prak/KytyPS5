@@ -717,6 +717,7 @@ private:
 static uint32_t g_test_physical_memory_unmaps_before_failure = UINT32_MAX;
 static uint32_t g_test_host_reservation_pages_before_failure = UINT32_MAX;
 static bool     g_test_fail_next_fixed_reserve_range_add     = false;
+static bool     g_test_use_legacy_host_for_next_flexible_map = false;
 #endif
 
 class PhysicalMemory {
@@ -1936,6 +1937,7 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 	uint64_t             out_addr                = 0;
 	bool                 committed_from_reserved = false;
 	bool                 consumed_reserved       = false;
+	bool                 placeholder_backed      = false;
 	VirtualRanges::Range consumed_range {};
 
 	if ((flags & MAP_FIXED) != 0) {
@@ -1953,6 +1955,7 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 			    CommitFixedHostRange(in_addr, len, mode)) {
 				out_addr                = in_addr;
 				committed_from_reserved = true;
+				placeholder_backed      = consumed_range.placeholder_backed;
 			}
 		} else if (!ReleaseReservedRange(in_addr, len)) {
 			return KERNEL_ERROR_ENOMEM;
@@ -1961,7 +1964,27 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 		}
 	} else {
 		const auto search_addr = (in_addr != 0 ? in_addr : DEFAULT_PS5_BASE);
-		out_addr               = VirtualMemory::AllocAligned(search_addr, len, mode, PAGE_SIZE);
+		bool use_placeholder = true;
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+		if (g_test_use_legacy_host_for_next_flexible_map) {
+			g_test_use_legacy_host_for_next_flexible_map = false;
+			use_placeholder = false;
+		}
+#endif
+		out_addr = use_placeholder
+		               ? g_placeholder_address_space->ReserveAligned(search_addr, len, PAGE_SIZE)
+		               : 0;
+		if (out_addr != 0) {
+			if (g_placeholder_address_space->Commit(out_addr, len, mode)) {
+				placeholder_backed = true;
+			} else {
+				g_placeholder_address_space->ReleaseFree(out_addr, len);
+				out_addr = 0;
+			}
+		}
+		if (out_addr == 0) {
+			out_addr = VirtualMemory::AllocAligned(search_addr, len, mode, PAGE_SIZE);
+		}
 	}
 
 	*addr_in_out = reinterpret_cast<void*>(out_addr);
@@ -1973,6 +1996,14 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 		}
 		return KERNEL_ERROR_ENOMEM;
 	}
+	auto release_host_mapping = [&]() {
+		if (placeholder_backed && g_placeholder_address_space->ReleaseCommitted(out_addr, len)) {
+			if (g_placeholder_address_space->ReleaseFree(out_addr, len)) {
+				return;
+			}
+		}
+		VirtualMemory::Free(out_addr);
+	};
 
 	if (!g_flexible_memory->Map(out_addr, len, prot, mode, gpu_mode, name)) {
 		LOGF_COLOR(Log::Color::Red, "\t [Fail]\n");
@@ -1981,7 +2012,7 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 			g_virtual_ranges->Add(out_addr, len, 0, 0, 0, VirtualRangeType::Reserved, name, false,
 			                      placeholder_backed);
 		} else {
-			VirtualMemory::Free(out_addr);
+			release_host_mapping();
 		}
 		return KERNEL_ERROR_ENOMEM;
 	}
@@ -1989,7 +2020,7 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 	const auto range_type =
 	    ((flags & MAP_STACK) != 0 ? VirtualRangeType::Stack : VirtualRangeType::Flexible);
 	if (!g_virtual_ranges->Add(out_addr, len, 0, prot, 0, range_type, name,
-	                           committed_from_reserved)) {
+	                           committed_from_reserved, placeholder_backed)) {
 		GpuAccessMode rollback_gpu_mode = GpuAccessMode::NoAccess;
 		g_flexible_memory->Unmap(out_addr, len, &rollback_gpu_mode);
 		if (committed_from_reserved) {
@@ -1997,7 +2028,7 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 			g_virtual_ranges->Add(out_addr, len, 0, 0, 0, VirtualRangeType::Reserved, name, false,
 			                      placeholder_backed);
 		} else {
-			VirtualMemory::Free(out_addr);
+			release_host_mapping();
 		}
 		return KERNEL_ERROR_EBUSY;
 	}
@@ -2178,6 +2209,7 @@ int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 	bool          backend_unmapped = false;
 	bool          shared_unmapped  = false;
 	bool          placeholder_restored     = false;
+	bool          placeholder_released     = false;
 	bool          flexible_backend         = false;
 	uint64_t      physical_host_to_release = 0;
 	uint64_t      flexible_host_to_release = 0;
@@ -2227,8 +2259,14 @@ int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 		backend_unmapped = (backend_found ? g_flexible_memory->Unmap(vaddr, len, &gpu_mode,
 		                                                             &flexible_host_to_release)
 		                                  : false);
-		if (backend_unmapped && can_restore_placeholder) {
+		if (backend_unmapped && range.placeholder_backed) {
 			placeholder_restored = g_placeholder_address_space->ReleaseCommitted(vaddr, len);
+			if (placeholder_restored) {
+				if (!range.committed_from_reserved) {
+					placeholder_released = g_placeholder_address_space->ReleaseFree(vaddr, len);
+					placeholder_restored = !placeholder_released;
+				}
+			}
 		}
 	}
 	if (!backend_unmapped) {
@@ -2244,7 +2282,9 @@ int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 	const bool can_release_host_range = exact_host_range && backend_unmapped &&
 	                                    !range.committed_from_reserved &&
 	                                    host_range_released_or_shared;
-	if (can_release_host_range && (vaddr != 0 || len != 0)) {
+	if (placeholder_released) {
+		// The owned placeholder was split from its neighbors and released above.
+	} else if (can_release_host_range && (vaddr != 0 || len != 0)) {
 		if (!shared_unmapped) {
 			VirtualMemory::Free(flexible_backend ? flexible_host_to_release
 			                                     : physical_host_to_release);
@@ -2820,6 +2860,18 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 	     Common::EnumName(gpu_mode).c_str(), shared_backing ? "yes" : "no", shared_reason);
 
 	if (out_addr == 0) {
+		VirtualRanges::Range original_fixed_range {};
+		if (fixed && g_virtual_ranges->Query(in_addr, 0, &original_fixed_range)) {
+			LOGF("\t original_start       = 0x%016" PRIx64 "\n"
+			     "\t original_size        = 0x%016" PRIx64 "\n"
+			     "\t original_type        = %s\n"
+			     "\t original_reserved    = %s\n"
+			     "\t original_placeholder = %s\n",
+			     original_fixed_range.start, original_fixed_range.size,
+			     Common::EnumName(original_fixed_range.type).c_str(),
+			     original_fixed_range.committed_from_reserved ? "yes" : "no",
+			     original_fixed_range.placeholder_backed ? "yes" : "no");
+		}
 		if (consumed_reserved) {
 			g_virtual_ranges->Add(in_addr, len, 0, 0, 0, VirtualRangeType::Reserved,
 			                      consumed_range.name, false, consumed_range.placeholder_backed);
@@ -3093,8 +3145,16 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size, bool* p
 			} else if (chunk.range.type == VirtualRangeType::Flexible ||
 			           chunk.range.type == VirtualRangeType::Stack ||
 			           chunk.range.type == VirtualRangeType::Pooled) {
-				host_restored =
-				    CommitFixedHostRange(chunk.range.start, chunk.range.size, chunk.mode);
+				if (chunk.host_unmapped && chunk.placeholder_restored) {
+					const bool consumed =
+					    g_placeholder_address_space->Consume(chunk.range.start, chunk.range.size);
+					host_restored =
+					    consumed && g_placeholder_address_space->Commit(
+					                    chunk.range.start, chunk.range.size, chunk.mode);
+				} else {
+					host_restored =
+					    CommitFixedHostRange(chunk.range.start, chunk.range.size, chunk.mode);
+				}
 				if (chunk.backend_unmapped) {
 					backend_restored = g_flexible_memory->Map(chunk.range.start, chunk.range.size,
 					                                          chunk.range.protection, chunk.mode,
@@ -3160,6 +3220,16 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size, bool* p
 			unmapped = g_flexible_memory->Unmap(chunk.range.start, chunk.range.size, &gpu_mode);
 			chunk.gpu_mode         = gpu_mode;
 			chunk.backend_unmapped = unmapped;
+			if (unmapped && chunk.range.placeholder_backed) {
+				chunk.placeholder_restored =
+				    g_placeholder_address_space->ReleaseCommitted(chunk.range.start,
+				                                                    chunk.range.size);
+				if (chunk.placeholder_restored) {
+					chunk.host_unmapped = true;
+				} else {
+					unmapped = false;
+				}
+			}
 		}
 
 		if (!unmapped) {
@@ -3180,7 +3250,9 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size, bool* p
 		}
 	}
 
-	if (g_placeholder_address_space->ReserveFixed(start, size)) {
+	const bool reclaimed_untracked_placeholder =
+	    chunks.empty() && g_placeholder_address_space->ReleaseCommitted(start, size);
+	if (reclaimed_untracked_placeholder || g_placeholder_address_space->ReserveFixed(start, size)) {
 		*placeholder_backed = true;
 	} else if (!ReserveFixedHostRange(start, size)) {
 		if (gpu_unmapped) {
@@ -3330,8 +3402,21 @@ void TestFailHostReservationAfter(uint32_t successful_pages) {
 	g_test_host_reservation_pages_before_failure = successful_pages;
 }
 
+void TestUseLegacyHostAllocationForNextFlexibleMap() {
+	g_test_use_legacy_host_for_next_flexible_map = true;
+}
+
 void TestFailNextFixedReserveRangeRegistration() {
 	g_test_fail_next_fixed_reserve_range_add = true;
+}
+
+uint64_t TestCreateUntrackedPlaceholderAllocation(uint64_t size) {
+	const auto vaddr = g_placeholder_address_space->ReserveAligned(0, size, 0x4000);
+	if (vaddr == 0 ||
+	    !g_placeholder_address_space->Commit(vaddr, size, VirtualMemory::Mode::ReadWrite)) {
+		return 0;
+	}
+	return vaddr;
 }
 
 bool TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size) {

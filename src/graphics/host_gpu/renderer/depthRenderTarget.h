@@ -21,6 +21,18 @@ inline constexpr bool depth_htile_stencil_acceleration_compatible(bool has_stenc
 	return acceleration_disabled || (has_stencil && has_htile);
 }
 
+// DB_Z_INFO's ITERATE_FLUSH and DECOMPRESS_ON_N_ZPLANES fields control native depth-pipe
+// behavior; they do not change the guest image footprint. Kyty represents this PS5 single-sample
+// preset with the same SW_64KB_Z_X tiling used by its other depth targets, while Vulkan owns the
+// corresponding compression policy.
+inline constexpr bool depth_single_sample_metadata_compatible(uint32_t tile_mode_index,
+                                                               uint32_t num_samples,
+                                                               bool     iterate_flush,
+                                                               uint8_t  decompress_on_n_zplanes) {
+	return tile_mode_index == 1 && num_samples == 0 && iterate_flush &&
+	       decompress_on_n_zplanes == 5;
+}
+
 struct RenderDepthInfo {
 	VkFormat                    format                   = VK_FORMAT_UNDEFINED;
 	uint32_t                    width                    = 0;

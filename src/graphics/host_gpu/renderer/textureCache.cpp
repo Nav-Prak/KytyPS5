@@ -1816,10 +1816,15 @@ void TextureCache::RetireStoragePageNeighbors(GraphicContext* ctx, const ImageIn
 		    m_memory_tracker.IsRegionGpuModified(cached->Address(), cached->Size());
 		switch (ClassifyStorageImageOverlap(
 		    requested.address, requested.size, cached->Address(), cached->Size(),
-		    cached->kind == CachedImage::Kind::Texture, cached->ctx == ctx, cached->gpu_modified,
-		    cached->buffer_modified, tracker_gpu)) {
+		    cached->kind == CachedImage::Kind::Texture,
+		    cached->kind == CachedImage::Kind::RenderTarget, cached->ctx == ctx,
+		    cached->gpu_modified, cached->buffer_modified, tracker_gpu)) {
 			case StorageImageOverlap::None: continue;
 			case StorageImageOverlap::RetireSampled: retire.push_back(cached.get()); continue;
+			case StorageImageOverlap::RetireTarget:
+				wait_idle |= cached->gpu_modified;
+				retire.push_back(cached.get());
+				continue;
 			case StorageImageOverlap::PageNeighbor: break;
 			case StorageImageOverlap::Unsupported:
 				EXIT("TextureCache: unsupported storage-image byte alias, requested=0x%016" PRIx64
@@ -2284,6 +2289,7 @@ RenderTextureVulkanImage* TextureCache::FindRenderTarget(CommandBuffer*         
 		return static_cast<RenderTextureVulkanImage*>(match->image);
 	}
 	std::vector<CachedImage*>    retire;
+	std::vector<CachedImage*>    readback;
 	std::shared_ptr<CachedImage> native_image_source;
 	for (const auto& entry: m_images) {
 		auto& cached = *entry;
@@ -2332,6 +2338,9 @@ RenderTextureVulkanImage* TextureCache::FindRenderTarget(CommandBuffer*         
 				break;
 			case RenderTargetOverlap::RetireTarget:
 				supported = cached.kind == CachedImage::Kind::RenderTarget;
+				if (supported && cached.gpu_modified) {
+					readback.push_back(&cached);
+				}
 				break;
 			case RenderTargetOverlap::None:
 			case RenderTargetOverlap::Unsupported: break;
@@ -2351,6 +2360,15 @@ RenderTextureVulkanImage* TextureCache::FindRenderTarget(CommandBuffer*         
 		retire.push_back(&cached);
 	}
 	RequireRetirementIsolation(retire, "render target", info.address, info.size);
+	if (!readback.empty()) {
+		VulkanDeviceWaitIdle(ctx);
+		for (auto* cached: readback) {
+			const auto transfer = m_readback->DownloadColorImage(*cached);
+			m_memory_tracker.ForEachDownloadRange<true>(transfer.address, transfer.size,
+			                                            [](uint64_t, uint64_t) noexcept {});
+			cached->gpu_modified = false;
+		}
+	}
 	RetireImages(retire, native_image_source.get());
 	auto cached                = std::make_shared<CachedImage>();
 	cached->kind               = CachedImage::Kind::RenderTarget;

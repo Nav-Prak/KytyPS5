@@ -1,14 +1,47 @@
 # Grand Theft Auto V PS5 bring-up plan
 
-This document is a pre-test engineering plan for bringing a legally obtained PlayStation 5 copy
-of *Grand Theft Auto V* to offline Story Mode in KytyPS5. It is not a compatibility report and does
-not claim that the game currently boots.
+This document is the engineering plan and running bring-up record for a legally obtained
+PlayStation 5 copy of *Grand Theft Auto V* in offline Story Mode. It records technical milestones,
+but it is not a playability claim.
 
 Plan date: 2026-07-17
 
 Starting source branch: `feature/hades-compatibility`
 
 Starting source commit: `d30dfac`
+
+## Bring-up status
+
+Tested title: `PPSA04264`, application version `01.005.000` (PS5 SDK 6.00).
+
+Status on 2026-07-17:
+
+- The loader enters guest main and the title completes substantial platform and asset
+  initialization.
+- The renderer compiled nine observed shaders, executed hundreds of graphics dispatches in the
+  diagnostic run, streamed assets, and reached a 3840x2160 display-buffer render.
+- A 55-second trace-free run remained alive without a fatal error. Visual correctness, menu input,
+  and Story Mode entry have not yet been verified, so M3 and later milestones remain open.
+- `VideoRecordingP_v1` is still an unresolved called stub. It has not yet been shown to block the
+  offline startup path.
+- The host used for this run did not expose an SDL/WASAPI audio endpoint. Kyty continued with its
+  timing fallback, so audible output remains untested.
+
+Three deterministic compatibility blockers were fixed generically during the first session:
+
+1. A host reservation occupied GTA V's fixed guest mapping range. Windows builds now reserve a
+   bounded placeholder arena for fixed guest mappings and can transactionally replace overlapping
+   placeholder-backed flexible mappings.
+2. GTA V aliases render targets as storage images. The cache now retires fully contained,
+   same-context render targets after synchronization and exact readback; partial or buffer-owned
+   aliases remain rejected.
+3. GTA V uses the PS5 single-sample depth preset `TILE_MODE_INDEX=1`, `ITERATE_FLUSH=1`, and
+   `DECOMPRESS_ON_N_ZPLANES=5`. Kyty maps that exact control preset to its existing
+   `SW_64KB_Z_X` depth representation while retaining strict rejection for other unsupported depth
+   layouts.
+
+Focused virtual-memory, image-alias, shared-tracker-page, and depth-preset regressions cover these
+changes. Raw logs and local paths remain outside the repository.
 
 ## Initial target
 

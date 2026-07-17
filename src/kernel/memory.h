@@ -163,7 +163,9 @@ void UnregisterProgramMemory(uint64_t vaddr, uint64_t size);
 void TestFailNextPhysicalMemoryUnmap();
 void TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps);
 void TestFailHostReservationAfter(uint32_t successful_pages);
+void TestUseLegacyHostAllocationForNextFlexibleMap();
 void TestFailNextFixedReserveRangeRegistration();
+uint64_t TestCreateUntrackedPlaceholderAllocation(uint64_t size);
 bool TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
 #endif
 

@@ -10307,7 +10307,8 @@ void CheckRenderTargetTileRoundTrip() {
     uint32_t bytes_per_element;
   };
   constexpr std::array cases{
-      Case{129, 65, 1}, Case{257, 131, 2}, Case{3840, 2160, 4}, Case{65, 67, 8}};
+      Case{129, 65, 1}, Case{257, 131, 2}, Case{3840, 2160, 4},
+      Case{65, 67, 8},  Case{67, 65, 16}};
   for (const auto test : cases) {
     const auto pitch =
         TileGetRenderTargetPitch(test.width, test.bytes_per_element);
@@ -10344,6 +10345,23 @@ void CheckRenderTargetTileRoundTrip() {
               "linear-to-tiled render-target conversion did not round-trip");
     }
   }
+  using Element128 = std::array<uint32_t, 4>;
+  constexpr uint32_t block128_width = 64;
+  constexpr uint32_t block128_height = 64;
+  std::vector<Element128> known128(block128_width * block128_height);
+  for (uint32_t i = 0; i < known128.size(); i++) {
+    known128[i] = {i, i ^ 0x55aa55aau, ~i, i * 0x9e3779b9u};
+  }
+  std::vector<Element128> tiled128(known128.size());
+  TileConvertLinearToTiledRenderTarget(
+      tiled128.data(), known128.data(), block128_width, block128_height,
+      block128_width, sizeof(Element128), 0x10000);
+  Require("RenderTargetTileRoundTrip", "128-bit byte mapping",
+          tiled128[0] == known128[0] && tiled128[1] == known128[64] &&
+              tiled128[2] == known128[128] && tiled128[4] == known128[1] &&
+              tiled128[8] == known128[2] && tiled128[32] == known128[4] &&
+              tiled128[4095] == known128[4095],
+          "128-bit render-target tiling disagreed with the Standard64KB equation");
   constexpr uint32_t width = 257;
   constexpr uint32_t height = 131;
   constexpr uint32_t bytes_per_element = 4;

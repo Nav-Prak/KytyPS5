@@ -701,6 +701,9 @@ SelectDepthTransitionSource(bool depth_load_clear, bool sampled_native_available
 }
 
 [[nodiscard]] inline bool IsRgba8SrgbReinterpretation(VkFormat cached, VkFormat requested) noexcept;
+[[nodiscard]] inline bool IsCompatibleStorageSampledViewFormat(VkFormat cached,
+                                                                VkFormat requested) noexcept;
+[[nodiscard]] inline bool IsMutableStorageSampledViewFormat(VkFormat format) noexcept;
 
 [[nodiscard]] inline StorageSampledOverlap
 ClassifyStorageSampledOverlap(const ImageInfo& requested, const ImageInfo& cached,
@@ -717,8 +720,7 @@ ClassifyStorageSampledOverlap(const ImageInfo& requested, const ImageInfo& cache
 	    requested.tile == cached.tile && requested.depth == cached.depth &&
 	    requested.type == cached.type && requested.base_array == cached.base_array;
 	const bool compatible_format =
-	    (requested.format == cached.format && requested_view_format == cached_image_format) ||
-	    IsRgba8SrgbReinterpretation(cached_image_format, requested_view_format);
+	    IsCompatibleStorageSampledViewFormat(cached_image_format, requested_view_format);
 	return same_backing && compatible_format && cached_gpu_modified && !cached_cpu_dirty &&
 	               same_context
 	           ? StorageSampledOverlap::ExactImage
@@ -852,7 +854,7 @@ ClassifyStorageRenderTargetOverlap(const ImageInfo& storage, VkFormat storage_fo
 }
 
 [[nodiscard]] inline bool IsRgba8SrgbReinterpretation(VkFormat cached,
-                                                      VkFormat requested) noexcept {
+                                                       VkFormat requested) noexcept {
 	return (cached == VK_FORMAT_R8G8B8A8_UNORM && requested == VK_FORMAT_R8G8B8A8_SRGB) ||
 	       (cached == VK_FORMAT_R8G8B8A8_SRGB && requested == VK_FORMAT_R8G8B8A8_UNORM) ||
 	       (cached == VK_FORMAT_B8G8R8A8_UNORM && requested == VK_FORMAT_B8G8R8A8_SRGB) ||
@@ -888,8 +890,12 @@ ClassifyStorageImageOverlap(uint64_t requested_address, uint64_t requested_size,
 	if (!ImagePageRangesOverlap(requested_address, requested_size, cached_address, cached_size)) {
 		return StorageImageOverlap::None;
 	}
+	const bool retire_target = render_target && same_context && !buffer_modified &&
+	                           gpu_modified == tracker_gpu_modified;
 	if (!ImageRangeOverlaps(requested_address, requested_size, cached_address, cached_size)) {
-		return StorageImageOverlap::PageNeighbor;
+		return render_target ? (retire_target ? StorageImageOverlap::RetireTarget
+		                                      : StorageImageOverlap::Unsupported)
+		                     : StorageImageOverlap::PageNeighbor;
 	}
 	if (sampled && same_context && !gpu_modified && !buffer_modified && !tracker_gpu_modified) {
 		return StorageImageOverlap::RetireSampled;
@@ -897,10 +903,20 @@ ClassifyStorageImageOverlap(uint64_t requested_address, uint64_t requested_size,
 	const auto delta = cached_address >= requested_address ? cached_address - requested_address
 	                                                     : UINT64_MAX;
 	const bool contained = delta <= requested_size && cached_size <= requested_size - delta;
-	return render_target && contained && same_context && !buffer_modified &&
-	               gpu_modified == tracker_gpu_modified
-	           ? StorageImageOverlap::RetireTarget
-	           : StorageImageOverlap::Unsupported;
+	return retire_target && contained ? StorageImageOverlap::RetireTarget
+	                                  : StorageImageOverlap::Unsupported;
+}
+
+[[nodiscard]] inline bool IsCompatibleStorageSampledViewFormat(VkFormat cached,
+                                                                VkFormat requested) noexcept {
+	return cached == requested || IsRgba8SrgbReinterpretation(cached, requested) ||
+	       (cached == VK_FORMAT_R8_UINT && requested == VK_FORMAT_R8_UNORM) ||
+	       (cached == VK_FORMAT_R8_UNORM && requested == VK_FORMAT_R8_UINT);
+}
+
+[[nodiscard]] inline bool IsMutableStorageSampledViewFormat(VkFormat format) noexcept {
+	return IsRgba8SrgbViewFormat(format) || format == VK_FORMAT_R8_UINT ||
+	       format == VK_FORMAT_R8_UNORM;
 }
 
 [[nodiscard]] inline constexpr bool LayeredBackingContains(uint64_t container_size,

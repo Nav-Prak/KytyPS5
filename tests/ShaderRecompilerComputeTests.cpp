@@ -10540,6 +10540,33 @@ void CheckStorageTextureSampledReuse() {
               VK_FORMAT_R8G8B8A8_UNORM, true, false, true) ==
               StorageSampledOverlap::ExactImage,
           "exact storage backing rejected a distinct sampled descriptor swizzle");
+  ImageInfo r8_uint_storage{};
+  r8_uint_storage.address = 0x78000000;
+  r8_uint_storage.size = 0x800000;
+  r8_uint_storage.format = Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt);
+  r8_uint_storage.width = 2048;
+  r8_uint_storage.height = 4096;
+  r8_uint_storage.pitch = 2048;
+  r8_uint_storage.levels = 1;
+  r8_uint_storage.tile = Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
+  r8_uint_storage.swizzle = DstSel(4, 5, 6, 7);
+  r8_uint_storage.type = Prospero::GpuEnumValue(Prospero::ImageType::kColor2D);
+  auto r8_unorm_sampled = r8_uint_storage;
+  r8_unorm_sampled.format = Prospero::GpuEnumValue(Prospero::BufferFormat::k8UNorm);
+  r8_unorm_sampled.swizzle = DstSel(0, 0, 0, 1);
+  Require("StorageTextureSampledReuse", "R8 UINT-to-UNORM sampled view",
+          IsMutableStorageSampledViewFormat(VK_FORMAT_R8_UINT) &&
+              IsCompatibleStorageSampledViewFormat(VK_FORMAT_R8_UINT,
+                                                   VK_FORMAT_R8_UNORM) &&
+              ClassifyStorageSampledOverlap(
+                  r8_unorm_sampled, r8_uint_storage, VK_FORMAT_R8_UNORM,
+                  VK_FORMAT_R8_UINT, true, false, true) ==
+                  StorageSampledOverlap::ExactImage,
+          "GPU-owned R8 UINT storage image rejected its exact R8 UNORM sampled view");
+  Require("StorageTextureSampledReuse", "R8 incompatible sampled view",
+          !IsCompatibleStorageSampledViewFormat(VK_FORMAT_R8_UINT,
+                                                VK_FORMAT_R8_SNORM),
+          "R8 UINT storage image admitted an incompatible signed-normalized view");
   const auto usage = TextureFormatUsage::Sampled | TextureFormatUsage::Storage;
   Require("StorageTextureSampledReuse", "usage",
           (TextureGetUsage(usage) &
@@ -11169,6 +11196,27 @@ void CheckImageOverlapResolution() {
 	                                    false, true, true, true,
 	                                    false, true) == StorageImageOverlap::Unsupported,
 	        "partially covered render target was admitted as storage backing");
+	constexpr uint64_t neighboring_storage_address = 0x6001000800ull;
+	constexpr uint64_t neighboring_storage_size    = 0x80000;
+	constexpr uint64_t neighboring_target_address =
+	    neighboring_storage_address + neighboring_storage_size;
+	constexpr uint64_t neighboring_target_size = 0x18000;
+	Require("ImageOverlapResolution", "storage retires render-target page neighbor",
+	        !ImageRangeOverlaps(neighboring_storage_address, neighboring_storage_size,
+	                            neighboring_target_address, neighboring_target_size) &&
+	            ImagePageRangesOverlap(neighboring_storage_address, neighboring_storage_size,
+	                                   neighboring_target_address, neighboring_target_size) &&
+	            ClassifyStorageImageOverlap(
+	                neighboring_storage_address, neighboring_storage_size,
+	                neighboring_target_address, neighboring_target_size, false, true, true, true,
+	                false, true) == StorageImageOverlap::RetireTarget,
+	        "GPU-owned byte-disjoint render-target page neighbor was not retired");
+	Require("ImageOverlapResolution", "storage rejects buffer-owned target page neighbor",
+	        ClassifyStorageImageOverlap(neighboring_storage_address, neighboring_storage_size,
+	                                    neighboring_target_address, neighboring_target_size, false,
+	                                    true, true, true, true, true) ==
+	            StorageImageOverlap::Unsupported,
+	        "buffer-owned render-target page neighbor was retired");
   ImageInfo page_left = sampled;
   page_left.size = TRACKER_PAGE_SIZE / 2;
   ImageInfo same_page = page_left;

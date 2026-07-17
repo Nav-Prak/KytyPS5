@@ -805,7 +805,8 @@ TextureImageCreateParams MakeImageParams(const ImageInfo& info, bool storage) {
 	params.image_layout    = TextureUploadDestination::MipLevels;
 	params.allow_cube_view = !storage;
 	params.compatible_format_views =
-	    storage && IsRgba8SrgbViewFormat(TextureGetFormat(info.format, params.format_usage));
+	    storage && IsMutableStorageSampledViewFormat(
+	                   TextureGetFormat(info.format, params.format_usage));
 	params.owner = storage ? "StorageTextureCache" : "TextureCache";
 	return params;
 }
@@ -1608,7 +1609,7 @@ VkImageView TextureCache::GetStorageTextureSampledView(GraphicContext*          
 		     info.view_levels, image != nullptr ? image->mip_levels : 0, info.base_array);
 	}
 	const auto view_format = TextureGetFormat(info.format, TextureFormatUsage::Sampled);
-	if (view_format != image->format && !IsRgba8SrgbReinterpretation(image->format, view_format)) {
+	if (!IsCompatibleStorageSampledViewFormat(image->format, view_format)) {
 		EXIT("TextureCache: incompatible sampled view of storage texture, image_format=%d"
 		     " view_format=%d swizzle=0x%03x\n",
 		     static_cast<int>(image->format), static_cast<int>(view_format), info.swizzle);

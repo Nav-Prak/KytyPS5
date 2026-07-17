@@ -29,7 +29,7 @@ Status on 2026-07-17:
   install the backing view. Fixed direct maps now consult the authoritative range metadata and
   recover with an ordinary fixed file-view map in that case. A visible retest passed the former
   assertion and reached 10% of Story Mode loading.
-- The next blocker was a write-only `R32_UINT` storage image using `image_store_mip` with a
+- The next blocker was a write-only `R8G8B8A8_UINT` storage image using `image_store_mip` with a
   descriptor that exposes only mip level zero. Kyty now collapses this safe single-level case to
   the bound Vulkan storage view, while retaining strict rejection for genuine multi-mip storage
   and read/write non-identity swizzles. The following resource used the same contract with a
@@ -57,10 +57,10 @@ Four deterministic compatibility blockers were fixed generically during the firs
    and installs the direct-memory file view with the correct fixed-map path. Focused regressions
    cover both partial direct-view replacement and recovery from stale placeholder tracking.
 5. `image_store_mip` can be emitted for a storage descriptor that exposes only level zero. Kyty now
-   accepts that single-level case, including the console's write-only single-channel BGRA selector,
+   accepts that single-level case, including the console's write-only integer BGRA selector,
    without pretending to support per-mip storage views.
 6. One-level Standard4KB storage images now use the existing PS5 detiler on upload and a matching
-   inverse tiler on GPU-to-guest readback. A deterministic `R32_UINT` round trip covers the exact
+   inverse tiler on GPU-to-guest readback. A deterministic `R8G8B8A8_UINT` round trip covers the exact
    layout class used during Story Mode loading.
 
 Focused virtual-memory, image-alias, shared-tracker-page, and depth-preset regressions cover these

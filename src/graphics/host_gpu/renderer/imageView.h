@@ -23,7 +23,8 @@ namespace Libs::Graphics {
 	       // even when the selected uint/float format exposes only one channel. Descriptor
 	       // validation rejects this non-identity mapping for resources that are also read.
 	       (single_channel && swizzle == DstSel(6, 5, 4, 7)) ||
-	       (format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UNorm) &&
+	       ((format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UNorm) ||
+	         format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UInt)) &&
 	        (swizzle == DstSel(4, 5, 6, 1) || swizzle == DstSel(6, 5, 4, 7))) ||
 	       (format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32_32_32_32Float) &&
 	        swizzle == DstSel(5, 6, 7, 4));
@@ -141,7 +142,7 @@ IsSupportedSampledDepthResource(const ShaderRecompiler::IR::ImageResource& resou
 	    swizzle == DstSel(4, 5, 6, 7) ||
 	    (single_channel && (swizzle == DstSel(4, 0, 0, 0) || swizzle == DstSel(4, 0, 0, 1))) ||
 	    (single_channel && swizzle == DstSel(6, 5, 4, 7)) ||
-	    (view_format == VK_FORMAT_R8G8B8A8_UNORM &&
+	    ((view_format == VK_FORMAT_R8G8B8A8_UNORM || view_format == VK_FORMAT_R8G8B8A8_UINT) &&
 	     (swizzle == DstSel(4, 5, 6, 1) || swizzle == DstSel(6, 5, 4, 7))) ||
 	    (view_format == VK_FORMAT_R32G32B32A32_SFLOAT && swizzle == DstSel(5, 6, 7, 4));
 	if ((image_format != view_format &&

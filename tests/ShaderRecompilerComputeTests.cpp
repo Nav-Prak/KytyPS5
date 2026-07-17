@@ -9197,6 +9197,11 @@ void CheckSampledColorViews() {
                              DstSel(6, 5, 4, 7)) == VulkanImage::VIEW_STORAGE,
       "RGBA8 BGRA storage did not select the identity storage view");
   Require(
+      "SampledColorViews", "storage uint BGRA write mapping",
+      SelectStorageColorView(VK_FORMAT_R8G8B8A8_UINT, VK_FORMAT_R8G8B8A8_UINT,
+                             DstSel(6, 5, 4, 7)) == VulkanImage::VIEW_STORAGE,
+      "RGBA8_UINT BGRA storage did not select the identity storage view");
+  Require(
       "SampledColorViews", "mutable BGRA sRGB storage view",
       SelectStorageColorView(VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM,
                              DstSel(6, 5, 4, 7)) == VulkanImage::VIEW_STORAGE,
@@ -9519,7 +9524,7 @@ ShaderTextureResource BasicDynamicMipUintStorageTextureDescriptor() {
   auto descriptor = BasicLinearStorageTextureDescriptor();
   descriptor.fields[1] =
       (descriptor.fields[1] & ~(0x1ff00000u | 0xc0000000u)) |
-      (Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) << 20u) | (3u << 30u);
+      (Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UInt) << 20u) | (3u << 30u);
   descriptor.fields[2] = 15u | (63u << 14u);
   descriptor.fields[3] =
       (descriptor.fields[3] & ~((0x1fu << 20u) | 0xfffu)) |
@@ -9622,7 +9627,8 @@ void CheckBasicStorageTextureDescriptor() {
   Require("BasicStorageTexture", "dynamic-mip uint descriptor",
           dynamic_mip.Width5() + 1u == 64 && dynamic_mip.Height5() + 1u == 64 &&
               dynamic_mip.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) &&
-              dynamic_mip.Format() == Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) &&
+              dynamic_mip.Format() ==
+                  Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UInt) &&
               dynamic_mip.TileMode() ==
                   Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB) &&
               dynamic_mip.DstSelXYZW() == DstSel(6, 5, 4, 7) &&
@@ -9882,7 +9888,7 @@ void CheckStorageTextureLinearReadbackLayout() {
 void CheckStorageTextureStandard4KBReadbackLayout() {
   ImageInfo info{};
   info.address = 0x200000;
-  info.format = Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt);
+  info.format = Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UInt);
   info.width = 64;
   info.height = 64;
   info.pitch = TileGetTexturePitch(info.format, info.width, 1,
@@ -9911,7 +9917,7 @@ void CheckStorageTextureStandard4KBReadbackLayout() {
       info.size, info.size);
   Require("StorageTextureStandard4KBReadback", "round trip",
           info.pitch == 64 && info.size == 0x4000 && roundtrip == linear,
-          "R32_UINT Standard4KB storage readback did not preserve guest layout");
+          "RGBA8_UINT Standard4KB storage readback did not preserve guest layout");
   std::printf("[host]    %-32s ok\n", "StorageTextureStandard4KBReadback");
 }
 

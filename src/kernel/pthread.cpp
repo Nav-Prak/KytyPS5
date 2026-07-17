@@ -323,7 +323,7 @@ struct PthreadMutexattrPrivate {
 
 struct PthreadAttrPrivate {
 	uint8_t        reserved[64];
-	KernelCpumask  affinity;
+	std::atomic<KernelCpumask> affinity;
 	size_t         guard_size;
 	void*          stack_addr;
 	size_t         stack_size;
@@ -357,7 +357,7 @@ struct PthreadPrivate {
 	std::atomic_bool      detached;
 	std::atomic_bool      almost_done;
 	std::atomic_bool      free;
-	uint64_t              host_thread_id;
+	std::atomic<uint64_t> host_thread_id {0};
 	uintptr_t             guest_host_rbx;
 	uintptr_t             guest_host_rsp;
 	uintptr_t             guest_host_rbp;
@@ -795,6 +795,9 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	}
 
 	// The guest ABI expects the entry argument in rdi and a 16-byte aligned stack before call.
+	// r12-r15 are used as scratch registers before all input operands are consumed. Declare them
+	// as clobbers even though the assembly restores their original values, or the compiler may
+	// allocate guest_rsp/guest_rbp to a register that is overwritten before it is read.
 	asm volatile("pushq %%r12\n\t"
 	             "pushq %%r13\n\t"
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -823,9 +826,9 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	             "popq %%r12\n\t"
 	             : "=a"(ret), "+D"(arg), "+S"(func)
 	             : [guest_rsp] "r"(guest_rsp), [guest_rbp] "r"(guest_rbp)
-	             : "cc", "memory", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2",
-	               "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
-	               "xmm12", "xmm13", "xmm14", "xmm15");
+	             : "cc", "memory", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "r13", "r14",
+	               "r15", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8",
+	               "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
 
 	g_guest_entry_return_rsp = 0;
 	if (g_pthread_self != nullptr) {
@@ -862,6 +865,48 @@ static void UpdateCurrentThreadStackAttr(PthreadAttr* attr) {
 	}
 #endif
 }
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+static bool ApplyHostThreadAffinity(uint64_t host_thread_id, KernelCpumask guest_mask) {
+	if (host_thread_id == 0 || guest_mask == 0) {
+		return false;
+	}
+
+	const auto active_processors = GetActiveProcessorCount(0);
+	if (active_processors == 0) {
+		return false;
+	}
+
+	constexpr auto mask_bits = static_cast<DWORD>(sizeof(DWORD_PTR) * 8);
+	const auto     bits      = std::min(active_processors, mask_bits);
+	const auto available_mask =
+	    (bits == mask_bits ? ~DWORD_PTR {0} : (DWORD_PTR {1} << bits) - DWORD_PTR {1});
+	const auto host_mask = static_cast<DWORD_PTR>(guest_mask) & available_mask;
+	if (host_mask == 0) {
+		return false;
+	}
+
+	HANDLE thread_handle = nullptr;
+	bool   close_handle  = false;
+	if (host_thread_id == static_cast<uint64_t>(GetCurrentThreadId())) {
+		thread_handle = GetCurrentThread();
+	} else {
+		thread_handle = OpenThread(THREAD_SET_INFORMATION, FALSE,
+		                           static_cast<DWORD>(host_thread_id));
+		close_handle = (thread_handle != nullptr);
+	}
+
+	if (thread_handle == nullptr) {
+		return false;
+	}
+
+	const bool applied = SetThreadAffinityMask(thread_handle, host_mask) != 0;
+	if (close_handle) {
+		CloseHandle(thread_handle);
+	}
+	return applied;
+}
+#endif
 
 static void FreeDetachedThreads(void* /*arg*/) {
 	PRINT_NAME_ENABLE(false);
@@ -901,7 +946,7 @@ void PthreadInitSelfForMainThread() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	os_thread_id = static_cast<uint64_t>(GetCurrentThreadId());
 #endif
-	g_pthread_self->host_thread_id = os_thread_id;
+	g_pthread_self->host_thread_id.store(os_thread_id, std::memory_order_release);
 	g_pthread_main                 = g_pthread_self;
 
 	LOGF("\tPthread main self: id = %d, os_thread_id = %" PRIu64 ", stack_addr = 0x%016" PRIx64
@@ -1880,7 +1925,7 @@ int KYTY_SYSV_ABI PthreadAttrGetaffinity(const PthreadAttr* attr, KernelCpumask*
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	*mask = (*attr)->affinity;
+	*mask = (*attr)->affinity.load(std::memory_order_acquire);
 
 	return OK;
 }
@@ -2042,7 +2087,7 @@ int KYTY_SYSV_ABI PthreadAttrSetaffinity(PthreadAttr* attr, KernelCpumask mask) 
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	attr_value->affinity = mask;
+	attr_value->affinity.store(mask, std::memory_order_release);
 
 	return OK;
 }
@@ -3080,7 +3125,7 @@ int PthreadGetUniqueId(Pthread thread) {
 }
 
 uint64_t PthreadGetHostThreadId(Pthread thread) {
-	return thread != nullptr ? thread->host_thread_id : 0;
+	return thread != nullptr ? thread->host_thread_id.load(std::memory_order_acquire) : 0;
 }
 
 void PthreadQueuePendingSignal(Pthread thread, int signum) {
@@ -3181,7 +3226,11 @@ static void* RunThread(void* arg) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	os_thread_id = static_cast<uint64_t>(GetCurrentThreadId());
 #endif
-	thread->host_thread_id = os_thread_id;
+	thread->host_thread_id.store(os_thread_id, std::memory_order_release);
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	ApplyHostThreadAffinity(os_thread_id, thread->attr->affinity.load(std::memory_order_acquire));
+#endif
 
 	LOGF("\tPthread run begin: %s, id = %d, os_thread_id = %" PRIu64 ", entry = 0x%016" PRIx64
 	     ", arg = 0x%016" PRIx64 ", stack_addr = 0x%016" PRIx64 ", stack_size = %" PRIu64 "\n",
@@ -3252,6 +3301,7 @@ int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
 		created_thread->almost_done     = false;
 		created_thread->detached        = created_thread->attr->detached;
 		created_thread->unique_id       = -1;
+		created_thread->host_thread_id.store(0, std::memory_order_release);
 
 		result =
 		    pthread_create(&created_thread->p, &created_thread->attr->p, RunThread, created_thread);
@@ -3355,6 +3405,12 @@ int KYTY_SYSV_ABI PthreadSetaffinity(Pthread thread, KernelCpumask mask) {
 	}
 
 	auto result = PthreadAttrSetaffinity(&thread->attr, mask);
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (result == OK) {
+		ApplyHostThreadAffinity(thread->host_thread_id.load(std::memory_order_acquire), mask);
+	}
+#endif
 
 	return result;
 }

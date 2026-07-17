@@ -19,6 +19,10 @@ namespace Libs::Graphics {
 	    format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float);
 	return swizzle == DstSel(4, 5, 6, 7) ||
 	       (single_channel && (swizzle == DstSel(4, 0, 0, 0) || swizzle == DstSel(4, 0, 0, 1))) ||
+	       // Write-only storage descriptors can retain the surface's conventional BGRA selector
+	       // even when the selected uint/float format exposes only one channel. Descriptor
+	       // validation rejects this non-identity mapping for resources that are also read.
+	       (single_channel && swizzle == DstSel(6, 5, 4, 7)) ||
 	       (format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UNorm) &&
 	        (swizzle == DstSel(4, 5, 6, 1) || swizzle == DstSel(6, 5, 4, 7))) ||
 	       (format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32_32_32_32Float) &&
@@ -136,6 +140,7 @@ IsSupportedSampledDepthResource(const ShaderRecompiler::IR::ImageResource& resou
 	const bool swizzle_ok =
 	    swizzle == DstSel(4, 5, 6, 7) ||
 	    (single_channel && (swizzle == DstSel(4, 0, 0, 0) || swizzle == DstSel(4, 0, 0, 1))) ||
+	    (single_channel && swizzle == DstSel(6, 5, 4, 7)) ||
 	    (view_format == VK_FORMAT_R8G8B8A8_UNORM &&
 	     (swizzle == DstSel(4, 5, 6, 1) || swizzle == DstSel(6, 5, 4, 7))) ||
 	    (view_format == VK_FORMAT_R32G32B32A32_SFLOAT && swizzle == DstSel(5, 6, 7, 4));
@@ -154,8 +159,9 @@ IsSupportedStorageImageResource(const ShaderRecompiler::IR::ImageResource& resou
 	       (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray) &&
-	       resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None && resource.written &&
-	       !resource.atomic && !resource.depth_compare;
+	       (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None ||
+	        resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage) &&
+	       resource.written && !resource.atomic && !resource.depth_compare;
 }
 
 inline void

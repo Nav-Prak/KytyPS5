@@ -387,9 +387,17 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	const bool supported_swizzle =
 	    IsSupportedStorageSwizzle(descriptor.Format(), descriptor.DstSelXYZW()) &&
 	    (descriptor.DstSelXYZW() == DstSel(4, 5, 6, 7) || !resource.read);
+	// OpImageWrite has no Lod operand. A guest image_store_mip is therefore safe to lower to the
+	// bound view only when that descriptor exposes the sole level zero; genuine multi-mip storage
+	// still fails the descriptor checks below.
+	const bool supported_mip =
+	    resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None ||
+	    (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage &&
+	     descriptor.BaseLevel() == 0 && descriptor.LastLevel() == 0 && descriptor.MaxMip() == 0);
 	return (is_2d || is_2d_array || is_3d) && supported_tile && descriptor.BaseLevel() == 0 &&
 	       descriptor.LastLevel() == 0 && descriptor.MaxMip() == 0 && descriptor.MinLod() == 0 &&
-	       descriptor.BaseArray5() == 0 && supported_swizzle && descriptor.BCSwizzle() == 0 &&
+	       descriptor.BaseArray5() == 0 && supported_swizzle && supported_mip &&
+	       descriptor.BCSwizzle() == 0 &&
 	       !descriptor.MsaaDepth();
 }
 
@@ -422,12 +430,17 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	}
 	EXIT("unsupported storage texture: resource=%d descriptor=%d encoding=%d format=%d "
 	     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
-	     " extent=%ux%ux%u type=%u format=%u tile=%u swizzle=0x%03x read=%d written=%d\n",
+	     " extent=%ux%ux%u type=%u format=%u tile=%u swizzle=0x%03x"
+	     " kind=%u dimension=%u mip_mode=%u base_level=%u last_level=%u max_mip=%u min_lod=%u"
+	     " read=%d written=%d atomic=%d\n",
 	     resource_ok, descriptor_ok, encoding_ok, format_ok, descriptor.Base40(), size,
 	     static_cast<uint32_t>(descriptor.Width5()) + 1u,
 	     static_cast<uint32_t>(descriptor.Height5()) + 1u,
 	     static_cast<uint32_t>(descriptor.Depth()) + 1u, descriptor.Type(), format,
-	     descriptor.TileMode(), descriptor.DstSelXYZW(), resource.read, resource.written);
+	     descriptor.TileMode(), descriptor.DstSelXYZW(), static_cast<uint32_t>(resource.kind),
+	     static_cast<uint32_t>(resource.dimension), static_cast<uint32_t>(resource.mip_mode),
+	     descriptor.BaseLevel(), descriptor.LastLevel(), descriptor.MaxMip(), descriptor.MinLod(),
+	     resource.read, resource.written, resource.atomic);
 }
 
 void ValidateMetadataReuseTexture(const ShaderRecompiler::IR::ImageResource& resource,
@@ -453,7 +466,7 @@ NativeTexture(uint64_t submit_id, CommandBuffer* command_buffer,
 	const bool storage    = resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImage ||
 	                        resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint;
 	const auto variant    = NativeTextureVariant(resource);
-	if (storage) {
+	if (storage && descriptor.IsNull()) {
 		ValidateStorageImageResource(resource);
 	}
 	if (descriptor.IsNull()) {

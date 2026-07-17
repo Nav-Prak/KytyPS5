@@ -9070,8 +9070,6 @@ void CheckReverseRenderTargetFormatContract() {
       resource.atomic = true;
     } else if (std::strcmp(kind, "storage-compare") == 0) {
       resource.depth_compare = true;
-    } else if (std::strcmp(kind, "storage-mip") == 0) {
-      resource.mip_mode = ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
     } else if (std::strcmp(kind, "storage-dimension") == 0) {
       resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Unknown;
     } else {
@@ -9213,6 +9211,11 @@ void CheckSampledColorViews() {
                                  DstSel(4, 0, 0, 1)) ==
               VulkanImage::VIEW_STORAGE,
           "R32_UINT R001 storage did not select the identity storage view");
+  Require("SampledColorViews", "storage R32 uint BGRA write mapping",
+          SelectStorageColorView(VK_FORMAT_R32_UINT, VK_FORMAT_R32_UINT,
+                                 DstSel(6, 5, 4, 7)) ==
+              VulkanImage::VIEW_STORAGE,
+          "R32_UINT BGRA storage did not select the identity storage view");
   Require("SampledColorViews", "storage R16 uint R000 write mapping",
           SelectStorageColorView(VK_FORMAT_R16_UINT, VK_FORMAT_R16_UINT,
                                  DstSel(4, 0, 0, 0)) == VulkanImage::VIEW_STORAGE,
@@ -9250,6 +9253,11 @@ void CheckSampledColorViews() {
   Require("SampledColorViews", "write-only uint 2D-array storage resource",
           IsSupportedStorageImageResource(storage_resource),
           "basic write-only uint 2D-array storage resource was rejected");
+  storage_resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  storage_resource.mip_mode = ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
+  Require("SampledColorViews", "dynamic-mip storage resource",
+          IsSupportedStorageImageResource(storage_resource),
+          "dynamic-mip storage resource was rejected before descriptor validation");
 
   char path[MAX_PATH]{};
   Require("SampledColorViews", "host",
@@ -9262,7 +9270,7 @@ void CheckSampledColorViews() {
         "sampled-rgb10-reverse", "sampled-abgr-format", "sampled-depth-format",
         "sampled-depth-swizzle", "storage", "storage-format",
         "storage-compatible-swizzle", "storage-abgr", "storage-kind", "storage-no-write",
-        "storage-atomic", "storage-compare", "storage-mip",
+        "storage-atomic", "storage-compare",
         "storage-dimension"}) {
     std::string command =
         std::string("\"") + path + "\" --image-view-death " + kind;
@@ -9500,6 +9508,22 @@ ShaderTextureResource BasicUintVolumeStorageTextureDescriptor() {
            0x0000000fu, 0x00700000u, 0x00000000u, 0x00000000u}};
 }
 
+ShaderRecompiler::IR::ImageResource BasicDynamicMipUintStorageTextureResource() {
+  auto resource = BasicLinearStorageTextureResource();
+  resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+  resource.mip_mode = ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
+  return resource;
+}
+
+ShaderTextureResource BasicDynamicMipUintStorageTextureDescriptor() {
+  auto descriptor = BasicLinearStorageTextureDescriptor();
+  descriptor.fields[1] =
+      (descriptor.fields[1] & ~0x1ff00000u) |
+      (Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) << 20u);
+  descriptor.fields[3] = (descriptor.fields[3] & ~0xfffu) | DstSel(6, 5, 4, 7);
+  return descriptor;
+}
+
 [[noreturn]] void RunStorageTextureDescriptorDeathCase(const char *kind) {
   auto resource = BasicStorageTextureResource();
   auto descriptor = BasicStorageTextureDescriptor();
@@ -9541,6 +9565,14 @@ ShaderTextureResource BasicUintVolumeStorageTextureDescriptor() {
         (Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB) << 20u);
   } else if (std::strcmp(kind, "mip") == 0) {
     descriptor.fields[3] |= 1u << 16u;
+  } else if (std::strcmp(kind, "dynamic-mip-levels") == 0) {
+    resource = BasicDynamicMipUintStorageTextureResource();
+    descriptor = BasicDynamicMipUintStorageTextureDescriptor();
+    descriptor.fields[3] |= 1u << 16u;
+  } else if (std::strcmp(kind, "dynamic-mip-read") == 0) {
+    resource = BasicDynamicMipUintStorageTextureResource();
+    descriptor = BasicDynamicMipUintStorageTextureDescriptor();
+    resource.read = true;
   } else if (std::strcmp(kind, "swizzle") == 0) {
     descriptor.fields[3] =
         (descriptor.fields[3] & ~0xfffu) | DstSel(4, 5, 6, 1);
@@ -9581,6 +9613,17 @@ void CheckBasicStorageTextureDescriptor() {
               descriptor.Height5() + 1u == 33 && descriptor.Depth() + 1u == 33,
           "basic 3D storage descriptor fixture is malformed");
   ValidateStorageTexture(BasicStorageTextureResource(), descriptor, 0x10000);
+
+  const auto dynamic_mip = BasicDynamicMipUintStorageTextureDescriptor();
+  Require("BasicStorageTexture", "dynamic-mip uint descriptor",
+          dynamic_mip.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) &&
+              dynamic_mip.Format() == Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) &&
+              dynamic_mip.TileMode() == Prospero::GpuEnumValue(Prospero::TileMode::kLinear) &&
+              dynamic_mip.DstSelXYZW() == DstSel(6, 5, 4, 7) &&
+              dynamic_mip.BaseLevel() == 0 && dynamic_mip.LastLevel() == 0 &&
+              dynamic_mip.MaxMip() == 0,
+          "single-level dynamic-mip uint storage descriptor fixture is malformed");
+  ValidateStorageTexture(BasicDynamicMipUintStorageTextureResource(), dynamic_mip, 0x10000);
 
   const auto linear = BasicLinearStorageTextureDescriptor();
   Require("BasicStorageTexture", "linear descriptor",
@@ -9702,7 +9745,8 @@ void CheckBasicStorageTextureDescriptor() {
   Require("BasicStorageTexture", "host",
           GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
           "GetModuleFileName failed");
-  for (const char *kind : {"resource", "type", "tile", "mip", "swizzle",
+  for (const char *kind : {"resource", "type", "tile", "mip", "dynamic-mip-levels",
+                           "dynamic-mip-read", "swizzle",
                            "linear-rgb1-read", "bgra-read", "r16-float-read", "r8-unorm-read",
                            "yzwx-read", "yzwx-format",
                            "array-base-view", "reserved", "metadata", "uint-format",

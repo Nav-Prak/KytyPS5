@@ -24,10 +24,15 @@ Status on 2026-07-17:
 - Some front-end glyphs are missing or fragmented even though surrounding text and artwork render
   correctly. This remains a separate graphics correctness issue.
 - Selecting Story Mode reached a deliberate guest fatal assertion after `sceKernelBatchMap`
-  returned `KERNEL_ERROR_ENOMEM` for a null-address direct-memory entry. The batch mapper now treats
-  a null address as an allocation request while preserving fixed placement for explicit addresses.
-  Two automated replays survived past the former assertion, but the automated environment could
-  not expose the SDL window; reaching player control still requires a visible M5 retest.
+  returned `KERNEL_ERROR_ENOMEM` for a fixed direct-memory map. The range was an ordinary Windows
+  reservation that overlapped stale placeholder bookkeeping, so `MEM_REPLACE_PLACEHOLDER` could not
+  install the backing view. Fixed direct maps now consult the authoritative range metadata and
+  recover with an ordinary fixed file-view map in that case. A visible retest passed the former
+  assertion and reached 10% of Story Mode loading.
+- The next blocker was a write-only `R32_UINT` storage image using `image_store_mip` with a
+  descriptor that exposes only mip level zero. Kyty now collapses this safe single-level case to
+  the bound Vulkan storage view, while retaining strict rejection for genuine multi-mip storage
+  and read/write non-identity swizzles. A visible M5 retest is pending.
 - `VideoRecordingP_v1` is still an unresolved called stub. It has not yet been shown to block the
   offline startup path.
 - The host used for this run did not expose an SDL/WASAPI audio endpoint. Kyty continued with its
@@ -45,9 +50,13 @@ Four deterministic compatibility blockers were fixed generically during the firs
    `DECOMPRESS_ON_N_ZPLANES=5`. Kyty maps that exact control preset to its existing
    `SW_64KB_Z_X` depth representation while retaining strict rejection for other unsupported depth
    layouts.
-4. `sceKernelBatchMap` supplies fixed semantics for a batch that can contain null-address map
-   entries. Null direct and flexible map addresses now allow kernel-selected placement; non-null
-   addresses remain fixed. A focused direct-memory batch-map regression covers the distinction.
+4. A fixed `sceKernelBatchMap` replacement can target an ordinary Windows reservation that overlaps
+   stale placeholder bookkeeping. Kyty now distinguishes the reservation from a real placeholder
+   and installs the direct-memory file view with the correct fixed-map path. Focused regressions
+   cover both partial direct-view replacement and recovery from stale placeholder tracking.
+5. `image_store_mip` can be emitted for a storage descriptor that exposes only level zero. Kyty now
+   accepts that single-level case, including the console's write-only single-channel BGRA selector,
+   without pretending to support per-mip storage views.
 
 Focused virtual-memory, image-alias, shared-tracker-page, and depth-preset regressions cover these
 changes. Raw logs and local paths remain outside the repository.

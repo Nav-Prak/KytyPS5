@@ -43,8 +43,12 @@ Status on 2026-07-17:
   cleared the blocker, entered the prologue, and rendered the "Ludendorff, nine years ago" title.
 - The prologue then submitted the two-dword `IT_REWIND` packet emitted by `GraphicsDcbRewind`.
   Kyty now validates its length and sole `INITIAL_STATE` payload bit and consumes it as a marker;
-  the bounded host command-buffer parser has no persistent hardware ring read pointer to rewind.
-  A visible retest of this new path is pending.
+  the bounded host command-buffer parser has no persistent hardware ring read pointer to rewind. A
+  visible retest cleared the crash and reached the in-game title frame.
+- The title frame then remained static while audio advanced and the guest repeatedly called two
+  unresolved `Agc_v1` imports. Unresolved-import diagnostics now preserve the guest ABI while
+  reporting the caller, module-relative offset, and first four integer arguments. A diagnostic
+  rerun is pending before assigning semantics to either function.
 - `VideoRecordingP_v1` is still an unresolved called stub. It has not yet been shown to block the
   offline startup path.
 - The host used for this run did not expose an SDL/WASAPI audio endpoint. Kyty continued with its

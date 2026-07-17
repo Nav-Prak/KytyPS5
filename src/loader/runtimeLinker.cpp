@@ -108,6 +108,7 @@ struct StubbedImportRecord {
 	uint32_t    index       = 0;
 	uint64_t    patch_vaddr = 0;
 	uint64_t    thunk_vaddr = 0;
+	uint64_t    base_vaddr  = 0;
 	std::string name;
 	SymbolType  type = SymbolType::Unknown;
 	BindType    bind = BindType::Unknown;
@@ -125,11 +126,13 @@ static std::atomic_uint32_t             g_unresolved_stub_call_log_count {0};
 static std::vector<uint64_t>            g_unresolved_stub_thunk_pages;
 static uint64_t                         g_unresolved_stub_thunk_offset = 0;
 
-static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id);
+static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id, uint64_t return_address,
+                                                      uint64_t arg0, uint64_t arg1, uint64_t arg2,
+                                                      uint64_t arg3);
 
 static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
 	constexpr uint64_t page_size  = 4096;
-	constexpr uint64_t thunk_size = 162;
+	constexpr uint64_t thunk_size = 202;
 
 	if (g_unresolved_stub_thunk_pages.empty() ||
 	    g_unresolved_stub_thunk_offset + thunk_size > page_size) {
@@ -199,6 +202,21 @@ static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
 	for (uint8_t reg = 0; reg < 8; reg++) {
 		save_xmm(reg, static_cast<uint8_t>(reg * 0x10u));
 	}
+	// Forward the guest return address and first four integer arguments to the diagnostic resolver.
+	// The thunk must preserve those arguments in case the import becomes available through a late
+	// module load and execution jumps to the real function.
+	const auto load_stack_arg = [&](uint8_t rex, uint8_t modrm, uint32_t offset) {
+		emit(rex);
+		emit(0x8b);
+		emit(modrm);
+		emit(0x24);
+		emit32(offset);
+	};
+	load_stack_arg(0x48, 0xb4, 0xb8); // mov rsi, [rsp + 0xb8]: guest return address
+	load_stack_arg(0x48, 0x94, 0xa8); // mov rdx, [rsp + 0xa8]: guest rdi
+	load_stack_arg(0x48, 0x8c, 0xa0); // mov rcx, [rsp + 0xa0]: guest rsi
+	load_stack_arg(0x4c, 0x84, 0x98); // mov r8,  [rsp + 0x98]: guest rdx
+	load_stack_arg(0x4c, 0x8c, 0x90); // mov r9,  [rsp + 0x90]: guest rcx
 	emit(0x48);
 	emit(0xbf);
 	emit64(record_id); // mov rdi, record_id
@@ -250,11 +268,12 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 
 	for (auto& record: g_stubbed_imports) {
 		if (record.patch_vaddr == ri.vaddr) {
-			record.index   = index;
-			record.name    = ri.name;
-			record.type    = ri.type;
-			record.bind    = ri.bind;
-			record.program = program_name;
+			record.index      = index;
+			record.base_vaddr = ri.base_vaddr;
+			record.name       = ri.name;
+			record.type       = ri.type;
+			record.bind       = ri.bind;
+			record.program    = program_name;
 			return record.thunk_vaddr;
 		}
 	}
@@ -262,6 +281,7 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 	StubbedImportRecord record {};
 	record.index       = index;
 	record.patch_vaddr = ri.vaddr;
+	record.base_vaddr  = ri.base_vaddr;
 	record.name        = ri.name;
 	record.type        = ri.type;
 	record.bind        = ri.bind;
@@ -273,7 +293,9 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 	return thunk;
 }
 
-static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id) {
+static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id, uint64_t return_address,
+                                                      uint64_t arg0, uint64_t arg1, uint64_t arg2,
+                                                      uint64_t arg3) {
 	if (record_id < g_stubbed_imports.size()) {
 		auto& record = g_stubbed_imports[record_id];
 		auto  nid    = record.name;
@@ -302,7 +324,13 @@ static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id) {
 	if (log_index < 1024) {
 		if (record_id < g_stubbed_imports.size()) {
 			const auto& record = g_stubbed_imports[record_id];
-			printf("Unresolved import stub called: %s\n", record.name.c_str());
+			const auto caller_offset =
+			    return_address >= record.base_vaddr ? return_address - record.base_vaddr : 0;
+			printf("Unresolved import stub called: %s caller=0x%016" PRIx64
+			       "+0x%08" PRIx64 " args=%016" PRIx64 "/%016" PRIx64 "/%016" PRIx64
+			       "/%016" PRIx64 " program=%s\n",
+			       record.name.c_str(), return_address, caller_offset, arg0, arg1, arg2, arg3,
+			       record.program.c_str());
 			LOGF("Unresolved import stub called [%u]: patch_vaddr=0x%016" PRIx64
 			     " jmprela_index=%" PRIu32 " symbol=%s type=%s bind=%s program=%s\n",
 			     log_index, record.patch_vaddr, record.index, record.name.c_str(),

@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/SpirvEmitter.h"
 
+#include "common/emulatorConfig.h"
 #include "graphics/shader/recompiler/SrtWalker.h"
 #include "graphics/shader/recompiler/spirvEmitter/spirvEmitterInternal.h"
 
@@ -439,13 +440,15 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 	}
 
 	EmitterState state;
-	state.program              = &program;
-	state.resources            = &resources;
-	state.vertex_input_info    = vertex_input_info;
-	state.pixel_input_info     = pixel_input_info;
-	state.compute_input_info   = compute_input_info;
-	state.stage                = program.stage;
-	state.wave_size            = program.wave_size;
+	state.program            = &program;
+	state.resources          = &resources;
+	state.vertex_input_info  = vertex_input_info;
+	state.pixel_input_info   = pixel_input_info;
+	state.compute_input_info = compute_input_info;
+	state.stage              = program.stage;
+	state.wave_size          = program.wave_size;
+	state.debug_printf_enabled =
+	    program.stage == ShaderType::Vertex && Config::SpirvDebugPrintfEnabled();
 	state.per_invocation_masks = program.lane_mask_mode == ShaderLaneMaskMode::PerInvocation;
 	state.exact_subgroup_operations =
 	    !state.per_invocation_masks && ProgramRequiresExactSubgroupSize(program);

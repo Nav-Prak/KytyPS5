@@ -59,6 +59,31 @@ bool ExportWritesData(const IR::Instruction& inst) {
 	}
 }
 
+void EmitVertexPositionDebugPrintf(EmitterState* state, uint32_t value) {
+	if (!state->debug_printf_enabled || state->debug_printf_import == 0 ||
+	    state->debug_printf_position_format == 0) {
+		return;
+	}
+	const auto input =
+	    std::find_if(state->inputs.begin(), state->inputs.end(),
+	                 [](const auto& item) { return item.kind == IR::StageInputKind::VertexIndex; });
+	if (input == state->inputs.end() || input->variable_id == 0) {
+		return;
+	}
+	const auto vertex_index = state->builder.AllocateId();
+	state->builder.AddFunction({OpLoad, state->int_type, vertex_index, input->variable_id});
+	uint32_t components[4] = {};
+	for (uint32_t i = 0; i < 4; i++) {
+		components[i] = state->builder.AllocateId();
+		state->builder.AddFunction(
+		    {OpCompositeExtract, state->float_type, components[i], value, i});
+	}
+	const auto result = state->builder.AllocateId();
+	state->builder.AddFunction({OpExtInst, state->void_type, result, state->debug_printf_import, 1,
+	                            state->debug_printf_position_format, vertex_index, components[0],
+	                            components[1], components[2], components[3]});
+}
+
 void EmitMrtZExport(EmitterState* state, const IR::Instruction& inst) {
 	if ((inst.export_info.en & 0x1u) != 0 && state->depth_variable != 0) {
 		state->builder.AddFunction(
@@ -99,6 +124,7 @@ void EmitExport(EmitterState* state, const IR::Instruction& inst) {
 
 	const auto value = EmitExportVec4F32(state, inst);
 	if (inst.export_info.kind == IR::ExportTargetKind::Position) {
+		EmitVertexPositionDebugPrintf(state, value);
 		const auto pointer = state->builder.AllocateId();
 		state->builder.AddFunction({OpAccessChain, state->ptr_output_vec4_float, pointer, variable,
 		                            ConstantU32(state, 0)});

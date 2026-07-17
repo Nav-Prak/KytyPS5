@@ -78,11 +78,6 @@ void EmitMoveRelDestU32(EmitterState* state, const IR::Instruction& inst) {
 }
 
 void EmitMoveU64(EmitterState* state, const IR::Instruction& inst) {
-	if (state->per_invocation_masks && inst.dst.kind == IR::OperandKind::Register &&
-	    IsMaskRegisterFile(inst.dst.reg.file)) {
-		EmitPerInvocationMask(state, inst.dst, EmitLaneMaskOperandActiveBool(state, inst.src[0]));
-		return;
-	}
 	const auto low  = EmitSequentialValueLoad(state, inst.src[0], 0);
 	const auto high = EmitSequentialValueLoad(state, inst.src[0], 1);
 	EmitStoreU32(state, inst.dst, low);

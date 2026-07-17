@@ -24,6 +24,7 @@ public:
 	                   const std::vector<uint32_t>& interfaces);
 	void AddExecutionMode(std::initializer_list<uint32_t> operands);
 	void AddName(uint32_t target, const char* name);
+	void AddString(uint32_t id, const char* value);
 	void AddAnnotation(std::initializer_list<uint32_t> words);
 	void AddType(std::initializer_list<uint32_t> words);
 	void AddFunction(std::initializer_list<uint32_t> words);

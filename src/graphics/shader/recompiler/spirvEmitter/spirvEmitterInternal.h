@@ -428,6 +428,9 @@ struct EmitterState {
 	bool                                   needs_image_gather_extended                   = false;
 	bool                                   needs_function_lds                            = false;
 	bool                                   needs_pixel_valid_mask                        = false;
+	bool                                   debug_printf_enabled                          = false;
+	uint32_t                               debug_printf_import                           = 0;
+	uint32_t                               debug_printf_position_format                  = 0;
 	std::vector<RegisterBinding>           registers;
 	std::vector<InputBinding>              inputs;
 	std::vector<OutputBinding>             outputs;
@@ -912,9 +915,11 @@ uint32_t AddressSourceCount(const IR::Instruction& inst, uint32_t first_src);
 
 bool IsFormattedBufferComponent(const IR::Instruction& inst);
 
-Prospero::BufferFormat FormattedBufferFormat(const EmitterState& state, const IR::Instruction& inst);
+Prospero::BufferFormat FormattedBufferFormat(const EmitterState&    state,
+                                             const IR::Instruction& inst);
 
-IR::Instruction WithFormatComponentByteOffset(const IR::Instruction& inst, Prospero::BufferFormat format);
+IR::Instruction WithFormatComponentByteOffset(const IR::Instruction& inst,
+                                              Prospero::BufferFormat format);
 
 uint32_t EmitTBufferBitcastF32ToU32(EmitterState* state, uint32_t value);
 
@@ -952,7 +957,7 @@ bool EmitTypedTBufferLoad(EmitterState* state, const IR::Instruction& inst,
 bool EmitFormattedBufferLoad(EmitterState* state, const IR::Instruction& inst);
 
 uint32_t FormattedBufferDwordStoreComponentCount(Prospero::BufferFormat format,
-                                                 uint32_t        opcode_components);
+                                                 uint32_t               opcode_components);
 
 bool EmitBufferIntegerFormatStore(EmitterState* state, const IR::Instruction& inst);
 

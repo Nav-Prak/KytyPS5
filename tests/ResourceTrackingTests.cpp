@@ -1047,6 +1047,27 @@ void TestResourceSpecializationIsTypedAndTransactional() {
   Check(binding != nullptr && binding->resources == std::vector<uint32_t>({0}) &&
             FindBinding(program.bindings, DescriptorBindingKind::Storage3D) == nullptr,
         "specialized image topology did not reach the exact native binding group");
+
+  Program row_program;
+  row_program.stage = ShaderType::Compute;
+  row_program.blocks.resize(1);
+  row_program.blocks[0].instructions = {
+      ImageUse(0x30, Opcode::ImageLoad, ResourceKind::Image,
+               Decoder::ImageDimension::Dim2D)};
+  Prepare(&row_program);
+  ResourceSnapshot row_snapshot;
+  row_snapshot.images.resize(1);
+  row_snapshot.images[0].dword_count = 8;
+  row_snapshot.images[0].dwords[0] = 0x1000;
+  row_snapshot.images[0].dwords[3] =
+      Prospero::GpuEnumValue(Prospero::ImageType::kColor1D) << 28u;
+  error.clear();
+  Check(SpecializeResources(&row_program, row_snapshot, &error) &&
+            row_program.info.images[0].dimension ==
+                Decoder::ImageDimension::Dim2D &&
+            row_program.blocks[0].instructions[0].memory.image_dimension ==
+                Decoder::ImageDimension::Dim2D,
+        "guest 1D descriptor was not normalized to the native 2D image binding");
 }
 
 void TestRuntimeSpecializationCoversBakedBufferAndAddressFields() {

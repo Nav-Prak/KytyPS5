@@ -3591,6 +3591,24 @@ TestCase Scalar64BitOps() {
            O::SCselectB64, O::VMovB32, O::BufferStoreDword, O::SEndpgm}};
 }
 
+TestCase ScalarMoveB64VccPreservesRawBits() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 8, 0x3f0ccccdu);
+  AppendSMovLiteral(&code, 9, 0x3f800000u);
+  code.push_back(EncodeSop1(0x04, 106, 8));
+  AppendStoreSgprPair(&code, 106, 0);
+  AppendEnd(&code);
+
+  return {"ScalarMoveB64VccPreservesRawBits",
+          code,
+          {},
+          {0x3f0ccccdu, 0x3f800000u},
+          {O::SMovB32, O::SMovB64, O::VMovB32, O::BufferStoreDword,
+           O::SEndpgm}};
+}
+
 TestCase ScalarAndn2B64SccBranch() {
   using O = ShaderOpcode;
 
@@ -7593,6 +7611,39 @@ TestCase ImageSampleAndGather() {
   return test;
 }
 
+TestCase ImageSampleBc7PreservesTransparentAlpha() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 20, 0x3f000000u);
+  AppendVMovLiteral(&code, 21, 0x3f000000u);
+  AppendVMovU32(&code, 22, 0);
+  code.push_back(EncodeMimg0(0x20, 0xf));
+  code.push_back(EncodeMimg1(0, 20));
+  for (u32 i = 0; i < 4u; i++) {
+    AppendStoreVgpr(&code, i, i);
+  }
+  AppendEnd(&code);
+
+  // One BC7 block containing sixteen white texels with zero alpha. Keeping RGB
+  // non-zero makes an accidental RGB/one alpha swizzle immediately visible.
+  std::vector<u32> image(16, 0);
+  image[0] = 0xfffc0030u;
+  image[1] = 0xaaafffffu;
+  image[2] = 0x924aaaaau;
+  image[3] = 0x24924924u;
+
+  TestCase test;
+  test.name = "ImageSampleBc7TransparentAlpha";
+  test.code = code;
+  test.expected = {0x3f800000u, 0x3f800000u, 0x3f800000u, 0x00000000u};
+  test.opcodes = {O::VMovB32, O::ImageSample, O::BufferStoreDword, O::SEndpgm};
+  test.sampled_image_rgba = image;
+  test.sampled_image_format = VK_FORMAT_BC7_UNORM_BLOCK;
+  test.sampled_image_dwords_per_pixel = 1;
+  return test;
+}
+
 TestCase ImageSampleA16SamplerCoordsOnGpu() {
   using O = ShaderOpcode;
 
@@ -8322,6 +8373,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarBrevB32PreservesScc);
   AddCase(BitfieldExtractWidthPastEndEdges);
   AddCase(Scalar64BitOps);
+  AddCase(ScalarMoveB64VccPreservesRawBits);
   AddCase(ScalarAndn2B64SccBranch);
   AddCase(ScalarLiteral);
   AddCase(VectorMoves);
@@ -8455,6 +8507,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageGetResinfoDmaskWidthHeight);
   AddCase(ImageGetResinfoDmaskMipLevels);
   AddCase(ImageSampleAndGather);
+  AddCase(ImageSampleBc7PreservesTransparentAlpha);
   AddCase(ImageSampleA16SamplerCoordsOnGpu);
   AddCase(ImageSampleOpcodeAliasUsesNormalCoords);
   AddCase(ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu);
@@ -8493,7 +8546,7 @@ std::vector<SkippedCase> MakeSkippedCases() {
   return {ImageStoreMipWritesExplicitMip2D()};
 }
 
-void CheckPs5GameExampleImageClearRuntimeShape() {
+void CheckComputeImageClearRuntimeShape() {
   const auto MakeCode = [] {
     std::vector<u32> code;
     AppendVop3(&code, 0x347u, 4, 8, InlineU32(6), Vgpr(0));
@@ -8536,10 +8589,10 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
     options.dump_ir = false;
     ShaderRecompiler::CompileResult result;
     std::string error;
-    Require("Ps5GameExampleImageClear", stage,
+    Require("ComputeImageClearRuntimeShape", stage,
             ShaderRecompiler::TryRecompile(code, options, &result, &error),
             error);
-    ValidateSpirv("Ps5GameExampleImageClear", result.spirv);
+    ValidateSpirv("ComputeImageClearRuntimeShape", result.spirv);
     return result;
   };
 
@@ -8553,7 +8606,7 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
   ShaderBufferResource descriptor{};
   u32 packed_clear = 0;
   uint64_t size = 0;
-  Require("Ps5GameExampleImageClear", "runtime shape",
+  Require("ComputeImageClearRuntimeShape", "runtime shape",
           ResolveComputeImageClear(compute, 64, 1, 1, 0x61u, &descriptor,
                                    &packed_clear, &size) &&
               descriptor.Base48() == 0x10000u && size == 64u * 16u &&
@@ -8564,33 +8617,235 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
   non_repeated.user_data[7] ^= 1u;
   compute.stage.resources =
       std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(non_repeated);
-  Require("Ps5GameExampleImageClear", "non-repeated clear",
+  Require("ComputeImageClearRuntimeShape", "non-repeated clear",
           !ResolveComputeImageClear(compute, 64, 1, 1, 0x61u, &descriptor,
                                     &packed_clear, &size),
           "non-uniform uint4 data was replaced with a color clear");
   compute.stage.resources =
       std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(positive.resources);
   compute.dispatch_threads_num[0] = 32;
-  Require("Ps5GameExampleImageClear", "partial dispatch",
+  Require("ComputeImageClearRuntimeShape", "partial dispatch",
           !ResolveComputeImageClear(compute, 32, 1, 1, 0x61u, &descriptor,
                                     &packed_clear, &size),
           "partial buffer coverage was classified as a complete clear");
-  std::printf("[host]    %-32s ok\n", "Ps5GameExampleImageClear");
+  std::printf("[host]    %-32s ok\n", "ComputeImageClearRuntimeShape");
+}
+
+void CheckPackedScalarImageClearRuntimeShape() {
+  constexpr uint32_t records = 128;
+  constexpr uint32_t clear = 0x12345678u;
+
+  ShaderBufferResource descriptor{};
+  descriptor.UpdateAddress48(0x20000u);
+  descriptor.fields[1] |= 4u << 16u;
+  descriptor.fields[2] = records;
+  descriptor.fields[3] =
+      (Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) << 12u) |
+      DstSel(4, 0, 0, 0);
+
+  ShaderRecompiler::IR::Program program{};
+  program.user_data_base = 0;
+  program.info.buffers.resize(1);
+  program.info.buffers[0].source = 2;
+  program.info.buffers[0].max_byte_extent = 4;
+  program.info.buffers[0].packed_stride = 4;
+  program.info.buffers[0].written = true;
+  program.info.buffers[0].formatted = true;
+
+  ShaderRecompiler::IR::ResourceSnapshot resources{};
+  ShaderRecompiler::IR::DescriptorValue raw{};
+  std::copy_n(descriptor.fields, 4, raw.dwords.begin());
+  raw.dword_count = 4;
+  resources.buffers.push_back(raw);
+  resources.user_data.assign(10, 0);
+  std::copy_n(descriptor.fields, 4, resources.user_data.begin());
+  resources.user_data[4] = clear;
+  resources.user_data[7] = 0x08000000u;
+  resources.user_data[8] = records;
+  resources.user_data[9] = 1;
+
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = 1;
+  compute.threads_num[2] = 1;
+  compute.group_id[0] = true;
+  compute.wave_size = 32;
+  compute.thread_ids_num = 1;
+  compute.stage.program =
+      std::make_shared<const ShaderRecompiler::IR::Program>(program);
+  compute.stage.resources =
+      std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(resources);
+
+  ShaderBufferResource resolved{};
+  u32 packed_clear = 0;
+  uint64_t size = 0;
+  Require("PackedScalarImageClear", "runtime shape",
+          ResolveComputeImageClear(compute, 2, 1, 1, 0x41u, &resolved,
+                                   &packed_clear, &size) &&
+              resolved.Base48() == 0x20000u && size == records * 4u &&
+              packed_clear == clear,
+          "complete packed scalar clear did not resolve");
+
+  auto wrong_bounds = resources;
+  wrong_bounds.user_data[8]--;
+  compute.stage.resources =
+      std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(wrong_bounds);
+  Require("PackedScalarImageClear", "bounds mismatch",
+          !ResolveComputeImageClear(compute, 2, 1, 1, 0x41u, &resolved,
+                                    &packed_clear, &size),
+          "mismatched shader bounds were classified as a complete clear");
+
+  compute.stage.resources =
+      std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(resources);
+  Require("PackedScalarImageClear", "partial dispatch",
+          !ResolveComputeImageClear(compute, 1, 1, 1, 0x41u, &resolved,
+                                    &packed_clear, &size),
+          "partial workgroup coverage was classified as a complete clear");
+  compute.dispatch_thread_dimensions = true;
+  compute.dispatch_threads_num[0] = records;
+  compute.dispatch_threads_num[1] = 1;
+  compute.dispatch_threads_num[2] = 1;
+  Require("PackedScalarImageClear", "wrong dispatch mode",
+          !ResolveComputeImageClear(compute, records, 1, 1, 0x61u, &resolved,
+                                    &packed_clear, &size),
+          "thread-dimension dispatch was classified as the workgroup kernel");
+  std::printf("[host]    %-32s ok\n", "PackedScalarImageClear");
+}
+
+void CheckUnitQuadPresentationViewport() {
+  const std::array<std::array<float, 2>, 4> ndc{{
+      {-1.0f, 1.0f},
+      {-0.999f, 1.0f},
+      {-1.0f, 0.998f},
+      {-0.999f, 0.998f},
+  }};
+  std::array<float, 2> scale{};
+  std::array<float, 2> offset{};
+  const auto maps_to = [&](uint32_t point, float x, float y) {
+    return std::abs(ndc[point][0] * scale[0] + offset[0] - x) < 0.25f &&
+           std::abs(ndc[point][1] * scale[1] + offset[1] - y) < 0.25f;
+  };
+  Require("UnitQuadPresentationViewport", "full extent mapping",
+          ResolveUnitQuadPresentationViewport(ndc, {1920, 1080}, &scale, &offset) &&
+              maps_to(0, 0.0f, 0.0f) && maps_to(1, 1920.0f, 0.0f) &&
+              maps_to(2, 0.0f, 1080.0f) && maps_to(3, 1920.0f, 1080.0f),
+          "unit presentation quad was not expanded to the framebuffer extent");
+
+  auto degenerate = ndc;
+  degenerate[1][0] = degenerate[0][0];
+  degenerate[3][0] = degenerate[2][0];
+  auto skewed = ndc;
+  skewed[3][1] += 0.01f;
+  Require("UnitQuadPresentationViewport", "geometry guards",
+          !ResolveUnitQuadPresentationViewport(degenerate, {1920, 1080}, &scale,
+                                                &offset) &&
+              !ResolveUnitQuadPresentationViewport(skewed, {1920, 1080}, &scale,
+                                                    &offset),
+          "degenerate or skewed presentation geometry was accepted");
+  std::printf("[host]    %-32s ok\n", "UnitQuadPresentationViewport");
+}
+
+void CheckVideoOutDccMetadataTransferDispatch() {
+  constexpr uint64_t render_metadata  = 0x5111960000ull;
+  constexpr uint64_t display_metadata = 0x5111970000ull;
+  const auto MakeDescriptor = [](uint64_t address, uint32_t stride, uint32_t records,
+                                 Prospero::BufferFormat format, uint32_t dst_sel) {
+    ShaderBufferResource descriptor{};
+    descriptor.UpdateAddress48(address);
+    descriptor.fields[1] |= stride << 16u;
+    descriptor.fields[2] = records;
+    descriptor.fields[3] = (Prospero::GpuEnumValue(format) << 12u) | dst_sel;
+    ShaderRecompiler::IR::DescriptorValue raw{};
+    std::copy_n(descriptor.fields, 4, raw.dwords.begin());
+    raw.dword_count = 4;
+    return raw;
+  };
+
+  ShaderRecompiler::IR::Program program{};
+  program.info.buffers.resize(2);
+  program.info.buffers[0].source = 2;
+  program.info.buffers[0].max_byte_extent = 4;
+  program.info.buffers[0].packed_stride = 1;
+  program.info.buffers[0].read = true;
+  program.info.buffers[0].formatted = true;
+  program.info.buffers[1].source = 3;
+  program.info.buffers[1].max_byte_extent = 8;
+  program.info.buffers[1].packed_stride = 2;
+  program.info.buffers[1].written = true;
+  program.info.buffers[1].formatted = true;
+
+  ShaderRecompiler::IR::ResourceSnapshot resources{};
+  resources.buffers.push_back(MakeDescriptor(render_metadata, 1, 0xc000,
+                                               Prospero::BufferFormat::k8UInt, 0x204));
+  resources.buffers.push_back(MakeDescriptor(display_metadata, 2, 0x6000,
+                                               Prospero::BufferFormat::k8_8UInt, 0x22c));
+
+  ShaderComputeInputInfo input{};
+  input.threads_num[0] = 8;
+  input.threads_num[1] = 8;
+  input.threads_num[2] = 1;
+  input.group_id[0] = true;
+  input.group_id[1] = true;
+  input.thread_ids_num = 2;
+  input.wave_size = 32;
+  input.stage.program =
+      std::make_shared<const ShaderRecompiler::IR::Program>(program);
+  input.stage.resources =
+      std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(resources);
+
+  ShaderBufferResource source{};
+  ShaderBufferResource destination{};
+  uint64_t transfer_size = 0;
+  Require("VideoOutDccMetadataTransfer", "exact repacking dispatch",
+          ResolveVideoOutDccMetadataTransferDispatch(input, 4, 24, 1, 0x41u,
+                                                      &source, &destination,
+                                                      &transfer_size) &&
+              source.Base48() == render_metadata &&
+              destination.Base48() == display_metadata && transfer_size == 0xc000,
+          "exact render-to-display DCC metadata repacking dispatch was rejected");
+  Require("VideoOutDccMetadataTransfer", "dispatch and format guards",
+          !ResolveVideoOutDccMetadataTransferDispatch(input, 4, 23, 1, 0x41u,
+                                                       &source, &destination,
+                                                       &transfer_size) &&
+              !ResolveVideoOutDccMetadataTransferDispatch(input, 4, 24, 1, 0x61u,
+                                                           &source, &destination,
+                                                           &transfer_size),
+          "partial or thread-dimension DCC metadata dispatch was admitted");
+  auto invalid_resources = resources;
+  invalid_resources.buffers[1].dwords[3] ^= 1u << 12u;
+  input.stage.resources =
+      std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(invalid_resources);
+  Require("VideoOutDccMetadataTransfer", "destination format guard",
+          !ResolveVideoOutDccMetadataTransferDispatch(input, 4, 24, 1, 0x41u,
+                                                       &source, &destination,
+                                                       &transfer_size),
+          "an incompatible DCC destination format was admitted");
+  std::printf("[host]    %-32s ok\n", "VideoOutDccMetadataTransfer");
 }
 
 void CheckEmbeddedFetchVertexOffset() {
   const auto MakeFetch = [](std::initializer_list<std::pair<u32, u32>> adds,
-                            std::optional<std::pair<u32, u32>> late_add = {}) {
+                            std::optional<std::pair<u32, u32>> late_add = {},
+                            std::initializer_list<std::pair<u32, u32>>
+                                preselection_adds = {},
+                            u32 selected_index = 0) {
     std::vector<u32> code;
     code.push_back(EncodeSMovB32(0, InlineU32(0)));
     code.push_back(EncodeSmem0(0x02u, 20, 4));
     code.push_back(EncodeSmem1(0));
-    code.push_back(EncodeVop2(0x01u, 0, Vgpr(8), 5));
+    for (const auto [sgpr, index_vgpr] : preselection_adds) {
+      // AGC uses v_sad_u32(index, start, 0, index) as an unsigned add in
+      // embedded-fetch prologues.
+      AppendVop3(&code, 0x15du, index_vgpr, sgpr, InlineU32(0),
+                 Vgpr(index_vgpr));
+    }
+    code.push_back(EncodeVop2(0x01u, selected_index, Vgpr(8), 5));
     for (const auto [sgpr, index_vgpr] : adds) {
-      AppendVop3B(&code, 0x30fu, 0, 0, sgpr, Vgpr(index_vgpr));
+      AppendVop3B(&code, 0x30fu, selected_index, 0, sgpr,
+                  Vgpr(index_vgpr));
     }
     code.push_back(EncodeMubuf0(0x03u, 0, true));
-    code.push_back(EncodeMubuf1(9, 5, 0));
+    code.push_back(EncodeMubuf1(9, 5, selected_index));
     if (late_add.has_value()) {
       AppendVop3B(&code, 0x30fu, 0, 0, late_add->first,
                   Vgpr(late_add->second));
@@ -8646,6 +8901,22 @@ void CheckEmbeddedFetchVertexOffset() {
               Resolve(valid, 0) == 7 && Resolve(valid, 5) == 5,
           "canonical fetch offset or register index-offset precedence is wrong");
 
+  const auto preselection = Compile(
+      "EmbeddedFetchPreselectionVertexOffset",
+      MakeFetch({}, {}, {{18, 5}}), 11);
+  Require("EmbeddedFetchPreselectionVertexOffset", "parse",
+          preselection.program.info.vertex_offset_sgpr == 18 &&
+              Resolve(preselection, 0) == 11,
+          "vertex offset applied before vertex/instance selection was lost");
+
+  const auto aliased_selection = Compile(
+      "EmbeddedFetchAliasedSelectionVertexOffset",
+      MakeFetch({}, {}, {{18, 5}}, 5), 13);
+  Require("EmbeddedFetchAliasedSelectionVertexOffset", "parse",
+          aliased_selection.program.info.vertex_offset_sgpr == 18 &&
+              Resolve(aliased_selection, 0) == 13,
+          "in-place vertex/instance selection lost vertex-index provenance");
+
   const auto pointer = 0x5b7c5100u;
   const auto late = Compile("EmbeddedFetchLateOffset",
                             MakeFetch({}, std::pair<u32, u32>{18, 0}), pointer);
@@ -8655,7 +8926,11 @@ void CheckEmbeddedFetchVertexOffset() {
                                  MakeFetch({{18, 1}}), pointer);
   const auto outside = Compile("EmbeddedFetchOutsideOffset",
                                MakeFetch({{19, 0}}), pointer);
-  for (const auto *result : {&late, &conflict, &malformed, &outside}) {
+  const auto preselection_conflict = Compile(
+      "EmbeddedFetchConflictingPreselectionOffset",
+      MakeFetch({}, {}, {{17, 5}, {18, 5}}), pointer);
+  for (const auto *result : {&late, &conflict, &malformed, &outside,
+                             &preselection_conflict}) {
     Require("EmbeddedFetchVertexOffset", "fail closed",
             result->program.info.vertex_offset_sgpr == -1 &&
                 Resolve(*result, 0) == 0,
@@ -8795,6 +9070,24 @@ void CheckSampledColorViews() {
                                      DstSel(6, 5, 4, 7)) ==
                   VulkanImage::VIEW_BGRA_TO_RGBA,
           "packed RGB10 target did not select its matching mutable channel-order view");
+  Require("SampledColorViews", "cached 2D render target descriptor",
+          IsSupportedCachedRenderTargetImageType(
+              false, Prospero::ImageType::kColor2D, 1080) &&
+              IsSupportedCachedRenderTargetImageType(
+                  true, Prospero::ImageType::kColor2D, 1080),
+          "existing sampled or storage 2D render target descriptor was rejected");
+  Require("SampledColorViews", "cached sampled 1D render target descriptor",
+          IsSupportedCachedRenderTargetImageType(
+              false, Prospero::ImageType::kColor1D, 1),
+          "single-row sampled 1D render target descriptor was rejected");
+  Require("SampledColorViews", "cached 1D render target limits",
+          !IsSupportedCachedRenderTargetImageType(
+              false, Prospero::ImageType::kColor1D, 2) &&
+              !IsSupportedCachedRenderTargetImageType(
+                  true, Prospero::ImageType::kColor1D, 1) &&
+              !IsSupportedCachedRenderTargetImageType(
+                  false, Prospero::ImageType::kColor1DArray, 1),
+          "non-row, storage, or array 1D render target descriptor was admitted");
   Require("SampledColorViews", "D32 depth target",
           SelectSampledDepthView(VK_FORMAT_D32_SFLOAT_S8_UINT,
                                  VK_FORMAT_R32_SFLOAT,
@@ -10587,6 +10880,22 @@ void CheckImageOverlapResolution() {
               ImagePageRangesOverlap(edge_fault_address, 1,
                                      edge_target_address, edge_target_size),
           "byte-disjoint CPU access lost the GPU owner of its shared tracker page");
+  constexpr uint64_t address_view = 0x201240;
+  constexpr uint64_t address_view_size = 0x20000;
+  constexpr uint64_t metadata_address = 0x210000;
+  Require("ImageOverlapResolution", "address prefix before metadata",
+          ImagePageRangePrefixBefore(address_view, address_view_size,
+                                     metadata_address, 0x8000) ==
+              metadata_address - address_view,
+          "address binding did not stop at the first metadata page");
+  Require("ImageOverlapResolution", "address prefix without metadata",
+          ImagePageRangePrefixBefore(address_view, 0x4000,
+                                     metadata_address, 0x8000) == 0x4000,
+          "non-overlapping address binding was shortened");
+  Require("ImageOverlapResolution", "address prefix starts in metadata",
+          ImagePageRangePrefixBefore(metadata_address + 0x100, 0x4000,
+                                     metadata_address, 0x8000) == 0,
+          "address binding beginning on a metadata page was exposed");
   Image sampled_image{};
   sampled_image = page_left;
   Image same_page_image{};
@@ -10666,6 +10975,10 @@ void CheckImageOverlapResolution() {
           ClassifyVideoOutCompression(true, video_metadata, 0x208u, 0) ==
               VideoOutCompression::Dcc256_64_64,
           "Prospero video-out DCC 256/64/64 mode was rejected");
+  Require("ImageOverlapResolution", "video-out DCC 256/256",
+          ClassifyVideoOutCompression(true, video_metadata, 0x48u, 0) ==
+              VideoOutCompression::Dcc256_256,
+          "Prospero video-out DCC 256/256 mode was rejected");
   Require("ImageOverlapResolution", "video-out compression guards",
           ClassifyVideoOutCompression(false, 0, 0, 0) ==
                   VideoOutCompression::Uncompressed &&
@@ -10685,13 +10998,61 @@ void CheckImageOverlapResolution() {
               VideoOutCompression::Dcc256_64_64, true, false, false) &&
               CanUseVideoOutNativeWithoutUpload(
                   VideoOutCompression::Dcc256_64_64, false, true, false) &&
+              CanUseVideoOutNativeWithoutUpload(
+                  VideoOutCompression::Dcc256_256, true, false, false) &&
               !CanUseVideoOutNativeWithoutUpload(
                   VideoOutCompression::Dcc256_64_64, false, false, false) &&
+              !CanUseVideoOutNativeWithoutUpload(
+                  VideoOutCompression::Dcc256_256, false, false, false) &&
               !CanUseVideoOutNativeWithoutUpload(
                   VideoOutCompression::Dcc256_64_64, true, false, true) &&
               !CanUseVideoOutNativeWithoutUpload(
                   VideoOutCompression::Uncompressed, true, true, false),
           "compressed video-out upload/read ownership boundary regressed");
+
+  Require("ImageOverlapResolution", "video-out DCC metadata layout",
+          ComputeVideoOutDccMetadataSize(0x870000, VideoOutCompression::Dcc256_64_64) ==
+                  0x10000 &&
+              ComputeVideoOutDccMetadataSize(0x870000,
+                                             VideoOutCompression::Dcc256_256) == 0x10000 &&
+              ComputeVideoOutDccMetadataSize(0x870000,
+                                             VideoOutCompression::Uncompressed) == 0 &&
+              ComputeVideoOutDccMetadataSize(UINT64_MAX,
+                                              VideoOutCompression::Dcc256_256) == 0,
+          "video-out DCC metadata footprint classification is invalid");
+  Require("ImageOverlapResolution", "video-out DCC active metadata layout",
+          ComputeVideoOutDccActiveMetadataSize(0x870000,
+                                               VideoOutCompression::Dcc256_256) == 0xc000 &&
+              ComputeVideoOutDccActiveMetadataSize(
+                  0x870000, VideoOutCompression::Dcc256_64_64) == 0xc000 &&
+              ComputeVideoOutDccActiveMetadataSize(
+                  0x870000, VideoOutCompression::Uncompressed) == 0,
+          "video-out DCC active metadata footprint classification is invalid");
+  Require("ImageOverlapResolution", "video-out DCC initial content",
+          ClassifyVideoOutDccInitialContent(0x00) ==
+                  VideoOutDccInitialContent::Clear0000 &&
+              ClassifyVideoOutDccInitialContent(0x10) ==
+                  VideoOutDccInitialContent::Unsupported &&
+              ClassifyVideoOutDccInitialContent(0x40) ==
+                  VideoOutDccInitialContent::Unsupported &&
+              ClassifyVideoOutDccInitialContent(0xff) ==
+                  VideoOutDccInitialContent::Unsupported,
+          "unsupported DCC metadata codes were admitted as native initial contents");
+  VideoOutInfo overwrite_surface {};
+  overwrite_surface.width  = 1920;
+  overwrite_surface.height = 1080;
+  VideoOutAccess full_overwrite {};
+  full_overwrite.intent      = VideoOutAccessIntent::FullOverwrite;
+  full_overwrite.layer_count = 1;
+  full_overwrite.width       = 1920;
+  full_overwrite.height      = 1080;
+  Require("ImageOverlapResolution", "video-out full overwrite",
+          IsFullVideoOutOverwrite(overwrite_surface, full_overwrite),
+          "exact video-out overwrite was rejected");
+  full_overwrite.width = 1919;
+  Require("ImageOverlapResolution", "video-out partial overwrite",
+          !IsFullVideoOutOverwrite(overwrite_surface, full_overwrite),
+          "partial video-out overwrite was accepted");
 
   VkClearColorValue clear{};
   Require("ImageOverlapResolution", "RGBA8 compute clear decode",
@@ -11676,7 +12037,10 @@ int main(int argc, char **argv) {
   CheckReferenceClockScale();
   CheckEmbeddedFetchVertexOffset();
   CheckEmbeddedFetchLaneSpill();
-  CheckPs5GameExampleImageClearRuntimeShape();
+  CheckComputeImageClearRuntimeShape();
+  CheckPackedScalarImageClearRuntimeShape();
+  CheckUnitQuadPresentationViewport();
+  CheckVideoOutDccMetadataTransferDispatch();
   VulkanHarness vulkan;
   vulkan.CheckMutableStorageSrgbView();
   vulkan.CheckMutableRenderTargetBgraStorageView();

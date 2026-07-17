@@ -232,6 +232,11 @@ add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(scalar_provenance_tests fmt::fmt)
 target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
+if (MSVC)
+	target_compile_options(scalar_provenance_tests PRIVATE /EHsc)
+else()
+	target_compile_options(scalar_provenance_tests PRIVATE -fexceptions)
+endif()
 
 add_executable(page_manager_tests EXCLUDE_FROM_ALL
 	../tests/PageManagerTests.cpp
@@ -281,6 +286,11 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(resource_tracking_tests fmt::fmt)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
+if (MSVC)
+	target_compile_options(resource_tracking_tests PRIVATE /EHsc)
+else()
+	target_compile_options(resource_tracking_tests PRIVATE -fexceptions)
+endif()
 
 add_executable(resource_mutex_tests EXCLUDE_FROM_ALL
 	../tests/ResourceMutexTests.cpp
@@ -292,6 +302,11 @@ target_include_directories(resource_mutex_tests PRIVATE ${inc_headers})
 add_kyty_full_emulator_test(shader_recompiler_compute_tests ../tests/ShaderRecompilerComputeTests.cpp)
 
 add_kyty_full_emulator_test(virtual_memory_allocation_tests ../tests/VirtualMemoryAllocationTests.cpp)
+if (MSVC)
+	target_compile_options(virtual_memory_allocation_tests PRIVATE /EHsc)
+else()
+	target_compile_options(virtual_memory_allocation_tests PRIVATE -fexceptions)
+endif()
 
 
 add_executable(kyty_emulator main.cpp ${kyty_emulator_src})

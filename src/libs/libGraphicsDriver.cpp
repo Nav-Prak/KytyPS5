@@ -205,6 +205,7 @@ LIB_DEFINE(InitGraphicsDriver_1) {
 	LIB_FUNC("cFazmnXpJOE", Gen5::GraphicsAcbEventWrite);
 	LIB_FUNC("KT-hTp-Ch14", Gen5::GraphicsAcbAcquireMem);
 	LIB_FUNC("ewobAQeMo5k", Gen5::GraphicsAcbAcquireMemGetSize);
+	LIB_FUNC("b-oySn+G2tE", Gen5::GraphicsAcbJumpGetSize);
 	LIB_FUNC("qyM2bxYFPAk", Gen5::GraphicsAcbCondExec);
 	LIB_FUNC("ozKzBP4aki4", Gen5::GraphicsAcbCondExecGetSize);
 	LIB_FUNC("htn36gPnBk4", Gen5::GraphicsAcbWaitRegMem);

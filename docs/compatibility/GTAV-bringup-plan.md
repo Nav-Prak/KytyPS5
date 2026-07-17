@@ -47,9 +47,12 @@ Status on 2026-07-17:
   visible retest cleared the crash and reached the in-game title frame.
 - The title frame then remained static while audio advanced and the guest repeatedly called two
   unresolved `Agc_v1` imports. Unresolved-import diagnostics now preserve the guest ABI while
-  reporting the caller, module-relative offset, and first four integer arguments. The diagnostic
-  rerun continued past those calls and compiled another shader, so the imports are not the first
-  causal blocker and no semantics have been assigned to them yet.
+  reporting the caller, module-relative offset, and first four integer arguments. Call-site
+  analysis identified `b-oySn+G2tE` as `GraphicsAcbJumpGetSize`: GTA's ring buffer reserves its
+  four-dword `IT_INDIRECT_BUFFER` packet at the end of each ACB segment and patches that slot to
+  chain the next segment. Returning zero let command data overlap the reserved jump slot. Kyty now
+  exposes the generic 16-byte packet size; a visible retest is pending. The other import is used as
+  a cleanup/destructor-style call whose return value is ignored and remains unresolved.
 - The next deterministic failure was GPU-to-guest writeback of a 128-bit-per-element RenderTarget
   surface. Kyty already detiled that format with the PS5 Standard64KB-128 equation; writeback now
   uses the exact reciprocal tiler, including strict 64x64-block pitch and allocation guards. Fixed
@@ -59,7 +62,7 @@ Status on 2026-07-17:
 - The host used for this run did not expose an SDL/WASAPI audio endpoint. Kyty continued with its
   timing fallback, so audible output remains untested.
 
-Nine deterministic compatibility blockers have been fixed generically during bring-up:
+Ten deterministic compatibility blockers have been fixed generically during bring-up:
 
 1. A host reservation occupied GTA V's fixed guest mapping range. Windows builds now reserve a
    bounded placeholder arena for fixed guest mappings and can transactionally replace overlapping
@@ -89,6 +92,9 @@ Nine deterministic compatibility blockers have been fixed generically during bri
 9. 128-bit RenderTarget surfaces now use the same Standard64KB-128 equation in both directions.
    GPU-to-guest writeback preserves the existing format-specific layout instead of failing after
    the prologue title, and fixed byte-map anchors prevent a self-consistent but incorrect round trip.
+10. ACB ring buffers now receive the correct 16-byte jump-packet reservation through
+    `GraphicsAcbJumpGetSize`. Segment command data can no longer overlap the four-dword
+    `IT_INDIRECT_BUFFER` slot later patched to chain the next segment.
 
 Focused virtual-memory, image-alias, shared-tracker-page, and depth-preset regressions cover these
 changes. Raw logs and local paths remain outside the repository.

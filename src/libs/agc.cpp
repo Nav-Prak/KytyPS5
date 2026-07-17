@@ -2727,6 +2727,15 @@ uint32_t KYTY_SYSV_ABI GraphicsAcbAcquireMemGetSize() {
 	return GraphicsDcbAcquireMemGetSize();
 }
 
+uint32_t KYTY_SYSV_ABI GraphicsAcbJumpGetSize() {
+	PRINT_NAME();
+
+	// ACB and DCB jumps both use a four-dword IT_INDIRECT_BUFFER packet. Ring-buffer
+	// implementations reserve this packet at the end of each segment before patching its
+	// target to chain the next segment.
+	return 4u * 4u;
+}
+
 uint32_t* KYTY_SYSV_ABI GraphicsDcbCondExec(CommandBuffer* buf, const volatile uint32_t* address,
                                             uint32_t num_dwords) {
 	PRINT_NAME();

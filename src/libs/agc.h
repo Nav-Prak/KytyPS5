@@ -180,6 +180,7 @@ uint32_t* KYTY_SYSV_ABI GraphicsAcbAcquireMem(CommandBuffer* buf, uint32_t gcr_c
                                               const volatile void* base, uint64_t size_bytes,
                                               uint32_t poll_cycles);
 uint32_t KYTY_SYSV_ABI  GraphicsAcbAcquireMemGetSize();
+uint32_t KYTY_SYSV_ABI  GraphicsAcbJumpGetSize();
 uint32_t* KYTY_SYSV_ABI GraphicsAcbCondExec(CommandBuffer* buf, const volatile uint32_t* address,
                                             uint32_t num_dwords);
 uint32_t KYTY_SYSV_ABI  GraphicsAcbCondExecGetSize();

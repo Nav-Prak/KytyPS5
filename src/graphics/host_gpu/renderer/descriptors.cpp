@@ -16,12 +16,13 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/objects/textureCommon.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/descriptorCache.h"
 #include "graphics/host_gpu/renderer/framebufferCache.h"
 #include "graphics/host_gpu/renderer/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/renderer/renderState.h"
+#include "graphics/host_gpu/renderer/renderTargetBarriers.h"
 #include "graphics/host_gpu/renderer/shaderResourceBarrier.h"
 #include "graphics/host_gpu/utils.h"
 #include "graphics/host_gpu/vma.h"
@@ -301,18 +302,6 @@ ResolveTargetTextureView(const ShaderRecompiler::IR::ImageResource& resource,
 	}
 }
 
-static bool IsSupportedSampledDepthFormat(VkFormat image_format, uint32_t guest_format,
-                                          VkFormat view_format) {
-	const bool d16 = image_format == VK_FORMAT_D16_UNORM &&
-	                 guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm) &&
-	                 view_format == VK_FORMAT_R16_UNORM;
-	const bool d32 =
-	    (image_format == VK_FORMAT_D32_SFLOAT || image_format == VK_FORMAT_D32_SFLOAT_S8_UINT) &&
-	    guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float) &&
-	    view_format == VK_FORMAT_R32_SFLOAT;
-	return d16 || d32;
-}
-
 bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor,
                                       const VulkanImage&           image) {
 	const auto width  = static_cast<uint32_t>(descriptor.Width5()) + 1u;
@@ -357,12 +346,20 @@ static void ValidateDepthTargetBinding(const ShaderRecompiler::IR::ImageResource
 	    TileGetTexturePitch(descriptor.Format(), static_cast<uint32_t>(descriptor.Width5()) + 1u, 1,
 	                        descriptor.TileMode());
 	EXIT("unsupported sampled depth target: resource=%d descriptor=%d encoding=%d format=%d "
-	     "image_format=%d view_format=%d descriptor_pitch=%u target_pitch=%u "
-	     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+	     "kind=%u dimension=%u mip=%u read=%d written=%d atomic=%d compare=%d "
+	     "image_format=%d view_format=%d image_layers=%u descriptor_type=%u base_array=%u "
+	     "depth=%u descriptor_pitch=%u target_pitch=%u fields=%08x/%08x/%08x/%08x/%08x/"
+	     "%08x/%08x/%08x addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 	     resource_ok, descriptor_ok, encoding_ok, format_ok,
+	     static_cast<uint32_t>(resource.kind), static_cast<uint32_t>(resource.dimension),
+	     static_cast<uint32_t>(resource.mip_mode), resource.read, resource.written, resource.atomic,
+	     resource.depth_compare,
 	     image == nullptr ? static_cast<int>(VK_FORMAT_UNDEFINED) : static_cast<int>(image->format),
-	     static_cast<int>(view_format), descriptor_pitch,
-	     image == nullptr ? 0u : image->guest_pitch, descriptor.Base40(), size);
+	     static_cast<int>(view_format), image == nullptr ? 0u : image->layers, descriptor.Type(),
+	     descriptor.BaseArray5(), descriptor.Depth(), descriptor_pitch,
+	     image == nullptr ? 0u : image->guest_pitch, descriptor.fields[0], descriptor.fields[1],
+	     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+	     descriptor.fields[6], descriptor.fields[7], descriptor.Base40(), size);
 }
 
 static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::ImageResource& resource,

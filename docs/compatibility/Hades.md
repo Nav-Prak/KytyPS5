@@ -11,9 +11,12 @@ This document records the source snapshot used to reach gameplay in a legally ob
 - Working snapshot branch: `archive/hades-working`
 - Review branch: `feature/hades-compatibility`
 - Upstream base commit: `13499502c909544244151823a838aee7b77b94a5` (`Support raw buffer writes to sampled textures`)
+- Latest upstream integration: `c21a4100c80f8a5c7f7f6ef09845df26625b3aa9` (`support 16-bit float video-out`)
 - Test date: 2026-07-17
 
 The working source commit is the exact code snapshot that was used for the successful gameplay test. The review branch reorganizes that work into focused technical commits and removes incidental formatting noise.
+
+The review branch builds and passes its automated graphics, shader, resource-tracking, vertex-metadata, and virtual-memory regression tests after the upstream integration. An in-game Hades retest is still required before treating the merged review-branch tip as a replacement for the archived working snapshot.
 
 ## Current status
 

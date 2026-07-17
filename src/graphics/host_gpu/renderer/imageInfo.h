@@ -5,6 +5,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -137,6 +138,139 @@ IsKnownCompressedVideoOut(VideoOutCompression compression) noexcept {
 	       compression == VideoOutCompression::Dcc256_256;
 }
 
+struct DepthFormatPolicy {
+	Prospero::DepthFormat   depth_format;
+	Prospero::BufferFormat  guest_format;
+	uint32_t                bytes_per_element;
+	VkFormat                sampled_view_format;
+	VkFormat                depth_attachment_format;
+	std::array<VkFormat, 3> stencil_attachment_formats;
+};
+
+inline constexpr std::array<DepthFormatPolicy, 2> DEPTH_FORMAT_POLICIES {{
+    {Prospero::DepthFormat::kZ16,
+     Prospero::BufferFormat::k16UNorm,
+     2,
+     VK_FORMAT_R16_UNORM,
+     VK_FORMAT_D16_UNORM,
+     {VK_FORMAT_D16_UNORM_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT}},
+    {Prospero::DepthFormat::kZ32F,
+     Prospero::BufferFormat::k32Float,
+     4,
+     VK_FORMAT_R32_SFLOAT,
+     VK_FORMAT_D32_SFLOAT,
+     {VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED}},
+}};
+
+[[nodiscard]] inline constexpr const DepthFormatPolicy*
+FindDepthFormatPolicy(uint32_t depth_format) noexcept {
+	for (const auto& policy: DEPTH_FORMAT_POLICIES) {
+		if (Prospero::GpuEnumValue(policy.depth_format) == depth_format) {
+			return &policy;
+		}
+	}
+	return nullptr;
+}
+
+[[nodiscard]] inline constexpr const DepthFormatPolicy*
+FindGuestDepthFormatPolicy(uint32_t guest_format) noexcept {
+	for (const auto& policy: DEPTH_FORMAT_POLICIES) {
+		if (Prospero::GpuEnumValue(policy.guest_format) == guest_format) {
+			return &policy;
+		}
+	}
+	return nullptr;
+}
+
+[[nodiscard]] inline constexpr bool IsStencilAttachmentFormat(const DepthFormatPolicy& policy,
+                                                              VkFormat format) noexcept {
+	for (const auto candidate: policy.stencil_attachment_formats) {
+		if (candidate != VK_FORMAT_UNDEFINED && candidate == format) {
+			return true;
+		}
+	}
+	return false;
+}
+
+[[nodiscard]] inline constexpr VkFormat DepthAttachmentFormat(const DepthFormatPolicy& policy,
+                                                              bool has_stencil) noexcept {
+	return has_stencil ? policy.stencil_attachment_formats.front() : policy.depth_attachment_format;
+}
+
+[[nodiscard]] inline constexpr VkFormat DepthAttachmentFormat(uint32_t depth_format,
+                                                              uint32_t stencil_format) noexcept {
+	bool has_stencil = false;
+	switch (static_cast<Prospero::StencilFormat>(stencil_format)) {
+		case Prospero::StencilFormat::kInvalid: break;
+		case Prospero::StencilFormat::k8UInt: has_stencil = true; break;
+		default: return VK_FORMAT_UNDEFINED;
+	}
+	const auto* policy = FindDepthFormatPolicy(depth_format);
+	return policy == nullptr ? VK_FORMAT_UNDEFINED : DepthAttachmentFormat(*policy, has_stencil);
+}
+
+[[nodiscard]] inline constexpr VkImageUsageFlags DepthTargetImageUsage() noexcept {
+	return VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+	       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+}
+
+[[nodiscard]] inline constexpr VkFormat DepthAspectTransferFormat(VkFormat format) noexcept {
+	switch (format) {
+		case VK_FORMAT_D16_UNORM:
+		case VK_FORMAT_D16_UNORM_S8_UINT: return VK_FORMAT_D16_UNORM;
+		case VK_FORMAT_D24_UNORM_S8_UINT: return VK_FORMAT_X8_D24_UNORM_PACK32;
+		case VK_FORMAT_D32_SFLOAT:
+		case VK_FORMAT_D32_SFLOAT_S8_UINT: return VK_FORMAT_D32_SFLOAT;
+		default: return VK_FORMAT_UNDEFINED;
+	}
+}
+
+[[nodiscard]] inline constexpr uint32_t DepthAspectTransferBytes(VkFormat format) noexcept {
+	switch (DepthAspectTransferFormat(format)) {
+		case VK_FORMAT_D16_UNORM: return 2;
+		case VK_FORMAT_X8_D24_UNORM_PACK32:
+		case VK_FORMAT_D32_SFLOAT: return 4;
+		default: return 0;
+	}
+}
+
+[[nodiscard]] inline constexpr uint32_t EncodeD16AsD24(uint16_t value) noexcept {
+	// Preserve the guest UNORM value when widening 16 bits to the 24-bit transfer plane.
+	return static_cast<uint32_t>((static_cast<uint64_t>(value) * 0x00ffffffu + 0x7fffu) / 0xffffu);
+}
+
+[[nodiscard]] inline uint32_t EncodeD16AsD32(uint16_t value) noexcept {
+	return std::bit_cast<uint32_t>(static_cast<float>(value) / 65535.0f);
+}
+
+[[nodiscard]] inline constexpr bool IsSupportedSampledDepthFormat(VkFormat image_format,
+                                                                  uint32_t guest_format,
+                                                                  VkFormat view_format) noexcept {
+	const auto* policy = FindGuestDepthFormatPolicy(guest_format);
+	return policy != nullptr && view_format == policy->sampled_view_format &&
+	       (image_format == policy->depth_attachment_format ||
+	        IsStencilAttachmentFormat(*policy, image_format));
+}
+
+[[nodiscard]] inline constexpr bool IsSupportedSampledDepthFormat(VkFormat image_format,
+                                                                  VkFormat view_format) noexcept {
+	for (const auto& policy: DEPTH_FORMAT_POLICIES) {
+		if (IsSupportedSampledDepthFormat(image_format, Prospero::GpuEnumValue(policy.guest_format),
+		                                  view_format)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+[[nodiscard]] inline constexpr bool IsSupportedDepthTargetFormat(const DepthTargetInfo& info) {
+	const bool  has_stencil = info.stencil_address != 0 || info.stencil_size != 0;
+	const auto* policy      = FindGuestDepthFormatPolicy(info.guest_format);
+	return policy != nullptr && info.bytes_per_element == policy->bytes_per_element &&
+	       (has_stencil ? IsStencilAttachmentFormat(*policy, info.format)
+	                    : info.format == policy->depth_attachment_format);
+}
+
 struct VideoOutInfo {
 	uint64_t            address           = 0;
 	uint64_t            size              = 0;
@@ -151,6 +285,7 @@ struct VideoOutInfo {
 	uint32_t            tile_mode         = 0;
 	uint32_t            dcc_control       = 0;
 	VideoOutCompression compression       = VideoOutCompression::Unsupported;
+	bool                bgra16            = false;
 };
 
 // Prospero video-out DCC modes covered here use one metadata byte per 256 bytes of color data.
@@ -231,48 +366,61 @@ CanUseVideoOutNativeWithoutUpload(VideoOutCompression compression, bool render_t
 }
 
 struct VideoOutPixelFormatInfo {
-	VkFormat format       = VK_FORMAT_UNDEFINED;
-	uint32_t guest_format = 0;
+	VkFormat format            = VK_FORMAT_UNDEFINED;
+	uint32_t guest_format      = 0;
+	uint32_t bytes_per_element = 0;
+	bool     bgra16            = false;
 };
+
+struct VideoOutFormatPolicy {
+	uint64_t                pixel_format;
+	VideoOutPixelFormatInfo info;
+};
+
+inline constexpr std::array<VideoOutFormatPolicy, 6> VIDEO_OUT_FORMAT_POLICIES {{
+    {0x8000000022000000ull,
+     {VK_FORMAT_R8G8B8A8_SRGB, Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8Srgb), 4,
+      false}},
+    {0x8000000000000000ull,
+     {VK_FORMAT_B8G8R8A8_SRGB, Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8Srgb), 4,
+      false}},
+    {0x8100000022000000ull,
+     {VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+      Prospero::GpuEnumValue(Prospero::BufferFormat::k10_10_10_2UNorm), 4, false}},
+    {0x8100000000000000ull,
+     {VK_FORMAT_A2R10G10B10_UNORM_PACK32,
+      Prospero::GpuEnumValue(Prospero::BufferFormat::k10_10_10_2UNorm), 4, false}},
+    {0xc001000622000000ull,
+     {VK_FORMAT_R16G16B16A16_SFLOAT,
+      Prospero::GpuEnumValue(Prospero::BufferFormat::k16_16_16_16Float), 8, false}},
+    {0xc001000600000000ull,
+     {VK_FORMAT_R16G16B16A16_SFLOAT,
+      Prospero::GpuEnumValue(Prospero::BufferFormat::k16_16_16_16Float), 8, true}},
+}};
 
 [[nodiscard]] inline bool DecodeVideoOutPixelFormat(uint64_t                 pixel_format,
                                                     VideoOutPixelFormatInfo* info) {
 	if (info == nullptr) {
 		return false;
 	}
-	VideoOutPixelFormatInfo next {};
-	switch (pixel_format) {
-		case 0x8000000022000000ull: // SCE_VIDEO_OUT_PIXEL_FORMAT2_R8_G8_B8_A8_SRGB
-			next.format       = VK_FORMAT_R8G8B8A8_SRGB;
-			next.guest_format = Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8Srgb);
-			break;
-		case 0x8000000000000000ull: // SCE_VIDEO_OUT_PIXEL_FORMAT2_B8_G8_R8_A8_SRGB
-			next.format       = VK_FORMAT_B8G8R8A8_SRGB;
-			next.guest_format = Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8Srgb);
-			break;
-		case 0x8100000022000000ull: // SCE_VIDEO_OUT_PIXEL_FORMAT2_R10_G10_B10_A2_SRGB
-			next.format       = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-			next.guest_format = Prospero::GpuEnumValue(Prospero::BufferFormat::k10_10_10_2UNorm);
-			break;
-		case 0x8100000000000000ull: // SCE_VIDEO_OUT_PIXEL_FORMAT2_B10_G10_R10_A2_SRGB
-			next.format       = VK_FORMAT_A2R10G10B10_UNORM_PACK32;
-			next.guest_format = Prospero::GpuEnumValue(Prospero::BufferFormat::k10_10_10_2UNorm);
-			break;
-		default: return false;
+	for (const auto& policy: VIDEO_OUT_FORMAT_POLICIES) {
+		if (policy.pixel_format == pixel_format) {
+			*info = policy.info;
+			return true;
+		}
 	}
-	*info = next;
-	return true;
+	return false;
 }
 
-[[nodiscard]] inline bool IsSupportedVideoOutFormat(uint32_t guest_format, VkFormat format) {
-	const bool rgba8 =
-	    guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8Srgb) &&
-	    (format == VK_FORMAT_R8G8B8A8_SRGB || format == VK_FORMAT_B8G8R8A8_SRGB);
-	const bool rgb10 =
-	    guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k10_10_10_2UNorm) &&
-	    (format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
-	     format == VK_FORMAT_A2R10G10B10_UNORM_PACK32);
-	return rgba8 || rgb10;
+[[nodiscard]] inline bool IsSupportedVideoOutFormat(const VideoOutInfo& info) {
+	for (const auto& policy: VIDEO_OUT_FORMAT_POLICIES) {
+		if (info.format == policy.info.format && info.guest_format == policy.info.guest_format &&
+		    info.bytes_per_element == policy.info.bytes_per_element &&
+		    info.bgra16 == policy.info.bgra16) {
+			return true;
+		}
+	}
+	return false;
 }
 
 enum class DepthOverlap : uint8_t { None, RetireSampled, ExpandTarget, Unsupported };
@@ -296,6 +444,7 @@ enum class BufferImageWrite : uint8_t {
 	InvalidateTexture,
 	InvalidateVideoOut,
 	SynchronizeRenderTarget,
+	SynchronizeVideoOut,
 	Unsupported
 };
 enum class MetaImageOverlap : uint8_t { RetainSampled, RetireTarget, Unsupported };
@@ -305,13 +454,13 @@ SelectStorageSampledViewShape(uint32_t type, uint32_t depth, uint32_t backing_la
 	switch (static_cast<Prospero::ImageType>(type)) {
 		case Prospero::ImageType::kColor2D:
 			return depth == 1 && backing_layers == 1 ? StorageSampledViewShape::Image2D
-			                                          : StorageSampledViewShape::Unsupported;
+			                                         : StorageSampledViewShape::Unsupported;
 		case Prospero::ImageType::kColor2DArray:
 			return depth != 0 && depth == backing_layers ? StorageSampledViewShape::Image2DArray
-			                                               : StorageSampledViewShape::Unsupported;
+			                                             : StorageSampledViewShape::Unsupported;
 		case Prospero::ImageType::kColor3D:
 			return depth != 0 && backing_layers == 1 ? StorageSampledViewShape::Image3D
-			                                          : StorageSampledViewShape::Unsupported;
+			                                         : StorageSampledViewShape::Unsupported;
 		default: return StorageSampledViewShape::Unsupported;
 	}
 }
@@ -324,6 +473,30 @@ SelectStorageSampledViewShape(uint32_t type, uint32_t depth, uint32_t backing_la
 		case 8: return true;
 		default: return false;
 	}
+}
+
+[[nodiscard]] inline constexpr bool IsSupportedDisplayRenderTargetTileMode(
+    uint32_t tile_mode) noexcept {
+	return tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
+}
+
+[[nodiscard]] inline constexpr bool
+IsSupportedStandard64RenderTarget(const RenderTargetInfo& info) noexcept {
+	if (info.tile_mode != Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB) ||
+	    info.address == 0 || (info.address & 0xffffu) != 0 || info.width == 0 || info.height == 0 ||
+	    info.bytes_per_element != 4 || info.levels != 1 || info.layers != 1) {
+		return false;
+	}
+	const auto expected_pitch = (static_cast<uint64_t>(info.width) + 127u) & ~uint64_t {127u};
+	const auto padded_height  = (static_cast<uint64_t>(info.height) + 127u) & ~uint64_t {127u};
+	return expected_pitch <= UINT32_MAX && info.pitch == expected_pitch &&
+	       expected_pitch <= UINT64_MAX / padded_height / info.bytes_per_element &&
+	       info.size == expected_pitch * padded_height * info.bytes_per_element;
+}
+
+[[nodiscard]] inline constexpr bool IsTiledRenderTarget(const RenderTargetInfo& info) noexcept {
+	return info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) ||
+	       IsSupportedStandard64RenderTarget(info);
 }
 
 [[nodiscard]] inline constexpr DepthTransitionSource
@@ -566,21 +739,23 @@ ClassifyBufferImageWrite(uint64_t buffer_address, uint64_t buffer_size, uint64_t
 		return BufferImageWrite::None;
 	}
 	const bool exact = buffer_address == image_address && buffer_size == image_size;
-	const auto offset = buffer_address >= image_address ? buffer_address - image_address : UINT64_MAX;
+	const auto offset =
+	    buffer_address >= image_address ? buffer_address - image_address : UINT64_MAX;
 	const bool contained = offset <= image_size && buffer_size <= image_size - offset;
 	const bool buffer_page_aligned =
 	    ((buffer_address | buffer_size) & (TRACKER_PAGE_SIZE - 1)) == 0;
-	const bool image_page_aligned =
-	    ((image_address | image_size) & (TRACKER_PAGE_SIZE - 1)) == 0;
+	const bool image_page_aligned = ((image_address | image_size) & (TRACKER_PAGE_SIZE - 1)) == 0;
 	switch (binding) {
 		case BufferImageBinding::Texture:
 			return contained && image_page_aligned && !image_gpu_modified
 			           ? BufferImageWrite::InvalidateTexture
 			           : BufferImageWrite::Unsupported;
 		case BufferImageBinding::VideoOut:
-			return exact && buffer_formatted && !image_gpu_modified
-			           ? BufferImageWrite::InvalidateVideoOut
-			           : BufferImageWrite::Unsupported;
+			if (!exact || !buffer_page_aligned || !buffer_formatted) {
+				return BufferImageWrite::Unsupported;
+			}
+			return image_gpu_modified ? BufferImageWrite::SynchronizeVideoOut
+			                          : BufferImageWrite::InvalidateVideoOut;
 		case BufferImageBinding::RenderTarget:
 			return exact && buffer_page_aligned && buffer_formatted && image_gpu_modified
 			           ? BufferImageWrite::SynchronizeRenderTarget

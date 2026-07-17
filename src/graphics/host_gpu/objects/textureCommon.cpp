@@ -115,6 +115,14 @@ RenderTargetFormatInfo TextureGetRenderTargetFormat(uint32_t raw_layout, uint32_
 	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R16G16B16A16_SFLOAT, 8};
 	}
+	if (is(Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
+	       Prospero::ChannelOrder::kAlt)) {
+		return {VK_FORMAT_R16G16B16A16_SFLOAT, 8, Prospero::ColorMappingBgra};
+	}
+	if (is(Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
+	       Prospero::ChannelOrder::kReversed)) {
+		return {VK_FORMAT_R16G16B16A16_SFLOAT, 8, Prospero::ColorMappingAbgr};
+	}
 	if (is(Prospero::ChannelLayout::k32, Prospero::ChannelType::kFloat,
 	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R32_SFLOAT, 4};
@@ -254,9 +262,9 @@ VkComponentMapping TextureGetComponentMapping(uint32_t swizzle) {
 
 bool TextureCheckFormat(GraphicContext* ctx, VkImageCreateInfo* image_info) {
 	VkImageFormatProperties props {};
-	if (vkGetPhysicalDeviceImageFormatProperties(
-	        ctx->physical_device, image_info->format, image_info->imageType, image_info->tiling,
-	        image_info->usage, image_info->flags, &props) == VK_ERROR_FORMAT_NOT_SUPPORTED) {
+	if (ctx->GetImageFormatProperties(image_info->format, image_info->imageType, image_info->tiling,
+	                                  image_info->usage, image_info->flags,
+	                                  &props) == VK_ERROR_FORMAT_NOT_SUPPORTED) {
 		auto apply_fallback = [&](VkFormat replacement, const char* message) {
 			image_info->format = replacement;
 			const bool result  = TextureCheckFormat(ctx, image_info);
@@ -281,9 +289,9 @@ bool TextureCheckFormat(GraphicContext* ctx, VkImageCreateInfo* image_info) {
 
 static bool TextureCheckFormatExact(GraphicContext* ctx, const VkImageCreateInfo& image_info) {
 	VkImageFormatProperties props {};
-	return vkGetPhysicalDeviceImageFormatProperties(
-	           ctx->physical_device, image_info.format, image_info.imageType, image_info.tiling,
-	           image_info.usage, image_info.flags, &props) != VK_ERROR_FORMAT_NOT_SUPPORTED;
+	return ctx->GetImageFormatProperties(image_info.format, image_info.imageType, image_info.tiling,
+	                                     image_info.usage, image_info.flags,
+	                                     &props) != VK_ERROR_FORMAT_NOT_SUPPORTED;
 }
 
 bool TextureCheckStorageSwizzle(VkImageCreateInfo* image_info, VkComponentMapping* components) {

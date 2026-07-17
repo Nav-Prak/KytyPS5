@@ -307,6 +307,8 @@ if (MSVC)
 else()
 	target_compile_options(virtual_memory_allocation_tests PRIVATE -fexceptions)
 endif()
+target_compile_definitions(virtual_memory_allocation_tests PRIVATE
+	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
 
 add_executable(kyty_emulator main.cpp ${kyty_emulator_src})

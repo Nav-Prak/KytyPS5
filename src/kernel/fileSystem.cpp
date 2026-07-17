@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <climits>
 #include <cstdio>
 #include <cstring>
@@ -27,6 +28,23 @@ namespace Libs::LibKernel::FileSystem {
 LIB_NAME("libkernel", "libkernel");
 
 constexpr int DESCRIPTOR_MIN = 3;
+
+static void PaceOrdinaryFileRead(std::chrono::steady_clock::time_point start) {
+	const auto minimum_us = Config::GetFileReadMinLatencyUs();
+	if (minimum_us == 0) {
+		return;
+	}
+
+	const auto elapsed = std::chrono::steady_clock::now() - start;
+	const auto minimum = std::chrono::microseconds(minimum_us);
+	if (elapsed < minimum) {
+		const auto remaining =
+		    std::chrono::duration_cast<std::chrono::microseconds>(minimum - elapsed);
+		if (remaining.count() > 0) {
+			Common::Thread::SleepMicro(static_cast<uint32_t>(remaining.count()));
+		}
+	}
+}
 
 enum class SpecialFile {
 	None,
@@ -499,6 +517,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 		return static_cast<int64_t>(nbytes);
 	}
 
+	const auto read_start = std::chrono::steady_clock::now();
 	file->mutex.Lock();
 
 	bool     is_invalid = file->f.IsInvalid();
@@ -506,6 +525,8 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
 
 	file->mutex.Unlock();
+
+	PaceOrdinaryFileRead(read_start);
 
 	if (is_invalid) {
 		LOGF("\tfile is invalid\n");
@@ -618,6 +639,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 		return static_cast<int64_t>(nbytes);
 	}
 
+	const auto read_start = std::chrono::steady_clock::now();
 	file->mutex.Lock();
 
 	bool     is_invalid = file->f.IsInvalid();
@@ -628,6 +650,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	file->f.Seek(pos);
 
 	file->mutex.Unlock();
+	PaceOrdinaryFileRead(read_start);
 
 	if (is_invalid) {
 		LOGF("\tfile is invalid\n");

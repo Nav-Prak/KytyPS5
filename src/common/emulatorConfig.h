@@ -22,6 +22,7 @@ struct ConfigOptions {
 	uint32_t               screen_width                = 1280;
 	uint32_t               screen_height               = 720;
 	uint32_t               vblank_frequency            = 60;
+	uint32_t               file_read_min_latency_us    = 0;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
@@ -45,6 +46,7 @@ void Load(const ConfigOptions& cfg);
 uint32_t GetScreenWidth();
 uint32_t GetScreenHeight();
 uint32_t GetVblankFrequency();
+uint32_t GetFileReadMinLatencyUs();
 bool     VulkanValidationEnabled();
 
 bool                   ShaderValidationEnabled();

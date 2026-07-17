@@ -10,6 +10,7 @@
 #include "emulator.h"
 #include "kytyGitVersion.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <fmt/format.h>
 
@@ -45,6 +46,8 @@ static void PrintUsage() {
 	::printf("  --screen-width <num>                 Window width. Default: 1280.\n");
 	::printf("  --screen-height <num>                Window height. Default: 720.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
+	::printf("  --file-read-min-latency-us <num>     Minimum ordinary-file read latency in\n"
+	         "                                        microseconds. Default: 0.\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
 	::printf("  --shader-validation <true|false>     Enable shader validation.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
@@ -156,6 +159,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			const int32_t vblank_frequency = Common::ToInt32(value);
 			options.config.vblank_frequency =
 			    static_cast<uint32_t>(vblank_frequency < 0 ? 0 : vblank_frequency);
+		} else if (arg == "--file-read-min-latency-us") {
+			const int32_t latency = Common::ToInt32(value);
+			options.config.file_read_min_latency_us =
+			    static_cast<uint32_t>(std::clamp(latency, 0, 1000000));
 		} else if (arg == "--vulkan-validation") {
 			if (!ParseBool(value, options.config.vulkan_validation_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());

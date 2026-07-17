@@ -623,6 +623,54 @@ static void DetileStandard4KBTyped(T* dst, const T* src, uint32_t row_elements,
 }
 
 template <typename T>
+static void TileStandard4KBTyped(T* dst, const T* src, uint32_t row_elements,
+                                 uint32_t width_elements, uint32_t height_elements,
+                                 uint32_t padded_width, uint32_t block_width_log2,
+                                 uint32_t block_height_log2, uint64_t dst_size,
+                                 uint64_t src_size) {
+	constexpr auto bytes_per_element = static_cast<uint32_t>(sizeof(T));
+
+	std::array<uint32_t, 64> x_elements {};
+	std::array<uint32_t, 64> y_elements {};
+	const uint32_t block_width        = 1u << block_width_log2;
+	const uint32_t block_height       = 1u << block_height_log2;
+	const uint32_t elements_per_block = 4096u / bytes_per_element;
+	const uint32_t blocks_per_row     = padded_width >> block_width_log2;
+
+	for (uint32_t x = 0; x < block_width; x++) {
+		x_elements[x] = Gen5Standard4KBOffsetInBlock(x, 0, bytes_per_element) / bytes_per_element;
+	}
+	for (uint32_t y = 0; y < block_height; y++) {
+		y_elements[y] = Gen5Standard4KBOffsetInBlock(0, y, bytes_per_element) / bytes_per_element;
+	}
+
+	const uint64_t dst_count = dst_size / bytes_per_element;
+	const uint64_t src_count = src_size / bytes_per_element;
+	for (uint32_t block_y = 0; block_y < height_elements; block_y += block_height) {
+		const uint32_t copy_height = std::min(block_height, height_elements - block_y);
+		for (uint32_t block_x = 0; block_x < width_elements; block_x += block_width) {
+			const uint32_t copy_width = std::min(block_width, width_elements - block_x);
+			const uint64_t block_index =
+			    (static_cast<uint64_t>(block_y >> block_height_log2) * blocks_per_row) +
+			    (block_x >> block_width_log2);
+			const uint64_t block_base = block_index * elements_per_block;
+			for (uint32_t local_y = 0; local_y < copy_height; local_y++) {
+				const uint64_t src_row =
+				    (static_cast<uint64_t>(block_y + local_y) * row_elements) + block_x;
+				const uint64_t dst_row = block_base + y_elements[local_y];
+				for (uint32_t local_x = 0; local_x < copy_width; local_x++) {
+					const uint64_t src_index = src_row + local_x;
+					const uint64_t dst_index = dst_row + x_elements[local_x];
+					if (src_index < src_count && dst_index < dst_count) {
+						dst[dst_index] = src[src_index];
+					}
+				}
+			}
+		}
+	}
+}
+
+template <typename T>
 static void DetileStandard4KBVolumeTyped(T* dst, const T* src, uint32_t row_elements,
                                          uint32_t width_elements, uint32_t height_elements,
                                          uint32_t depth_elements, uint32_t padded_width,
@@ -2310,6 +2358,69 @@ void TileConvertTiledToLinearStandard4KB(void* dst, const void* src, uint32_t fo
 			                       row_elements, width_elements, height_elements, padded_width,
 			                       block_width_log2, block_height_log2, dst_size, src_size, src_x,
 			                       src_y);
+			break;
+		default: EXIT("unsupported Standard4KB element size: %u\n", bytes_per_element);
+	}
+}
+
+void TileConvertLinearToTiledStandard4KB(void* dst, const void* src, uint32_t format,
+                                         uint32_t width, uint32_t height, uint32_t pitch,
+                                         uint64_t dst_size, uint64_t src_size) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_IF(dst == nullptr);
+	EXIT_IF(src == nullptr);
+	EXIT_NOT_IMPLEMENTED(pitch == 0);
+	EXIT_NOT_IMPLEMENTED(width > pitch);
+
+	uint32_t bytes_per_element       = 0;
+	uint32_t texels_per_element_wide = 0;
+	uint32_t texels_per_element_tall = 0;
+	uint32_t block_width_log2        = 0;
+	uint32_t block_height_log2       = 0;
+	EXIT_NOT_IMPLEMENTED(!Gen5Standard4KBLayout(format, &bytes_per_element,
+	                                            &texels_per_element_wide, &texels_per_element_tall,
+	                                            &block_width_log2, &block_height_log2));
+
+	const uint32_t row_elements =
+	    std::max((pitch + texels_per_element_wide - 1u) / texels_per_element_wide, 1u);
+	const uint32_t width_elements =
+	    std::max((width + texels_per_element_wide - 1u) / texels_per_element_wide, 1u);
+	const uint32_t height_elements =
+	    std::max((height + texels_per_element_tall - 1u) / texels_per_element_tall, 1u);
+	const uint32_t block_width   = 1u << block_width_log2;
+	const uint32_t block_height  = 1u << block_height_log2;
+	const uint32_t padded_width  = (row_elements + block_width - 1u) & ~(block_width - 1u);
+	const uint32_t padded_height = (height_elements + block_height - 1u) & ~(block_height - 1u);
+	EXIT_IF((padded_width & (block_width - 1u)) != 0);
+	EXIT_IF((padded_height & (block_height - 1u)) != 0);
+	std::memset(dst, 0, static_cast<size_t>(dst_size));
+
+	switch (bytes_per_element) {
+		case 1:
+			TileStandard4KBTyped(static_cast<uint8_t*>(dst), static_cast<const uint8_t*>(src),
+			                       row_elements, width_elements, height_elements, padded_width,
+			                       block_width_log2, block_height_log2, dst_size, src_size);
+			break;
+		case 2:
+			TileStandard4KBTyped(static_cast<uint16_t*>(dst), static_cast<const uint16_t*>(src),
+			                       row_elements, width_elements, height_elements, padded_width,
+			                       block_width_log2, block_height_log2, dst_size, src_size);
+			break;
+		case 4:
+			TileStandard4KBTyped(static_cast<uint32_t*>(dst), static_cast<const uint32_t*>(src),
+			                       row_elements, width_elements, height_elements, padded_width,
+			                       block_width_log2, block_height_log2, dst_size, src_size);
+			break;
+		case 8:
+			TileStandard4KBTyped(static_cast<uint64_t*>(dst), static_cast<const uint64_t*>(src),
+			                       row_elements, width_elements, height_elements, padded_width,
+			                       block_width_log2, block_height_log2, dst_size, src_size);
+			break;
+		case 16:
+			TileStandard4KBTyped(static_cast<Uint128*>(dst), static_cast<const Uint128*>(src),
+			                       row_elements, width_elements, height_elements, padded_width,
+			                       block_width_log2, block_height_log2, dst_size, src_size);
 			break;
 		default: EXIT("unsupported Standard4KB element size: %u\n", bytes_per_element);
 	}

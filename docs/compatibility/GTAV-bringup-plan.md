@@ -32,7 +32,9 @@ Status on 2026-07-17:
 - The next blocker was a write-only `R32_UINT` storage image using `image_store_mip` with a
   descriptor that exposes only mip level zero. Kyty now collapses this safe single-level case to
   the bound Vulkan storage view, while retaining strict rejection for genuine multi-mip storage
-  and read/write non-identity swizzles. A visible M5 retest is pending.
+  and read/write non-identity swizzles. The following resource used the same contract with a
+  Standard4KB tile. Storage upload, binding, and coherent guest readback now support that one-level
+  layout as well. A visible M5 retest is pending.
 - `VideoRecordingP_v1` is still an unresolved called stub. It has not yet been shown to block the
   offline startup path.
 - The host used for this run did not expose an SDL/WASAPI audio endpoint. Kyty continued with its
@@ -57,6 +59,9 @@ Four deterministic compatibility blockers were fixed generically during the firs
 5. `image_store_mip` can be emitted for a storage descriptor that exposes only level zero. Kyty now
    accepts that single-level case, including the console's write-only single-channel BGRA selector,
    without pretending to support per-mip storage views.
+6. One-level Standard4KB storage images now use the existing PS5 detiler on upload and a matching
+   inverse tiler on GPU-to-guest readback. A deterministic `R32_UINT` round trip covers the exact
+   layout class used during Story Mode loading.
 
 Focused virtual-memory, image-alias, shared-tracker-page, and depth-preset regressions cover these
 changes. Raw logs and local paths remain outside the repository.

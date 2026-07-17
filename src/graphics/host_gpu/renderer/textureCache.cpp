@@ -430,6 +430,9 @@ struct TextureCache::ReadbackWorker {
 		const bool tiled_target = target && IsTiledRenderTarget(cached.target);
 		const bool tiled_storage =
 		    storage && info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
+		const bool standard4_storage =
+		    storage && info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB) &&
+		    TileIsStandard4KBTextureSupported(cached.info.format);
 		bool single_layer_storage = false;
 		if (storage) {
 			switch (static_cast<Prospero::ImageType>(cached.info.type)) {
@@ -443,9 +446,10 @@ struct TextureCache::ReadbackWorker {
 		const bool basic_storage =
 		    !storage ||
 		    (single_layer_storage && cached.info.base_level == 0 && cached.info.levels == 1 &&
-		     cached.info.base_array == 0 && (linear || tiled_storage));
+		     cached.info.base_array == 0 && (linear || tiled_storage || standard4_storage));
 		const auto layers = target ? cached.target.layers : 1u;
-		if ((!linear && !tiled_target && !tiled_storage) || !basic_storage || info.levels != 1 ||
+		if ((!linear && !tiled_target && !tiled_storage && !standard4_storage) || !basic_storage ||
+		    info.levels != 1 ||
 		    info.size > UINT32_MAX) {
 			EXIT("TextureCache: unsupported color-image readback layout, addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64 " extent=%ux%u pitch=%u bpe=%u levels=%u tile=%u kind=%u\n",
@@ -468,20 +472,24 @@ struct TextureCache::ReadbackWorker {
 		    MakeLayeredImageBufferCopies(layers, slice_size, info.pitch, info.width, info.height);
 		UtilFillBuffer(cached.ctx, download.data(), info.size, regions, cached.image,
 		               cached.image->layout);
-		if (tiled_target || tiled_storage) {
+		if (tiled_target || tiled_storage || standard4_storage) {
 			guest.resize(info.size);
-			const RenderTargetInfo layout =
-			    target ? cached.target : RenderTargetInfo {info.address,
-			                                               info.size,
-			                                               info.format,
-			                                               info.width,
-			                                               info.height,
-			                                               info.pitch,
-			                                               info.bytes_per_element,
-			                                               info.tile_mode,
-			                                               info.levels,
-			                                               1};
-			cache.m_tiler.TileImage(guest.data(), download.data(), layout);
+			if (standard4_storage) {
+				cache.m_tiler.TileImage(guest.data(), download.data(), cached.info);
+			} else {
+				const RenderTargetInfo layout =
+				    target ? cached.target : RenderTargetInfo {info.address,
+				                                               info.size,
+				                                               info.format,
+				                                               info.width,
+				                                               info.height,
+				                                               info.pitch,
+				                                               info.bytes_per_element,
+				                                               info.tile_mode,
+				                                               info.levels,
+				                                               1};
+				cache.m_tiler.TileImage(guest.data(), download.data(), layout);
+			}
 			Libs::LibKernel::Memory::WriteBacking(info.address, guest.data(), info.size);
 		} else {
 			Libs::LibKernel::Memory::WriteBacking(info.address, download.data(), info.size);
@@ -2077,13 +2085,16 @@ StorageTextureVulkanImage* TextureCache::FindStorageTexture(CommandBuffer*   com
 	const bool supported_depth_tile =
 	    info.tile == Prospero::GpuEnumValue(Prospero::TileMode::kDepth) &&
 	    IsSupportedStorageDepthTile(info.format, info.type, info.width, info.height, info.depth);
+	const bool supported_standard4 =
+	    info.tile == Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB) &&
+	    TileIsStandard4KBTextureSupported(info.format);
 	if (command == nullptr || ctx == nullptr || info.address == 0 || info.size == 0 ||
 	    info.address >= TRACKER_ADDRESS_SIZE || info.size > TRACKER_ADDRESS_SIZE - info.address ||
 	    info.width == 0 || info.height == 0 || info.depth == 0 || info.levels != 1 ||
 	    info.base_level != 0 || info.view_levels != 1 || info.base_array != 0 || !supported_type ||
 	    (info.tile != Prospero::GpuEnumValue(Prospero::TileMode::kLinear) &&
 	     info.tile != Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) &&
-	     !supported_depth_tile) ||
+	     !supported_standard4 && !supported_depth_tile) ||
 	    !IsSupportedStorageSwizzle(info.format, info.swizzle)) {
 		EXIT("TextureCache: unsupported storage-image request, command=%p ctx=%p "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64

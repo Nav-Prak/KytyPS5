@@ -67,6 +67,9 @@ void TileConvertTiledToLinearStandard4KB(void* dst, const void* src, uint32_t fo
                                          uint32_t width, uint32_t height, uint32_t pitch,
                                          uint64_t dst_size, uint64_t src_size, uint32_t src_x = 0,
                                          uint32_t src_y = 0);
+void TileConvertLinearToTiledStandard4KB(void* dst, const void* src, uint32_t format,
+                                         uint32_t width, uint32_t height, uint32_t pitch,
+                                         uint64_t dst_size, uint64_t src_size);
 void TileConvertTiledToLinearStandard256B(void* dst, const void* src, uint32_t format,
                                           uint32_t width, uint32_t height, uint32_t pitch,
                                           uint64_t dst_size, uint64_t src_size);

@@ -145,6 +145,20 @@ void Tiler::DetileStencil(GraphicContext* ctx, DepthStencilVulkanImage* image,
 	              VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
 }
 
+void Tiler::TileImage(void* dst, const void* src, const ImageInfo& info) const {
+	if (info.tile != Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB) ||
+	    !TileIsStandard4KBTextureSupported(info.format) || info.levels != 1 || info.depth != 1 ||
+	    info.base_level != 0 || info.base_array != 0) {
+		EXIT("Tiler: unsupported storage-image tile, dst=%p src=%p "
+		     "addr=0x%016" PRIx64 "+0x%016" PRIx64
+		     " extent=%ux%ux%u pitch=%u levels=%u tile=%u format=%u\n",
+		     dst, src, info.address, info.size, info.width, info.height, info.depth, info.pitch,
+		     info.levels, info.tile, info.format);
+	}
+	TileConvertLinearToTiledStandard4KB(dst, src, info.format, info.width, info.height, info.pitch,
+	                                    info.size, info.size);
+}
+
 void Tiler::TileImage(void* dst, const void* src, const RenderTargetInfo& info) const {
 	const bool standard64 = IsSupportedStandard64RenderTarget(info);
 	if ((info.tile_mode != Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) &&

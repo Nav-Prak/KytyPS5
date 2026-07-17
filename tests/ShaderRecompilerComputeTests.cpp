@@ -9518,9 +9518,13 @@ ShaderRecompiler::IR::ImageResource BasicDynamicMipUintStorageTextureResource() 
 ShaderTextureResource BasicDynamicMipUintStorageTextureDescriptor() {
   auto descriptor = BasicLinearStorageTextureDescriptor();
   descriptor.fields[1] =
-      (descriptor.fields[1] & ~0x1ff00000u) |
-      (Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) << 20u);
-  descriptor.fields[3] = (descriptor.fields[3] & ~0xfffu) | DstSel(6, 5, 4, 7);
+      (descriptor.fields[1] & ~(0x1ff00000u | 0xc0000000u)) |
+      (Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) << 20u) | (3u << 30u);
+  descriptor.fields[2] = 15u | (63u << 14u);
+  descriptor.fields[3] =
+      (descriptor.fields[3] & ~((0x1fu << 20u) | 0xfffu)) |
+      (Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB) << 20u) |
+      DstSel(6, 5, 4, 7);
   return descriptor;
 }
 
@@ -9562,7 +9566,7 @@ ShaderTextureResource BasicDynamicMipUintStorageTextureDescriptor() {
   } else if (std::strcmp(kind, "tile") == 0) {
     descriptor.fields[3] =
         (descriptor.fields[3] & ~(0x1fu << 20u)) |
-        (Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB) << 20u);
+        (Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB) << 20u);
   } else if (std::strcmp(kind, "mip") == 0) {
     descriptor.fields[3] |= 1u << 16u;
   } else if (std::strcmp(kind, "dynamic-mip-levels") == 0) {
@@ -9616,14 +9620,16 @@ void CheckBasicStorageTextureDescriptor() {
 
   const auto dynamic_mip = BasicDynamicMipUintStorageTextureDescriptor();
   Require("BasicStorageTexture", "dynamic-mip uint descriptor",
-          dynamic_mip.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) &&
+          dynamic_mip.Width5() + 1u == 64 && dynamic_mip.Height5() + 1u == 64 &&
+              dynamic_mip.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) &&
               dynamic_mip.Format() == Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) &&
-              dynamic_mip.TileMode() == Prospero::GpuEnumValue(Prospero::TileMode::kLinear) &&
+              dynamic_mip.TileMode() ==
+                  Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB) &&
               dynamic_mip.DstSelXYZW() == DstSel(6, 5, 4, 7) &&
               dynamic_mip.BaseLevel() == 0 && dynamic_mip.LastLevel() == 0 &&
               dynamic_mip.MaxMip() == 0,
           "single-level dynamic-mip uint storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicDynamicMipUintStorageTextureResource(), dynamic_mip, 0x10000);
+  ValidateStorageTexture(BasicDynamicMipUintStorageTextureResource(), dynamic_mip, 0x4000);
 
   const auto linear = BasicLinearStorageTextureDescriptor();
   Require("BasicStorageTexture", "linear descriptor",
@@ -9871,6 +9877,42 @@ void CheckStorageTextureLinearReadbackLayout() {
               transfer.tile_mode == info.tile && linear_size == info.size,
           "normalized storage readback lost the exact PS5 linear image layout");
   std::printf("[host]    %-32s ok\n", "StorageTextureLinearReadback");
+}
+
+void CheckStorageTextureStandard4KBReadbackLayout() {
+  ImageInfo info{};
+  info.address = 0x200000;
+  info.format = Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt);
+  info.width = 64;
+  info.height = 64;
+  info.pitch = TileGetTexturePitch(info.format, info.width, 1,
+                                   Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB));
+  info.levels = 1;
+  info.view_levels = 1;
+  info.tile = Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB);
+  info.swizzle = DstSel(6, 5, 4, 7);
+  info.depth = 1;
+  info.type = Prospero::GpuEnumValue(Prospero::ImageType::kColor2D);
+  TileSizeAlign size{};
+  TileGetTextureTotalSize(info.format, info.width, info.height, info.depth, info.pitch,
+                          info.levels, info.tile, false, &size);
+  info.size = size.size;
+
+  std::vector<uint32_t> linear(info.size / sizeof(uint32_t));
+  for (uint32_t i = 0; i < linear.size(); i++) {
+    linear[i] = 0x9e3779b9u * (i + 1u);
+  }
+  std::vector<uint32_t> tiled(linear.size(), 0);
+  std::vector<uint32_t> roundtrip(linear.size(), 0);
+  Tiler tiler;
+  tiler.TileImage(tiled.data(), linear.data(), info);
+  TileConvertTiledToLinearStandard4KB(
+      roundtrip.data(), tiled.data(), info.format, info.width, info.height, info.pitch,
+      info.size, info.size);
+  Require("StorageTextureStandard4KBReadback", "round trip",
+          info.pitch == 64 && info.size == 0x4000 && roundtrip == linear,
+          "R32_UINT Standard4KB storage readback did not preserve guest layout");
+  std::printf("[host]    %-32s ok\n", "StorageTextureStandard4KBReadback");
 }
 
 void CheckStorageImageSwizzleSpecializationId() {
@@ -12607,6 +12649,7 @@ int main(int argc, char **argv) {
   CheckStorageTextureLinearUploadLayout();
   CheckStorageTextureDepthTileUploadLayout();
   CheckStorageTextureLinearReadbackLayout();
+  CheckStorageTextureStandard4KBReadbackLayout();
   CheckStorageImageSwizzleSpecializationId();
   CheckColorResolveLayers();
   CheckStandard64RenderTargetTileRoundTrip();

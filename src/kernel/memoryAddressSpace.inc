@@ -358,17 +358,22 @@ public:
 
 		const bool exact_unmap = (vaddr == old.vaddr && size == old.size);
 		if (exact_unmap) {
-			const bool unmapped =
-			    preserve_placeholder
-			        ? UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)
-			        : UnmapView(reinterpret_cast<void*>(old.vaddr), old.size);
+			bool placeholder_kept = false;
+			bool unmapped          = false;
+			if (preserve_placeholder) {
+				unmapped = UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size);
+				placeholder_kept = unmapped;
+			}
+			if (!unmapped) {
+				unmapped = UnmapView(reinterpret_cast<void*>(old.vaddr), old.size);
+			}
 			if (!unmapped) {
 				std::lock_guard lock(m_mutex);
 				m_maps.emplace(old.vaddr, old);
 				return false;
 			}
-			if (preserve_placeholder && placeholder_preserved != nullptr) {
-				*placeholder_preserved = true;
+			if (placeholder_preserved != nullptr) {
+				*placeholder_preserved = placeholder_kept;
 			}
 			return true;
 		}

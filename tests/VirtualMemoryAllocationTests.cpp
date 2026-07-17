@@ -821,37 +821,105 @@ void TestFixedReserveReplacesPartialDirectMapping() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-void TestBatchMapAllocatesNullDirectAddress() {
-	const char* test = "BatchMapAllocatesNullDirectAddress";
+void TestFixedDirectReplacesDirectPrefix() {
+	const char*        test                   = "FixedDirectReplacesDirectPrefix";
+	constexpr uint64_t initial_part_size       = SceKernelPageSize * 4;
+	constexpr uint64_t initial_size            = initial_part_size * 2;
+	constexpr uint64_t replacement_size        = SceKernelPageSize * 4;
+	constexpr uint64_t replacement_phys_offset = 0x80000;
+	constexpr uint64_t physical_size            = replacement_phys_offset + replacement_size;
 
 	int64_t phys_addr = 0;
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
 	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
-	            SceKernelPageSize, SceKernelPageSize, SceKernelMtypeC, &phys_addr),
+	            physical_size, SceKernelPageSize, SceKernelMtypeC, &phys_addr),
 	        "KernelAllocateDirectMemory");
 
+	Libs::LibKernel::Memory::TestUseLegacyHostAllocationForNextFlexibleMap();
+	void* reserve = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &reserve, initial_size, SceKernelProtCpuRw, 0, "direct_replace_container"),
+	        "KernelMapNamedFlexibleMemory(container)");
+	const auto base = reinterpret_cast<uint64_t>(reserve);
+
+	void* initial = reserve;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &initial, initial_size, 0, SceKernelMapFixed | SceKernelMapNoCoalesce,
+	            phys_addr, SceKernelPageSize, "direct_replace_initial"),
+	        "KernelMapNamedDirectMemory(initial)");
+
+	Libs::LibKernel::Memory::KernelBatchMapEntry replacement {};
+	replacement.start      = reserve;
+	replacement.offset     = static_cast<uint64_t>(phys_addr) + replacement_phys_offset;
+	replacement.length     = replacement_size;
+	replacement.protection = SceKernelProtCpuRw;
+	replacement.operation  = 0;
+	int processed          = -1;
+	CheckOk(test, Libs::LibKernel::Memory::KernelBatchMap(&replacement, 1, &processed),
+	        "KernelBatchMap(replacement)");
+	Check(test, processed == 1, "batch replacement did not report the mapped entry");
+	Check(test, reinterpret_cast<uint64_t>(replacement.start) == base,
+	      "fixed direct replacement moved");
+	ExpectRange(test, Query(test, base), base, base + replacement_size,
+	            static_cast<int>(replacement.protection), 0, 1, 0, 1, "anon",
+	            static_cast<uint64_t>(phys_addr) + replacement_phys_offset);
+	ExpectRange(test, Query(test, base + replacement_size), base + replacement_size,
+	            base + initial_size, 0, 0, 1, 0, 1, "direct_replace_initial",
+	            static_cast<uint64_t>(phys_addr) + replacement_size);
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, replacement_size),
+	        "KernelMunmap(replacement)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(base + replacement_size,
+	                                              initial_size - replacement_size),
+	        "KernelMunmap(initial remainder)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, physical_size),
+	        "KernelReleaseDirectMemory");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestFixedDirectRecoversStalePlaceholderTracking() {
+	const char*        test        = "FixedDirectRecoversStalePlaceholderTracking";
+	constexpr uint64_t size        = SceKernelPageSize * 4;
+	constexpr uint64_t replacement = 0x80000;
+	constexpr uint64_t phys_size   = replacement + size;
+
+	int64_t phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+	            phys_size, SceKernelPageSize, SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+
+	const auto base =
+	    Libs::LibKernel::Memory::TestCreateOrdinaryReservedRangeWithStalePlaceholder(size);
+	Check(test, base != 0, "failed to create the stale ordinary reservation");
+	Check(test, Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(base, size),
+	      "test setup did not create stale placeholder tracking");
+
 	Libs::LibKernel::Memory::KernelBatchMapEntry entry {};
-	entry.start      = nullptr;
-	entry.offset     = static_cast<uint64_t>(phys_addr);
-	entry.length     = SceKernelPageSize;
+	entry.start      = reinterpret_cast<void*>(base);
+	entry.offset     = static_cast<uint64_t>(phys_addr) + replacement;
+	entry.length     = size;
 	entry.protection = SceKernelProtCpuRw;
 	entry.operation  = 0;
-
-	int processed = -1;
+	int processed    = -1;
 	CheckOk(test, Libs::LibKernel::Memory::KernelBatchMap(&entry, 1, &processed),
 	        "KernelBatchMap");
-	Check(test, processed == 1, "batch map did not report the mapped entry");
-	Check(test, entry.start != nullptr, "batch map left a null allocation address");
+	Check(test, processed == 1, "batch map did not report the replacement");
+	Check(test, reinterpret_cast<uint64_t>(entry.start) == base, "fixed replacement moved");
+	Check(test, !Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(base, size),
+	      "stale placeholder tracking survived replacement");
+	ExpectRange(test, Query(test, base), base, base + size,
+	            static_cast<int>(entry.protection), 0, 1, 0, 1, "anon",
+	            static_cast<uint64_t>(phys_addr) + replacement);
 
-	const auto base = reinterpret_cast<uint64_t>(entry.start);
-	ExpectRange(test, Query(test, base), base, base + SceKernelPageSize, SceKernelProtCpuRw, 0, 1,
-	            0, 1, "anon", static_cast<uint64_t>(phys_addr));
-
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize),
-	        "KernelMunmap");
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, SceKernelPageSize),
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, size), "KernelMunmap");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, phys_size),
 	        "KernelReleaseDirectMemory");
 
 	std::printf("[host]    %-48s ok\n", test);
@@ -1650,7 +1718,8 @@ int main() {
 	RunTest(TestReleasedReserveCanBeReused);
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
-	RunTest(TestBatchMapAllocatesNullDirectAddress);
+	RunTest(TestFixedDirectReplacesDirectPrefix);
+	RunTest(TestFixedDirectRecoversStalePlaceholderTracking);
 	RunTest(TestNonzeroDirectOffsetAliasesSharedBacking);
 	RunTest(TestDirectPhysicalFreeRangeReuseAndCoalescing);
 	RunTest(TestDirectAlignmentStaysWithinSearchRange);

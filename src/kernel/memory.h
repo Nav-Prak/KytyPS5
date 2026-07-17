@@ -166,6 +166,7 @@ void TestFailHostReservationAfter(uint32_t successful_pages);
 void TestUseLegacyHostAllocationForNextFlexibleMap();
 void TestFailNextFixedReserveRangeRegistration();
 uint64_t TestCreateUntrackedPlaceholderAllocation(uint64_t size);
+uint64_t TestCreateOrdinaryReservedRangeWithStalePlaceholder(uint64_t size);
 bool TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
 #endif
 

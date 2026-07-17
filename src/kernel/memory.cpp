@@ -2715,19 +2715,35 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 
 	auto                 in_addr                 = reinterpret_cast<uint64_t>(*addr);
 	uint64_t             out_addr                = 0;
+	VirtualRanges::Range initial_fixed_range {};
+	const bool initial_fixed_range_found = fixed && g_virtual_ranges->Query(in_addr, 0,
+	                                                                       &initial_fixed_range);
+	const bool initial_fixed_shared = initial_fixed_range_found &&
+	                                  g_direct_memory_backing->Contains(in_addr, len);
 	bool                 committed_from_reserved = false;
 	bool                 shared_backing          = false;
 	bool                 consumed_reserved       = false;
+	bool                 map_shared_attempted     = false;
+	bool                 map_shared_placeholder   = false;
 	VirtualRanges::Range consumed_range {};
 	auto                 shared_failure = DirectMemoryBacking::FailureReason::None;
 	// Direct mappings must remain views of the single backing object. Anonymous fallbacks break
 	// aliasing and lose direct-memory contents when a range is unmapped and mapped again.
 	auto map_shared_fixed = [&](uint64_t target_addr) -> bool {
 		const bool placeholder_ready = g_placeholder_address_space->Consume(target_addr, len);
+		map_shared_attempted          = true;
+		map_shared_placeholder        = placeholder_ready;
 		if (placeholder_ready) {
 			if (g_direct_memory_backing->MapExistingPlaceholderFixed(
 			        target_addr, len, direct_memory_start, mode, &shared_failure)) {
 				return true;
+			}
+			// An ordinary reserved range can overlap stale placeholder bookkeeping. The
+			// authoritative virtual-range metadata says that Windows must release the ordinary
+			// reservation before installing the file view, rather than replacing a placeholder.
+			if (consumed_reserved && !consumed_range.placeholder_backed) {
+				return g_direct_memory_backing->MapFixed(target_addr, len, direct_memory_start, mode,
+				                                         &shared_failure);
 			}
 			g_placeholder_address_space->AddFree(target_addr, len);
 			return false;
@@ -2861,6 +2877,29 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 	     Common::EnumName(gpu_mode).c_str(), shared_backing ? "yes" : "no", shared_reason);
 
 	if (out_addr == 0) {
+		std::fprintf(stderr,
+		             "KernelMapDirectMemory host map failed: hint=0x%016" PRIx64
+		             " offset=0x%016" PRIx64 " length=0x%016" PRIx64
+		             " alignment=0x%016" PRIx64 " flags=0x%08" PRIx32 " reason=%s\n",
+		             in_addr, static_cast<uint64_t>(direct_memory_start), static_cast<uint64_t>(len),
+		             static_cast<uint64_t>(alignment), static_cast<uint32_t>(flags), shared_reason);
+		std::fflush(stderr);
+		std::fprintf(stderr,
+		             "KernelMapDirectMemory fixed trace: initial_found=%d initial_start=0x%016" PRIx64
+		             " initial_size=0x%016" PRIx64 " initial_offset=0x%016" PRIx64
+		             " initial_type=%s initial_reserved=%d initial_placeholder=%d"
+		             " initial_shared=%d consumed_reserved=%d map_attempted=%d"
+		             " map_placeholder=%d current_shared=%d\n",
+		             initial_fixed_range_found ? 1 : 0, initial_fixed_range.start,
+		             initial_fixed_range.size, initial_fixed_range.offset,
+		             initial_fixed_range_found ? Common::EnumName(initial_fixed_range.type).c_str()
+		                                       : "None",
+		             initial_fixed_range.committed_from_reserved ? 1 : 0,
+		             initial_fixed_range.placeholder_backed ? 1 : 0, initial_fixed_shared ? 1 : 0,
+		             consumed_reserved ? 1 : 0, map_shared_attempted ? 1 : 0,
+		             map_shared_placeholder ? 1 : 0,
+		             g_direct_memory_backing->Contains(in_addr, len) ? 1 : 0);
+		std::fflush(stderr);
 		VirtualRanges::Range original_fixed_range {};
 		if (fixed && g_virtual_ranges->Query(in_addr, 0, &original_fixed_range)) {
 			LOGF("\t original_start       = 0x%016" PRIx64 "\n"
@@ -3420,6 +3459,20 @@ uint64_t TestCreateUntrackedPlaceholderAllocation(uint64_t size) {
 	return vaddr;
 }
 
+uint64_t TestCreateOrdinaryReservedRangeWithStalePlaceholder(uint64_t size) {
+	const auto vaddr = VirtualMemory::ReserveAligned(0, size, 0x10000);
+	if (vaddr == 0 ||
+	    !g_virtual_ranges->Add(vaddr, size, 0, 0, 0, VirtualRangeType::Reserved, "test", false,
+	                           false)) {
+		if (vaddr != 0) {
+			VirtualMemory::Free(vaddr);
+		}
+		return 0;
+	}
+	g_placeholder_address_space->AddFree(vaddr, size);
+	return vaddr;
+}
+
 bool TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size) {
 	return g_placeholder_address_space->TestContainsFree(vaddr, size);
 }
@@ -3716,8 +3769,6 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 		MAP_OP_MAP_FLEXIBLE = 3,
 		MAP_OP_TYPE_PROTECT = 4,
 	};
-	constexpr int MAP_FIXED = 0x10;
-
 	if (entries == nullptr || num_entries < 0) {
 		return KERNEL_ERROR_EINVAL;
 	}
@@ -3726,6 +3777,7 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 
 	for (int i = 0; i < num_entries; i++, processed++) {
 		auto* entry = &entries[i];
+		const auto input_start = entry->start;
 
 		LOGF("\t [%d] start = %p, offset = 0x%016" PRIx64 ", length = 0x%016" PRIx64
 		     ", prot = 0x%02" PRIx32 ", type = 0x%02" PRIx32 ", op = %d\n",
@@ -3739,13 +3791,10 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 		}
 
 		int result = OK;
-		// A null map address is an allocation request even when sceKernelBatchMap supplies
-		// MAP_FIXED for the batch. Preserve fixed placement for every explicit address.
-		const int map_flags = (entry->start == nullptr ? flags & ~MAP_FIXED : flags);
 		switch (entry->operation) {
 			case MAP_OP_MAP_DIRECT:
 				result = KernelMapNamedDirectMemory(&entry->start, entry->length, entry->protection,
-				                                    map_flags, static_cast<int64_t>(entry->offset), 0,
+				                                    flags, static_cast<int64_t>(entry->offset), 0,
 				                                    "anon");
 				break;
 			case MAP_OP_UNMAP:
@@ -3756,7 +3805,7 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 				break;
 			case MAP_OP_MAP_FLEXIBLE:
 				result = KernelMapNamedFlexibleMemory(&entry->start, entry->length,
-				                                      entry->protection, map_flags, "anon");
+				                                      entry->protection, flags, "anon");
 				break;
 			case MAP_OP_TYPE_PROTECT:
 				result =
@@ -3769,10 +3818,12 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 			std::fprintf(stderr,
 			             "KernelBatchMap2 failed: result=0x%08" PRIx32
 			             " index=%d processed=%d count=%d flags=0x%08" PRIx32
-			             " start=%p offset=0x%016" PRIx64 " length=0x%016" PRIx64
+			             " input_start=%p output_start=%p offset=0x%016" PRIx64
+			             " length=0x%016" PRIx64
 			             " protection=0x%02" PRIx32 " type=0x%02" PRIx32 " operation=%d\n",
 			             static_cast<uint32_t>(result), i, processed, num_entries,
-			             static_cast<uint32_t>(flags), entry->start, entry->offset, entry->length,
+			             static_cast<uint32_t>(flags), input_start, entry->start, entry->offset,
+			             entry->length,
 			             static_cast<uint32_t>(static_cast<unsigned char>(entry->protection)),
 			             static_cast<uint32_t>(static_cast<unsigned char>(entry->type)),
 			             entry->operation);

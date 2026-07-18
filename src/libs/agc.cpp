@@ -6,10 +6,10 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/virtualMemory.h"
+#include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
-#include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/objects/label.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -575,8 +575,12 @@ static bool get_shader_program_address_register(uint8_t type, uint32_t* lo_offse
 		case Prospero::ShaderBinaryType::kPs: *lo_offset = Pm4::SPI_SHADER_PGM_LO_PS; return true;
 		case Prospero::ShaderBinaryType::kGs: *lo_offset = Pm4::SPI_SHADER_PGM_LO_ES; return true;
 		case Prospero::ShaderBinaryType::kHs: *lo_offset = Pm4::SPI_SHADER_PGM_LO_LS; return true;
-		case Prospero::ShaderBinaryType::kGsBack: *lo_offset = Pm4::SPI_SHADER_PGM_LO_GS; return true;
-		case Prospero::ShaderBinaryType::kHsBack: *lo_offset = Pm4::SPI_SHADER_PGM_LO_HS; return true;
+		case Prospero::ShaderBinaryType::kGsBack:
+			*lo_offset = Pm4::SPI_SHADER_PGM_LO_GS;
+			return true;
+		case Prospero::ShaderBinaryType::kHsBack:
+			*lo_offset = Pm4::SPI_SHADER_PGM_LO_HS;
+			return true;
 		case Prospero::ShaderBinaryType::kGsFront:
 		case Prospero::ShaderBinaryType::kHsFront:
 		case Prospero::ShaderBinaryType::kFs: return false;
@@ -1016,12 +1020,14 @@ int KYTY_SYSV_ABI GraphicsSetUcRegIndirectPatchAddRegisters(uint32_t* cmd, uint3
 
 static uint32_t GraphicsPrimitiveTypeToGsOut(uint32_t prim_type) {
 	switch (static_cast<Prospero::PrimitiveType>(prim_type)) {
-		case Prospero::PrimitiveType::kPointList: return Prospero::GpuEnumValue(Prospero::GsOutputPrimitiveType::kPoints);
+		case Prospero::PrimitiveType::kPointList:
+			return Prospero::GpuEnumValue(Prospero::GsOutputPrimitiveType::kPoints);
 		case Prospero::PrimitiveType::kLineList:
 		case Prospero::PrimitiveType::kLineStrip:
 		case Prospero::PrimitiveType::kLineListAdjacency:
 		case Prospero::PrimitiveType::kLineStripAdjacency:
-		case Prospero::PrimitiveType::kLineLoop: return Prospero::GpuEnumValue(Prospero::GsOutputPrimitiveType::kLines);
+		case Prospero::PrimitiveType::kLineLoop:
+			return Prospero::GpuEnumValue(Prospero::GsOutputPrimitiveType::kLines);
 		case Prospero::PrimitiveType::kRectList:
 			return Prospero::GpuEnumValue(Prospero::GsOutputPrimitiveType::k2dRectangle);
 		case Prospero::PrimitiveType::kRectListLegacy:
@@ -1048,9 +1054,10 @@ int KYTY_SYSV_ABI GraphicsCreatePrimState(ShaderRegister* cx_regs, ShaderRegiste
 
 	EXIT_NOT_IMPLEMENTED(gs == nullptr);
 
-	EXIT_NOT_IMPLEMENTED(hs != nullptr &&
-	                     static_cast<Prospero::ShaderBinaryType>(hs->type) != Prospero::ShaderBinaryType::kHs);
-	EXIT_NOT_IMPLEMENTED(static_cast<Prospero::ShaderBinaryType>(gs->type) != Prospero::ShaderBinaryType::kGs);
+	EXIT_NOT_IMPLEMENTED(hs != nullptr && static_cast<Prospero::ShaderBinaryType>(hs->type) !=
+	                                          Prospero::ShaderBinaryType::kHs);
+	EXIT_NOT_IMPLEMENTED(static_cast<Prospero::ShaderBinaryType>(gs->type) !=
+	                     Prospero::ShaderBinaryType::kGs);
 
 	if (cx_regs != nullptr) {
 		EXIT_NOT_IMPLEMENTED(hs != nullptr && hs->specials->vgt_shader_stages_en.offset !=
@@ -3693,7 +3700,143 @@ static bool dcb_has_queued_interrupt(const uint32_t* dcb, uint32_t size_in_dword
 	return false;
 }
 
+static void log_submission_sync_packets(const char* kind, uint32_t queue, const uint32_t* commands,
+                                        uint32_t size_in_dwords) {
+	if (commands == nullptr || size_in_dwords == 0 ||
+	    Config::GetPrintfDirection() == Config::OutputDirection::Silent) {
+		return;
+	}
+
+	for (uint32_t offset = 0; offset < size_in_dwords;) {
+		auto cmd_id = commands[offset];
+		if (cmd_id == 0x80000000u) {
+			offset++;
+			continue;
+		}
+
+		auto len = KYTY_PM4_LEN(cmd_id);
+		if (len == 0 || len > size_in_dwords - offset) {
+			LOGF("\t %s sync scan stopped: queue=0x%08" PRIx32 ", offset=0x%08" PRIx32
+			     ", cmd=0x%08" PRIx32 ", remaining=0x%08" PRIx32 "\n",
+			     kind, queue, offset, cmd_id, size_in_dwords - offset);
+			return;
+		}
+
+		auto op = (cmd_id >> 8u) & 0xffu;
+		if (op == Pm4::IT_NOP && KYTY_PM4_R(cmd_id) == Pm4::R_WAIT_MEM_32 && len >= 7) {
+			auto address = static_cast<uint64_t>(commands[offset + 1]) |
+			               (static_cast<uint64_t>(commands[offset + 2]) << 32u);
+			LOGF("\t %s wait32: queue=0x%08" PRIx32 ", offset=0x%08" PRIx32
+			     ", address=0x%016" PRIx64 ", reference=0x%08" PRIx32 ", mask=0x%08" PRIx32
+			     ", control=0x%08" PRIx32 "\n",
+			     kind, queue, offset, address, commands[offset + 4], commands[offset + 3],
+			     commands[offset + 5]);
+		} else if (op == Pm4::IT_NOP && KYTY_PM4_R(cmd_id) == Pm4::R_RELEASE_MEM && len >= 7) {
+			auto address = static_cast<uint64_t>(commands[offset + 3]) |
+			               (static_cast<uint64_t>(commands[offset + 4]) << 32u);
+			auto value   = static_cast<uint64_t>(commands[offset + 5]) |
+			               (static_cast<uint64_t>(commands[offset + 6]) << 32u);
+			LOGF("\t %s release: queue=0x%08" PRIx32 ", offset=0x%08" PRIx32
+			     ", address=0x%016" PRIx64 ", value=0x%016" PRIx64 ", control=0x%08" PRIx32 "\n",
+			     kind, queue, offset, address, value, commands[offset + 2]);
+		}
+
+		offset += len;
+	}
+}
+
+struct AcbGraphicsDependency {
+	volatile uint32_t* address   = nullptr;
+	uint32_t           reference = 0;
+};
+
+static AcbGraphicsDependency get_acb_graphics_dependency(const uint32_t* acb,
+                                                         uint32_t        size_in_dwords) {
+	AcbGraphicsDependency dependency {};
+	if (acb == nullptr || size_in_dwords < 7) {
+		return dependency;
+	}
+
+	const auto wait_cmd = acb[0];
+	const auto wait_len = KYTY_PM4_LEN(wait_cmd);
+	const auto wait_op  = (wait_cmd >> 8u) & 0xffu;
+	if (wait_op != Pm4::IT_NOP || KYTY_PM4_R(wait_cmd) != Pm4::R_WAIT_MEM_32 || wait_len != 7 ||
+	    acb[3] != UINT32_MAX || (acb[5] & 0x7u) != 5u || (acb[5] & 0x10u) == 0u ||
+	    ((acb[5] >> 8u) & 0x3u) != 0u || ((acb[5] >> 4u) & 0xcu) != 0u) {
+		return dependency;
+	}
+
+	const auto wait_address =
+	    static_cast<uint64_t>(acb[1]) | (static_cast<uint64_t>(acb[2]) << 32u);
+	const auto wait_reference = acb[4];
+	if (wait_address == 0 || wait_reference == 0) {
+		return dependency;
+	}
+
+	// AGC compute submissions use a leading graphics-to-compute timeline wait and finish by
+	// releasing the same generation to a compute-to-graphics label. The native driver wires the
+	// leading dependency into the graphics queue. Kyty receives only the finished ACB, so recognize
+	// the paired-label shape before creating the missing graphics-side release.
+	bool has_paired_release = false;
+	for (uint32_t offset = wait_len; offset < size_in_dwords;) {
+		const auto cmd = acb[offset];
+		if (cmd == 0x80000000u) {
+			offset++;
+			continue;
+		}
+
+		const auto len = KYTY_PM4_LEN(cmd);
+		if (len == 0 || len > size_in_dwords - offset) {
+			break;
+		}
+
+		const auto op = (cmd >> 8u) & 0xffu;
+		if (op == Pm4::IT_NOP && KYTY_PM4_R(cmd) == Pm4::R_RELEASE_MEM && len >= 8) {
+			const auto release_address = static_cast<uint64_t>(acb[offset + 3]) |
+			                             (static_cast<uint64_t>(acb[offset + 4]) << 32u);
+			const auto data_sel        = (acb[offset + 2] >> 29u) & 0x7u;
+			if (release_address != 0 && release_address != wait_address && data_sel == 1u &&
+			    acb[offset + 5] == wait_reference && acb[offset + 6] == 0) {
+				has_paired_release = true;
+				break;
+			}
+		}
+
+		offset += len;
+	}
+
+	if (has_paired_release) {
+		dependency.address   = reinterpret_cast<volatile uint32_t*>(wait_address);
+		dependency.reference = wait_reference;
+	}
+	return dependency;
+}
+
+static void submit_acb_graphics_dependency(const uint32_t* acb, uint32_t size_in_dwords) {
+	const auto dependency = get_acb_graphics_dependency(acb, size_in_dwords);
+	if (dependency.address == nullptr || *dependency.address >= dependency.reference) {
+		return;
+	}
+
+	const auto address = reinterpret_cast<uint64_t>(dependency.address);
+	uint32_t   release[8] {};
+	release[0] = KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_RELEASE_MEM);
+	release[1] = 0x2fu | (6u << 8u);
+	release[2] = 1u << 29u;
+	release[3] = static_cast<uint32_t>(address & 0xfffffffcu);
+	release[4] = static_cast<uint32_t>(address >> 32u);
+	release[5] = dependency.reference;
+
+	LOGF("\t bridging ACB graphics dependency: address=0x%016" PRIx64 ", value=0x%08" PRIx32 "\n",
+	     address, dependency.reference);
+
+	// Queue the release after all graphics work already submitted, then let the compute queue's
+	// original WAIT_REG_MEM preserve the cross-engine ordering.
+	GraphicsRunSubmit(release, 8, nullptr, 0, false);
+}
+
 static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
+	log_submission_sync_packets("DCB", 0, dcb, size_in_dwords);
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
 	GraphicsRunSubmit(dcb, size_in_dwords, nullptr, 0,
 	                  !dcb_has_queued_interrupt(dcb, size_in_dwords));
@@ -3955,8 +4098,10 @@ static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
 	for (uint32_t i = 0; i < std::min<uint32_t>(size_in_dwords, 8); i++) {
 		LOGF("\t acb[%u] = 0x%08" PRIx32 "\n", i, acb[i]);
 	}
+	log_submission_sync_packets("ACB", queue, acb, size_in_dwords);
 
 	flush_pending_graphics_segment_before_acb(acb, size_in_dwords);
+	submit_acb_graphics_dependency(acb, size_in_dwords);
 
 	GraphicsDbgDumpDcb("a", size_in_dwords, acb);
 

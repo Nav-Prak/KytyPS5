@@ -74,6 +74,37 @@ bool IsAddress(const Instruction& inst) {
 	       inst.memory.kind == ResourceKind::Global || inst.memory.kind == ResourceKind::Scratch;
 }
 
+std::string OperandDiagnostic(const Operand& operand) {
+	if (operand.kind == OperandKind::ImmediateU32) {
+		return fmt::format("0x{:08x}", operand.imm);
+	}
+	if (operand.kind == OperandKind::PcRelativeU32) {
+		return fmt::format("pc+0x{:08x}", operand.imm);
+	}
+	if (operand.kind != OperandKind::Register) {
+		return "null";
+	}
+	const char* file = "?";
+	switch (operand.reg.file) {
+		case RegisterFile::Scalar: file = "s"; break;
+		case RegisterFile::Vector: file = "v"; break;
+		case RegisterFile::Vcc: file = "vcc"; break;
+		case RegisterFile::Exec: file = "exec"; break;
+		case RegisterFile::Scc: file = "scc"; break;
+		case RegisterFile::M0: file = "m0"; break;
+	}
+	return fmt::format("{}{}", file, operand.reg.index);
+}
+
+std::string InstructionDiagnostic(const Instruction& inst) {
+	std::string text = fmt::format("0x{:08x}: op={} dst={}", inst.pc,
+	                               static_cast<uint32_t>(inst.op), OperandDiagnostic(inst.dst));
+	for (uint32_t i = 0; i < inst.src_count; i++) {
+		text += fmt::format(" src{}={}", i, OperandDiagnostic(inst.src[i]));
+	}
+	return text;
+}
+
 uint32_t ByteExtent(const Instruction& inst) {
 	const auto bytes = std::max((inst.memory.data_bits + 7u) / 8u, 1u);
 	const auto count = std::max(inst.memory.data_dwords, 1u);
@@ -204,6 +235,59 @@ private:
 		return false;
 	}
 
+	std::string FormatInstructionContext(const std::vector<uint32_t>& path,
+	                                     uint32_t use_pc) const {
+		std::vector<uint32_t> targets {use_pc};
+		for (const auto id: path) {
+			if (id < m_program.provenance.values.size()) {
+				const auto pc = m_program.provenance.values[id].pc;
+				if (pc != 0 && std::find(targets.begin(), targets.end(), pc) == targets.end()) {
+					targets.push_back(pc);
+				}
+			}
+		}
+
+		std::string context;
+		for (const auto target: targets) {
+			for (const auto& block: m_program.blocks) {
+				const auto found = std::find_if(block.instructions.begin(), block.instructions.end(),
+				                                [target](const Instruction& inst) {
+					                                return inst.pc == target;
+				                                });
+				if (found == block.instructions.end()) {
+					continue;
+				}
+				const auto index = static_cast<size_t>(found - block.instructions.begin());
+				const auto begin = index > 8 ? index - 8 : 0;
+				const auto end   = std::min(index + 3, block.instructions.size());
+				context += fmt::format(" context around 0x{:08x}:", target);
+				for (auto i = begin; i < end; i++) {
+					context += fmt::format("\n  {}", InstructionDiagnostic(block.instructions[i]));
+				}
+				break;
+			}
+		}
+		return context;
+	}
+
+	std::string FormatValueArguments(uint32_t id) const {
+		if (id >= m_program.provenance.values.size()) {
+			return {};
+		}
+		const auto& value = m_program.provenance.values[id];
+		const auto  count = ScalarValueArgCount(value.op);
+		std::string detail;
+		for (uint32_t i = 0; i < count; i++) {
+			const auto arg = value.args[i];
+			const auto op  = arg < m_program.provenance.values.size()
+			                     ? static_cast<uint32_t>(m_program.provenance.values[arg].op)
+			                     : UINT32_MAX;
+			detail += fmt::format(" arg{}={}:{}({})", i, arg, op,
+			                      ScalarValueToString(m_program.provenance, arg));
+		}
+		return detail;
+	}
+
 	bool ValidateSource(uint32_t source, uint32_t dwords, uint32_t pc, std::string* error) const {
 		const auto* descriptor = GetDescriptorSource(m_program, source);
 		if (descriptor == nullptr || descriptor->dword_count != dwords) {
@@ -220,14 +304,19 @@ private:
 					const auto op = id < m_program.provenance.values.size()
 					                    ? static_cast<uint32_t>(m_program.provenance.values[id].op)
 					                    : UINT32_MAX;
-					chain += fmt::format("{}{}:{}({})", chain.empty() ? "" : " -> ", id, op,
+					const auto node_pc = id < m_program.provenance.values.size()
+					                         ? m_program.provenance.values[id].pc
+					                         : 0;
+					chain += fmt::format("{}{}:{}@0x{:08x}({})", chain.empty() ? "" : " -> ",
+					                     id, op, node_pc,
 					                     ScalarValueToString(m_program.provenance, id));
 				}
 				return Fail(
 				    pc, error,
 				    fmt::format(
-				        "descriptor source {} dword {} contains an unknown value {} ({}) path {}",
-				        source, i, value, ScalarValueToString(m_program.provenance, value), chain));
+				        "descriptor source {} dword {} contains an unknown value {} ({}){} path {}{}",
+				        source, i, value, ScalarValueToString(m_program.provenance, value),
+				        FormatValueArguments(value), chain, FormatInstructionContext(path, pc)));
 			}
 		}
 		const auto dynamic =

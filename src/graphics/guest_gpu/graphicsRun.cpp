@@ -609,6 +609,13 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	const auto log_width  = static_cast<int>(sizeof(T) * 2u);
 	const auto bits       = static_cast<unsigned>(sizeof(T) * 8u);
 
+	LOGF("\t wait_reg_mem%u begin: queue=%d, submit=%" PRIu64
+	     ", addr=0x%016" PRIx64 ", value=0x%0*" PRIx64 ", ref=0x%0*" PRIx64
+	     ", mask=0x%0*" PRIx64 ", func=%" PRIu32 "\n",
+	     bits, m_scheduler.Queue(), m_submit_id, addr_value, log_width,
+	     static_cast<uint64_t>(*addr), log_width, static_cast<uint64_t>(ref), log_width,
+	     static_cast<uint64_t>(mask), func);
+
 	uint64_t spin_count = 0;
 	for (;;) {
 		const auto value = *addr;
@@ -616,9 +623,11 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 			break;
 		}
 		if ((++spin_count % 100000u) == 0) {
-			LOGF("\t wait_reg_mem%u still waiting: addr = 0x%016" PRIx64 ", value = 0x%0*" PRIx64
+			LOGF("\t wait_reg_mem%u still waiting: queue=%d, submit=%" PRIu64
+			     ", addr = 0x%016" PRIx64 ", value = 0x%0*" PRIx64
 			     ", ref = 0x%0*" PRIx64 ", mask = 0x%0*" PRIx64 ", func = %" PRIu32 "\n",
-			     bits, addr_value, log_width, static_cast<uint64_t>(value), log_width,
+			     bits, m_scheduler.Queue(), m_submit_id, addr_value, log_width,
+			     static_cast<uint64_t>(value), log_width,
 			     static_cast<uint64_t>(ref), log_width, static_cast<uint64_t>(mask), func);
 		}
 		YieldCommandProcessorWait(poll);

@@ -1534,6 +1534,23 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo* regs, const HW::ShaderReg
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
 	if (!ShaderRecompiler::TryRecompile(code, options, &result, &error)) {
+		error += " CS user data:";
+		for (uint32_t i = 0; i < options.user_data_count; i++) {
+			error += fmt::format(" s{}=0x{:08x}", i, options.user_data[i]);
+		}
+		if (options.user_data_count >= 2) {
+			const auto srt = (static_cast<uint64_t>(options.user_data[1]) << 32u) |
+			                 options.user_data[0];
+			constexpr uint32_t ProbeDwords = 16;
+			if (HostMemoryRangeIsReadable(srt, ProbeDwords * sizeof(uint32_t))) {
+				std::array<uint32_t, ProbeDwords> probe {};
+				std::memcpy(probe.data(), reinterpret_cast<const void*>(srt), sizeof(probe));
+				error += fmt::format(" CS s[0:1] memory @0x{:016x}:", srt);
+				for (uint32_t i = 0; i < probe.size(); i++) {
+					error += fmt::format(" +0x{:02x}=0x{:08x}", i * 4u, probe[i]);
+				}
+			}
+		}
 		ExitShaderRecompilerFailure("ShaderRecompiler CS", options.shader_hash, error.c_str());
 	}
 	DumpShaderRecompilerOriginal("cs", options.shader_hash, code, result.decoded_dump);

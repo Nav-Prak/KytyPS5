@@ -385,6 +385,7 @@ struct Vop1SdwaRule {
 constexpr Vop1SdwaRule VOP1_SDWA_RULES[] = {
     {Opcode::VMovB32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), SdwaSelWords(),
      SdwaSelWords() | SdwaSelFull(), false},
+    {Opcode::VBfrevB32, SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::VCvtF32U32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::VCvtF32I32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::VCvtF32F16, SdwaSelWords() | SdwaSelFull(), 0, 0, true},
@@ -829,6 +830,7 @@ constexpr Vop2SdwaRule VOP2_SDWA_RULES[] = {
     {Opcode::VXorB32, SdwaSelWords() | SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), true, false},
     {Opcode::VXnorB32, SdwaSelWords() | SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), true, false},
     {Opcode::VAddNcU32, SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
+    {Opcode::VAddcU32, SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
     {Opcode::VSubNcU32, SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
     {Opcode::VSubrevNcU32, SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
 };

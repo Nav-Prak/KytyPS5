@@ -52,6 +52,7 @@ constexpr OpcodeMap VOP1_OPS[] = {
     {0x0cu, Opcode::VCvtRpiI32F32},
     {0x0du, Opcode::VCvtFlrI32F32},
     {0x0eu, Opcode::VCvtOffF32I4},
+    {0x10u, Opcode::VCvtF64F32},
     {0x11u, Opcode::VCvtF32Ubyte0},
     {0x12u, Opcode::VCvtF32Ubyte1},
     {0x13u, Opcode::VCvtF32Ubyte2},
@@ -1519,10 +1520,11 @@ bool DecodeVop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	    !DecodeScalarSource(src0, pc, &inst->src0, error)) {
 		return false;
 	}
-	if (inst->opcode == Opcode::VCvtF64I32) {
+	if (inst->opcode == Opcode::VCvtF64I32 || inst->opcode == Opcode::VCvtF64F32) {
 		if (vdst == 0xffu || !DecodeVectorGpr(vdst + 1u, &inst->dst2, error)) {
 			if (error != nullptr) {
-				*error = "V_CVT_F64_I32 destination pair exceeds the VGPR file";
+				*error = fmt::format("{} destination pair exceeds the VGPR file",
+				                     OpcodeToString(inst->opcode));
 			}
 			return false;
 		}

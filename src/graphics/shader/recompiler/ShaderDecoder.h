@@ -136,6 +136,7 @@ enum class Opcode {
 	VCndmaskB32,
 	VDot2cF32F16,
 	VCvtF64I32,
+	VCvtF64F32,
 	VCvtF32I32,
 	VCvtF32U32,
 	VCvtU32F32,

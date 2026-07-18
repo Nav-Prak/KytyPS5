@@ -366,6 +366,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::ConvertU32ToF32: text += "ConvertU32ToF32"; break;
 		case Opcode::ConvertI32ToF32: text += "ConvertI32ToF32"; break;
 		case Opcode::ConvertI32ToF64Bits: text += "ConvertI32ToF64Bits"; break;
+		case Opcode::ConvertF32BitsToF64Bits: text += "ConvertF32BitsToF64Bits"; break;
 		case Opcode::ConvertF32ToU32: text += "ConvertF32ToU32"; break;
 		case Opcode::ConvertF32ToI32: text += "ConvertF32ToI32"; break;
 		case Opcode::ConvertF32ToF16: text += "ConvertF32ToF16"; break;

@@ -538,6 +538,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::VCndmaskB32: return "v_cndmask_b32";
 		case Opcode::VDot2cF32F16: return "v_dot2c_f32_f16";
 		case Opcode::VCvtF64I32: return "v_cvt_f64_i32";
+		case Opcode::VCvtF64F32: return "v_cvt_f64_f32";
 		case Opcode::VCvtF32I32: return "v_cvt_f32_i32";
 		case Opcode::VCvtF32U32: return "v_cvt_f32_u32";
 		case Opcode::VCvtU32F32: return "v_cvt_u32_f32";

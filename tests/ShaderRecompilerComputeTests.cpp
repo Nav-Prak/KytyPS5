@@ -5012,9 +5012,14 @@ TestCase VectorFloatConversionOps() {
   code.push_back(0x00250602u);
   code.push_back(EncodeSMovB32(106, InlineU32(16)));
   code.push_back(0x7e04086au); // v_cvt_f64_i32 v[2:3], vcc_lo (GTA V)
+  AppendVMovLiteral(&code, 4, 0x3fc00000u);
+  code.push_back(0x7e082104u); // v_cvt_f64_f32 v[4:5], v4 (GTA V)
+  AppendVMovLiteral(&code, 6, 0x00000001u);
+  code.push_back(EncodeVop1(0x10, 6, Vgpr(6)));
 
   const u32 results[] = {13, 14, 15, 16, 17, 18, 42, 19, 20, 21, 22, 23, 24, 25,
-                         26, 27, 28, 29, 30, 36, 32, 33, 34, 35, 38, 39, 41, 8, 2, 3};
+                         26, 27, 28, 29, 30, 36, 32, 33, 34, 35, 38, 39, 41, 8, 2, 3,
+                         4,  5,  6,  7};
   for (u32 i = 0; i < static_cast<u32>(std::size(results)); i++) {
     AppendStoreVgpr(&code, results[i], i);
   }
@@ -5028,8 +5033,10 @@ TestCase VectorFloatConversionOps() {
            0x424c0000u, 0x42880000u, 0x3f000000u, 0x3e800000u, 0x40000000u,
            0x40400000u, 0x40000000u, 0x40000000u, 0x40000000u, 0x40000000u,
            0x3f000000u, 0x40000000u, 0,           0x3f800000u, 0xbd800000u,
-           0x3f800000u, 0x3f800000u, 0x40000000u, 0, 0x40300000u},
-          {O::VMovB32,       O::VCvtF64I32,    O::VCvtF32I32,    O::VCvtF32U32,
+           0x3f800000u, 0x3f800000u, 0x40000000u, 0, 0x40300000u, 0, 0x3ff80000u,
+           0, 0x36a00000u},
+          {O::VMovB32,       O::VCvtF64I32,    O::VCvtF64F32,    O::VCvtF32I32,
+           O::VCvtF32U32,
            O::VCvtU32F32,    O::VCvtI32F32,    O::VCvtF16F32,
            O::VCvtF32F16,    O::VCvtRpiI32F32, O::VCvtFlrI32F32,
            O::VCvtOffF32I4,  O::VCvtF32Ubyte0, O::VCvtF32Ubyte1,

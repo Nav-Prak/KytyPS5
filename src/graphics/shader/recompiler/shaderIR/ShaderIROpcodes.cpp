@@ -90,6 +90,7 @@ constexpr LowerMap LOWER_OPS[] = {
     {Decoder::Opcode::VPermlane16B32, Opcode::Permlane16B32},
     {Decoder::Opcode::VPermlanex16B32, Opcode::Permlanex16B32},
     {Decoder::Opcode::VCvtF64I32, Opcode::ConvertI32ToF64Bits},
+    {Decoder::Opcode::VCvtF64F32, Opcode::ConvertF32BitsToF64Bits},
     {Decoder::Opcode::VCvtF32I32, Opcode::ConvertI32ToF32},
     {Decoder::Opcode::VCvtF32U32, Opcode::ConvertU32ToF32},
     {Decoder::Opcode::VCvtU32F32, Opcode::ConvertF32ToU32},

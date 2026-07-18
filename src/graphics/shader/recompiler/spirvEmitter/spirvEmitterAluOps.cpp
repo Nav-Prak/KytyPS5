@@ -141,6 +141,114 @@ void EmitConvertI32ToF64Bits(EmitterState* state, const IR::Instruction& inst) {
 	EmitStoreU32(state, inst.dst2, result_high);
 }
 
+void EmitConvertF32BitsToF64Bits(EmitterState* state, const IR::Instruction& inst) {
+	const auto src             = EmitValueLoad(state, inst.src[0]);
+	const auto sign            = EmitAndConstant(state, src, 0x80000000u);
+	const auto exponent_shift  = state->builder.AllocateId();
+	const auto exponent        = state->builder.AllocateId();
+	const auto fraction        = EmitAndConstant(state, src, 0x007fffffu);
+	const auto exponent_zero   = state->builder.AllocateId();
+	const auto exponent_max    = state->builder.AllocateId();
+	const auto fraction_zero   = state->builder.AllocateId();
+	const auto value_zero      = state->builder.AllocateId();
+	const auto subnormal       = state->builder.AllocateId();
+	const auto normal_exponent = state->builder.AllocateId();
+	const auto normal_exp_bits = state->builder.AllocateId();
+	const auto mapped_low      = state->builder.AllocateId();
+	const auto mapped_fraction = state->builder.AllocateId();
+	const auto normal_unsigned = state->builder.AllocateId();
+	const auto normal_high     = state->builder.AllocateId();
+	const auto special_high    = state->builder.AllocateId();
+	const auto msb_i32         = state->builder.AllocateId();
+	const auto msb             = state->builder.AllocateId();
+	const auto safe_msb        = state->builder.AllocateId();
+	const auto sub_shift       = state->builder.AllocateId();
+	const auto sub_normalized  = state->builder.AllocateId();
+	const auto sub_fraction    = state->builder.AllocateId();
+	const auto sub_low         = state->builder.AllocateId();
+	const auto sub_mantissa    = state->builder.AllocateId();
+	const auto sub_exponent    = state->builder.AllocateId();
+	const auto sub_exp_bits    = state->builder.AllocateId();
+	const auto sub_unsigned    = state->builder.AllocateId();
+	const auto sub_high        = state->builder.AllocateId();
+	const auto finite_low      = state->builder.AllocateId();
+	const auto finite_high     = state->builder.AllocateId();
+	const auto non_special_high = state->builder.AllocateId();
+	const auto result_low      = state->builder.AllocateId();
+	const auto result_high     = state->builder.AllocateId();
+
+	state->builder.AddFunction({OpShiftRightLogical, state->uint_type, exponent_shift, src,
+	                            ConstantU32(state, 23)});
+	state->builder.AddFunction({OpBitwiseAnd, state->uint_type, exponent, exponent_shift,
+	                            ConstantU32(state, 0xff)});
+	state->builder.AddFunction(
+	    {OpIEqual, state->bool_type, exponent_zero, exponent, ConstantU32(state, 0)});
+	state->builder.AddFunction(
+	    {OpIEqual, state->bool_type, exponent_max, exponent, ConstantU32(state, 0xff)});
+	state->builder.AddFunction(
+	    {OpIEqual, state->bool_type, fraction_zero, fraction, ConstantU32(state, 0)});
+	state->builder.AddFunction(
+	    {OpLogicalAnd, state->bool_type, value_zero, exponent_zero, fraction_zero});
+	const auto fraction_nonzero = state->builder.AllocateId();
+	state->builder.AddFunction({OpLogicalNot, state->bool_type, fraction_nonzero, fraction_zero});
+	state->builder.AddFunction(
+	    {OpLogicalAnd, state->bool_type, subnormal, exponent_zero, fraction_nonzero});
+
+	state->builder.AddFunction(
+	    {OpIAdd, state->uint_type, normal_exponent, exponent, ConstantU32(state, 896)});
+	state->builder.AddFunction({OpShiftLeftLogical, state->uint_type, normal_exp_bits,
+	                            normal_exponent, ConstantU32(state, 20)});
+	state->builder.AddFunction({OpShiftLeftLogical, state->uint_type, mapped_low, fraction,
+	                            ConstantU32(state, 29)});
+	state->builder.AddFunction({OpShiftRightLogical, state->uint_type, mapped_fraction, fraction,
+	                            ConstantU32(state, 3)});
+	state->builder.AddFunction({OpBitwiseOr, state->uint_type, normal_unsigned, normal_exp_bits,
+	                            mapped_fraction});
+	state->builder.AddFunction(
+	    {OpBitwiseOr, state->uint_type, normal_high, normal_unsigned, sign});
+	const auto special_unsigned = state->builder.AllocateId();
+	state->builder.AddFunction({OpBitwiseOr, state->uint_type, special_unsigned,
+	                            ConstantU32(state, 0x7ff00000u), mapped_fraction});
+	state->builder.AddFunction(
+	    {OpBitwiseOr, state->uint_type, special_high, special_unsigned, sign});
+
+	state->builder.AddFunction(
+	    {OpExtInst, state->int_type, msb_i32, state->glsl_std450, GlslFindUMsb, fraction});
+	state->builder.AddFunction({OpBitcast, state->uint_type, msb, msb_i32});
+	state->builder.AddFunction(
+	    {OpSelect, state->uint_type, safe_msb, fraction_nonzero, msb, ConstantU32(state, 0)});
+	state->builder.AddFunction(
+	    {OpISub, state->uint_type, sub_shift, ConstantU32(state, 31), safe_msb});
+	state->builder.AddFunction(
+	    {OpShiftLeftLogical, state->uint_type, sub_normalized, fraction, sub_shift});
+	state->builder.AddFunction({OpBitwiseAnd, state->uint_type, sub_fraction, sub_normalized,
+	                            ConstantU32(state, 0x7fffffffu)});
+	state->builder.AddFunction({OpShiftLeftLogical, state->uint_type, sub_low, sub_fraction,
+	                            ConstantU32(state, 21)});
+	state->builder.AddFunction({OpShiftRightLogical, state->uint_type, sub_mantissa, sub_fraction,
+	                            ConstantU32(state, 11)});
+	state->builder.AddFunction(
+	    {OpIAdd, state->uint_type, sub_exponent, safe_msb, ConstantU32(state, 874)});
+	state->builder.AddFunction({OpShiftLeftLogical, state->uint_type, sub_exp_bits, sub_exponent,
+	                            ConstantU32(state, 20)});
+	state->builder.AddFunction(
+	    {OpBitwiseOr, state->uint_type, sub_unsigned, sub_exp_bits, sub_mantissa});
+	state->builder.AddFunction({OpBitwiseOr, state->uint_type, sub_high, sub_unsigned, sign});
+
+	state->builder.AddFunction(
+	    {OpSelect, state->uint_type, finite_low, subnormal, sub_low, mapped_low});
+	state->builder.AddFunction(
+	    {OpSelect, state->uint_type, finite_high, subnormal, sub_high, normal_high});
+	state->builder.AddFunction(
+	    {OpSelect, state->uint_type, non_special_high, value_zero, sign, finite_high});
+	state->builder.AddFunction(
+	    {OpSelect, state->uint_type, result_low, value_zero, ConstantU32(state, 0), finite_low});
+	state->builder.AddFunction(
+	    {OpSelect, state->uint_type, result_high, exponent_max, special_high, non_special_high});
+	EmitStoreU32(state, inst.dst, result_low);
+	EmitStoreU32(state, inst.dst2, result_high);
+}
+
 void EmitFindMsbFromHighU64(EmitterState* state, const IR::Instruction& inst) {
 	const auto low           = EmitSequentialValueLoad(state, inst.src[0], 0);
 	const auto high          = EmitSequentialValueLoad(state, inst.src[0], 1);

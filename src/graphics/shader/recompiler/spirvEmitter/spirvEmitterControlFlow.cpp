@@ -625,6 +625,9 @@ void EmitInstruction(EmitterState* state, const IR::Instruction& inst) {
 		case IR::Opcode::ConvertU32ToF32: EmitConvertU32ToF32(state, inst); break;
 		case IR::Opcode::ConvertI32ToF32: EmitConvertI32ToF32(state, inst); break;
 		case IR::Opcode::ConvertI32ToF64Bits: EmitConvertI32ToF64Bits(state, inst); break;
+		case IR::Opcode::ConvertF32BitsToF64Bits:
+			EmitConvertF32BitsToF64Bits(state, inst);
+			break;
 		case IR::Opcode::ConvertF32ToU32: EmitConvertF32ToU32(state, inst); break;
 		case IR::Opcode::ConvertF32ToI32: EmitConvertF32ToI32(state, inst); break;
 		case IR::Opcode::ConvertF32ToF16: EmitConvertF32ToF16(state, inst); break;

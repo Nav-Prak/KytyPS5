@@ -74,35 +74,9 @@ bool IsAddress(const Instruction& inst) {
 	       inst.memory.kind == ResourceKind::Global || inst.memory.kind == ResourceKind::Scratch;
 }
 
-std::string OperandDiagnostic(const Operand& operand) {
-	if (operand.kind == OperandKind::ImmediateU32) {
-		return fmt::format("0x{:08x}", operand.imm);
-	}
-	if (operand.kind == OperandKind::PcRelativeU32) {
-		return fmt::format("pc+0x{:08x}", operand.imm);
-	}
-	if (operand.kind != OperandKind::Register) {
-		return "null";
-	}
-	const char* file = "?";
-	switch (operand.reg.file) {
-		case RegisterFile::Scalar: file = "s"; break;
-		case RegisterFile::Vector: file = "v"; break;
-		case RegisterFile::Vcc: file = "vcc"; break;
-		case RegisterFile::Exec: file = "exec"; break;
-		case RegisterFile::Scc: file = "scc"; break;
-		case RegisterFile::M0: file = "m0"; break;
-	}
-	return fmt::format("{}{}", file, operand.reg.index);
-}
-
 std::string InstructionDiagnostic(const Instruction& inst) {
-	std::string text = fmt::format("0x{:08x}: op={} dst={}", inst.pc,
-	                               static_cast<uint32_t>(inst.op), OperandDiagnostic(inst.dst));
-	for (uint32_t i = 0; i < inst.src_count; i++) {
-		text += fmt::format(" src{}={}", i, OperandDiagnostic(inst.src[i]));
-	}
-	return text;
+	return fmt::format("0x{:08x}: op={} {}", inst.pc, static_cast<uint32_t>(inst.op),
+	                   InstructionToString(inst));
 }
 
 uint32_t ByteExtent(const Instruction& inst) {
@@ -326,6 +300,21 @@ private:
 					for (auto i = first; i < last; i++) {
 						detail += fmt::format("\n    {}", InstructionDiagnostic(block.instructions[i]));
 					}
+					std::vector<Register> dependencies;
+					for (uint32_t source_index = 0; source_index < inst.src_count;
+					     source_index++) {
+						const auto& source = inst.src[source_index];
+						if (source.kind == OperandKind::Register &&
+						    source.reg.file == RegisterFile::Vector &&
+						    source.reg != read.source &&
+						    std::find(dependencies.begin(), dependencies.end(), source.reg) ==
+						        dependencies.end()) {
+							dependencies.push_back(source.reg);
+						}
+					}
+					for (const auto dependency: dependencies) {
+						detail += FormatVectorDependency(dependency, 2);
+					}
 				}
 				if (writers > 16) {
 					break;
@@ -334,6 +323,42 @@ private:
 			if (writers == 0) {
 				detail += " none (stage input or undefined)";
 			}
+		}
+		return detail;
+	}
+
+	std::string FormatVectorDependency(Register source, uint32_t depth) const {
+		std::string detail = fmt::format("\n    vector dependency {} writers:",
+		                                 RegisterToString(source));
+		uint32_t writers = 0;
+		for (const auto& block: m_program.blocks) {
+			for (size_t index = 0; index < block.instructions.size(); index++) {
+				const auto& inst = block.instructions[index];
+				const bool writes =
+				    (inst.dst.kind == OperandKind::Register && inst.dst.reg == source) ||
+				    (inst.dst2.kind == OperandKind::Register && inst.dst2.reg == source);
+				if (!writes) {
+					continue;
+				}
+				if (writers++ >= 12) {
+					detail += "\n      additional writers omitted";
+					return detail;
+				}
+				detail += fmt::format("\n      {}", InstructionDiagnostic(inst));
+				if (depth == 0) {
+					continue;
+				}
+				for (uint32_t source_index = 0; source_index < inst.src_count; source_index++) {
+					const auto& dependency = inst.src[source_index];
+					if (dependency.kind == OperandKind::Register &&
+					    dependency.reg.file == RegisterFile::Vector && dependency.reg != source) {
+						detail += FormatVectorDependency(dependency.reg, depth - 1);
+					}
+				}
+			}
+		}
+		if (writers == 0) {
+			detail += " none (stage input or undefined)";
 		}
 		return detail;
 	}

@@ -271,6 +271,73 @@ private:
 		return context;
 	}
 
+	std::string FormatUniformVectorProducers(uint32_t use_pc) const {
+		struct UniformRead {
+			Register source;
+			uint32_t pc = 0;
+		};
+		std::vector<UniformRead> reads;
+		for (const auto& block: m_program.blocks) {
+			const auto use = std::find_if(block.instructions.begin(), block.instructions.end(),
+			                              [use_pc](const Instruction& inst) {
+				                              return inst.pc == use_pc;
+			                              });
+			if (use == block.instructions.end()) {
+				continue;
+			}
+			const auto begin = use - std::min<size_t>(16, use - block.instructions.begin());
+			for (auto current = begin; current != use; ++current) {
+				if (current->op != Opcode::ReadFirstLaneU32 || current->src_count == 0 ||
+				    current->src[0].kind != OperandKind::Register ||
+				    current->src[0].reg.file != RegisterFile::Vector) {
+					continue;
+				}
+				const UniformRead read {current->src[0].reg, current->pc};
+				if (std::find_if(reads.begin(), reads.end(), [&read](const UniformRead& existing) {
+					    return existing.source == read.source && existing.pc == read.pc;
+				    }) == reads.end()) {
+					reads.push_back(read);
+				}
+			}
+			break;
+		}
+
+		std::string detail;
+		for (const auto& read: reads) {
+			detail += fmt::format(" uniform vector source {} read at 0x{:08x}; writers:",
+			                      RegisterToString(read.source), read.pc);
+			uint32_t writers = 0;
+			for (const auto& block: m_program.blocks) {
+				for (size_t index = 0; index < block.instructions.size(); index++) {
+					const auto& inst = block.instructions[index];
+					const bool writes =
+					    (inst.dst.kind == OperandKind::Register && inst.dst.reg == read.source) ||
+					    (inst.dst2.kind == OperandKind::Register && inst.dst2.reg == read.source);
+					if (!writes) {
+						continue;
+					}
+					if (writers++ >= 16) {
+						detail += "\n  additional writers omitted";
+						break;
+					}
+					const auto first = index > 4 ? index - 4 : 0;
+					const auto last  = std::min(index + 3, block.instructions.size());
+					detail += fmt::format("\n  writer context around 0x{:08x}:", inst.pc);
+					for (auto i = first; i < last; i++) {
+						detail += fmt::format("\n    {}", InstructionDiagnostic(block.instructions[i]));
+					}
+				}
+				if (writers > 16) {
+					break;
+				}
+			}
+			if (writers == 0) {
+				detail += " none (stage input or undefined)";
+			}
+		}
+		return detail;
+	}
+
 	std::string FormatValueArguments(uint32_t id) const {
 		if (id >= m_program.provenance.values.size()) {
 			return {};
@@ -317,7 +384,8 @@ private:
 				    fmt::format(
 				        "descriptor source {} dword {} contains an unknown value {} ({}){} path {}{}",
 				        source, i, value, ScalarValueToString(m_program.provenance, value),
-				        FormatValueArguments(value), chain, FormatInstructionContext(path, pc)));
+				        FormatValueArguments(value), chain, FormatInstructionContext(path, pc) +
+				                                                    FormatUniformVectorProducers(pc)));
 			}
 		}
 		const auto dynamic =

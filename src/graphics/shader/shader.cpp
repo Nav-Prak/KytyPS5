@@ -1551,6 +1551,60 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo* regs, const HW::ShaderReg
 			for (uint32_t i = 0; i < probe.size(); i++) {
 				error += fmt::format(" +0x{:02x}=0x{:08x}", i * 4u, probe[i]);
 			}
+			for (uint32_t descriptor_offset = 0; descriptor_offset + 3 < probe.size();
+			     descriptor_offset += 4) {
+				const auto descriptor_base =
+				    (static_cast<uint64_t>(probe[descriptor_offset + 1] & 0xffffu) << 32u) |
+				    probe[descriptor_offset];
+				const auto stride = (probe[descriptor_offset + 1] >> 16u) & 0x3fffu;
+				const auto records = probe[descriptor_offset + 2];
+				const auto bytes = stride == 0 ? static_cast<uint64_t>(records)
+				                               : static_cast<uint64_t>(stride) * records;
+				constexpr uint64_t MaxProbeBytes = 64ull * 1024ull * 1024ull;
+				if (descriptor_base == 0 || records == 0 || stride < 8 || bytes == 0 ||
+				    bytes > MaxProbeBytes ||
+				    !HostMemoryRangeIsReadable(descriptor_base, static_cast<size_t>(bytes))) {
+					continue;
+				}
+
+				std::vector<uint32_t> selectors;
+				selectors.reserve(std::min<uint32_t>(records, 65536));
+				for (uint32_t record = 0; record < records; record++) {
+					uint32_t selector = 0;
+					std::memcpy(&selector,
+					            reinterpret_cast<const void*>(descriptor_base +
+					                                          static_cast<uint64_t>(record) * stride + 4u),
+					            sizeof(selector));
+					selectors.push_back(selector);
+				}
+				std::sort(selectors.begin(), selectors.end());
+				selectors.erase(std::unique(selectors.begin(), selectors.end()), selectors.end());
+				error += fmt::format(
+				    " CS buffer table candidate s[{}:{}]+0x{:02x} base=0x{:016x} stride={} "
+				    "records={} bytes=0x{:x} selector_dword1_unique={}",
+				    first, first + 1, descriptor_offset * 4u, descriptor_base, stride, records, bytes,
+				    selectors.size());
+				const auto selector_limit = std::min<size_t>(selectors.size(), 32);
+				for (size_t i = 0; i < selector_limit; i++) {
+					const auto selector = selectors[i];
+					error += fmt::format(" selector[{}]=0x{:08x}", i, selector);
+					const auto table_offset = static_cast<uint64_t>(selector) * 16u;
+					if (table_offset > bytes || bytes - table_offset < 16u) {
+						error += "(out-of-range)";
+						continue;
+					}
+					std::array<uint32_t, 4> selected_descriptor {};
+					std::memcpy(selected_descriptor.data(),
+					            reinterpret_cast<const void*>(descriptor_base + table_offset),
+					            sizeof(selected_descriptor));
+					error += fmt::format("({:08x}/{:08x}/{:08x}/{:08x})",
+					                     selected_descriptor[0], selected_descriptor[1],
+					                     selected_descriptor[2], selected_descriptor[3]);
+				}
+				if (selectors.size() > selector_limit) {
+					error += fmt::format(" selectors_omitted={}", selectors.size() - selector_limit);
+				}
+			}
 		}
 		ExitShaderRecompilerFailure("ShaderRecompiler CS", options.shader_hash, error.c_str());
 	}

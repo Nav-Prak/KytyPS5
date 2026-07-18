@@ -42,6 +42,7 @@ constexpr OpcodeMap VOP1_OPS[] = {
     {0x00u, Opcode::VNop},
     {0x01u, Opcode::VMovB32},
     {0x02u, Opcode::VReadfirstlaneB32},
+    {0x04u, Opcode::VCvtF64I32},
     {0x05u, Opcode::VCvtF32I32},
     {0x06u, Opcode::VCvtF32U32},
     {0x07u, Opcode::VCvtU32F32},
@@ -1517,6 +1518,14 @@ bool DecodeVop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	                 : DecodeVectorGpr(vdst, &inst->dst, error)) ||
 	    !DecodeScalarSource(src0, pc, &inst->src0, error)) {
 		return false;
+	}
+	if (inst->opcode == Opcode::VCvtF64I32) {
+		if (vdst == 0xffu || !DecodeVectorGpr(vdst + 1u, &inst->dst2, error)) {
+			if (error != nullptr) {
+				*error = "V_CVT_F64_I32 destination pair exceeds the VGPR file";
+			}
+			return false;
+		}
 	}
 	inst->src_count = 1;
 	return ReadLiteralOperands(code, word_index, inst, error);

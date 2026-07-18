@@ -650,6 +650,21 @@ bool LowerVectorMoveB32(const Decoder::Instruction& decoded, BasicBlock* block,
 	return true;
 }
 
+bool LowerVectorConvertI32ToF64Bits(const Decoder::Instruction& decoded, BasicBlock* block,
+                                    std::string* error) {
+	Instruction inst;
+	inst.pc        = decoded.pc;
+	inst.op        = Opcode::ConvertI32ToF64Bits;
+	inst.src_count = 1;
+	if (!LowerRegisterOperand(decoded.dst, &inst.dst, error) ||
+	    !LowerRegisterOperand(decoded.dst2, &inst.dst2, error) ||
+	    !LowerSourceOperand(decoded.src0, &inst.src[0], error)) {
+		return false;
+	}
+	block->instructions.push_back(inst);
+	return true;
+}
+
 bool LowerVectorMoveRelSource(const Decoder::Instruction& decoded, BasicBlock* block,
                               std::string* error) {
 	if (decoded.dst.kind != Decoder::OperandKind::Vgpr ||
@@ -1097,6 +1112,8 @@ bool LowerDecodedInstruction(const Decoder::Instruction& inst, BasicBlock* block
 			return LowerScalarBinaryScc(inst, block, Opcode::ScalarSignedSubOverflowI32, error);
 		case Decoder::Opcode::VCndmaskB32: return LowerVectorCndmask(inst, block, error);
 		case Decoder::Opcode::VMovB32: return LowerVectorMoveB32(inst, block, error);
+		case Decoder::Opcode::VCvtF64I32:
+			return LowerVectorConvertI32ToF64Bits(inst, block, error);
 		case Decoder::Opcode::VMovreldB32: return LowerVectorMoveRelDestination(inst, block, error);
 		case Decoder::Opcode::VMovrelsB32: return LowerVectorMoveRelSource(inst, block, error);
 		case Decoder::Opcode::VAddcU32: return LowerVectorAddCarry(inst, block, error);

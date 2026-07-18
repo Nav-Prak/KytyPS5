@@ -83,6 +83,64 @@ void EmitFindMsbFromHighU32(EmitterState* state, const IR::Instruction& inst) {
 	EmitStoreU32(state, inst.dst, ret);
 }
 
+void EmitConvertI32ToF64Bits(EmitterState* state, const IR::Instruction& inst) {
+	const auto src                 = EmitValueLoad(state, inst.src[0]);
+	const auto sign                = EmitAndConstant(state, src, 0x80000000u);
+	const auto negative            = state->builder.AllocateId();
+	const auto negated             = state->builder.AllocateId();
+	const auto magnitude           = state->builder.AllocateId();
+	const auto non_zero            = state->builder.AllocateId();
+	const auto msb_i32             = state->builder.AllocateId();
+	const auto msb                 = state->builder.AllocateId();
+	const auto safe_msb            = state->builder.AllocateId();
+	const auto normalization_shift = state->builder.AllocateId();
+	const auto normalized          = state->builder.AllocateId();
+	const auto fraction            = state->builder.AllocateId();
+	const auto mantissa_low        = state->builder.AllocateId();
+	const auto mantissa_high       = state->builder.AllocateId();
+	const auto exponent            = state->builder.AllocateId();
+	const auto exponent_bits       = state->builder.AllocateId();
+	const auto unsigned_high       = state->builder.AllocateId();
+	const auto signed_high         = state->builder.AllocateId();
+	const auto result_low          = state->builder.AllocateId();
+	const auto result_high         = state->builder.AllocateId();
+
+	state->builder.AddFunction(
+	    {OpINotEqual, state->bool_type, negative, sign, ConstantU32(state, 0)});
+	state->builder.AddFunction({OpISub, state->uint_type, negated, ConstantU32(state, 0), src});
+	state->builder.AddFunction({OpSelect, state->uint_type, magnitude, negative, negated, src});
+	state->builder.AddFunction(
+	    {OpINotEqual, state->bool_type, non_zero, magnitude, ConstantU32(state, 0)});
+	state->builder.AddFunction(
+	    {OpExtInst, state->int_type, msb_i32, state->glsl_std450, GlslFindUMsb, magnitude});
+	state->builder.AddFunction({OpBitcast, state->uint_type, msb, msb_i32});
+	state->builder.AddFunction(
+	    {OpSelect, state->uint_type, safe_msb, non_zero, msb, ConstantU32(state, 0)});
+	state->builder.AddFunction({OpISub, state->uint_type, normalization_shift,
+	                            ConstantU32(state, 31), safe_msb});
+	state->builder.AddFunction(
+	    {OpShiftLeftLogical, state->uint_type, normalized, magnitude, normalization_shift});
+	state->builder.AddFunction({OpBitwiseAnd, state->uint_type, fraction, normalized,
+	                            ConstantU32(state, 0x7fffffffu)});
+	state->builder.AddFunction({OpShiftLeftLogical, state->uint_type, mantissa_low, fraction,
+	                            ConstantU32(state, 21)});
+	state->builder.AddFunction({OpShiftRightLogical, state->uint_type, mantissa_high, fraction,
+	                            ConstantU32(state, 11)});
+	state->builder.AddFunction(
+	    {OpIAdd, state->uint_type, exponent, safe_msb, ConstantU32(state, 1023)});
+	state->builder.AddFunction({OpShiftLeftLogical, state->uint_type, exponent_bits, exponent,
+	                            ConstantU32(state, 20)});
+	state->builder.AddFunction(
+	    {OpBitwiseOr, state->uint_type, unsigned_high, exponent_bits, mantissa_high});
+	state->builder.AddFunction({OpBitwiseOr, state->uint_type, signed_high, unsigned_high, sign});
+	state->builder.AddFunction({OpSelect, state->uint_type, result_low, non_zero, mantissa_low,
+	                            ConstantU32(state, 0)});
+	state->builder.AddFunction({OpSelect, state->uint_type, result_high, non_zero, signed_high,
+	                            ConstantU32(state, 0)});
+	EmitStoreU32(state, inst.dst, result_low);
+	EmitStoreU32(state, inst.dst2, result_high);
+}
+
 void EmitFindMsbFromHighU64(EmitterState* state, const IR::Instruction& inst) {
 	const auto low           = EmitSequentialValueLoad(state, inst.src[0], 0);
 	const auto high          = EmitSequentialValueLoad(state, inst.src[0], 1);

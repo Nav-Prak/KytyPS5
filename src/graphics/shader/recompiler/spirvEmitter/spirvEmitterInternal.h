@@ -1313,6 +1313,8 @@ void EmitConvertU32ToF32(EmitterState* state, const IR::Instruction& inst);
 
 void EmitConvertI32ToF32(EmitterState* state, const IR::Instruction& inst);
 
+void EmitConvertI32ToF64Bits(EmitterState* state, const IR::Instruction& inst);
+
 uint32_t EmitTruncF32Value(EmitterState* state, uint32_t value);
 
 void EmitConvertF32ToU32(EmitterState* state, const IR::Instruction& inst);

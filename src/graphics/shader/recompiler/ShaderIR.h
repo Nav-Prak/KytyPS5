@@ -210,6 +210,7 @@ enum class Opcode {
 	ConvertByteU32ToF32,
 	ConvertU32ToF32,
 	ConvertI32ToF32,
+	ConvertI32ToF64Bits,
 	ConvertF32ToU32,
 	ConvertF32ToI32,
 	ConvertF32ToF16,

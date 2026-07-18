@@ -803,9 +803,9 @@ static bool ShaderGetStaticInputInfoVS(const HW::VertexShaderInfo* regs,
 
 static void ShaderGetStaticInputInfoPS(
     const HW::PixelShaderInfo* regs, const HW::ShaderRegisters* sh,
-    const ShaderVertexInputInfo* vs_info,
+    const ShaderVertexInputInfo*                        vs_info,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-    ShaderPixelInputInfo* ps_info) {
+    ShaderPixelInputInfo*                               ps_info) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(vs_info == nullptr);
@@ -844,10 +844,10 @@ static void ShaderGetStaticInputInfoPS(
 	        : 0;
 
 	for (int i = 0; i < 8; i++) {
-		ps_info->target_output_mode[i] = sh->target_output_mode[i];
-		ps_info->target_export_mapping[i] =
-		    sh->target_output_mode[i] != 0 ? target_export_mapping[i]
-		                                   : Prospero::ColorComponentMapping {};
+		ps_info->target_output_mode[i]    = sh->target_output_mode[i];
+		ps_info->target_export_mapping[i] = sh->target_output_mode[i] != 0
+		                                        ? target_export_mapping[i]
+		                                        : Prospero::ColorComponentMapping {};
 	}
 	ps_info->mrt_output_mask = 0;
 }

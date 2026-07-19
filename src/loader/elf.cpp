@@ -239,7 +239,7 @@ Elf64::~Elf64() {
 	Clear();
 }
 
-void Elf64::LoadSegment(uint64_t vaddr, uint64_t file_offset, uint64_t size) {
+bool Elf64::TryLoadSegment(uint64_t vaddr, uint64_t file_offset, uint64_t size) {
 	EXIT_IF(m_f == nullptr);
 
 	if (m_self != nullptr) {
@@ -264,7 +264,7 @@ void Elf64::LoadSegment(uint64_t vaddr, uint64_t file_offset, uint64_t size) {
 					m_f->Seek(offset + seg.offset);
 					m_f->Read(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), size);
 
-					return;
+					return true;
 				}
 			}
 		}
@@ -273,13 +273,20 @@ void Elf64::LoadSegment(uint64_t vaddr, uint64_t file_offset, uint64_t size) {
 			m_f->Seek(m_self->file_size);
 			m_f->Read(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), size);
 
-			return;
+			return true;
 		}
 
-		EXIT("missing self segment\n");
+		return false;
 	} else {
 		m_f->Seek(file_offset);
 		m_f->Read(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), size);
+		return true;
+	}
+}
+
+void Elf64::LoadSegment(uint64_t vaddr, uint64_t file_offset, uint64_t size) {
+	if (!TryLoadSegment(vaddr, file_offset, size)) {
+		EXIT("missing self segment\n");
 	}
 }
 
@@ -591,6 +598,26 @@ void Elf64::Save(const std::filesystem::path& file_name) {
 	EXIT_IF(!IsValid());
 
 	if (IsValid()) {
+		std::vector<Elf64_Phdr> saved_phdr(m_phdr.get(), m_phdr.get() + m_ehdr->e_phnum);
+		std::vector<std::unique_ptr<char[]>> segment_data(m_ehdr->e_phnum);
+
+		for (uint16_t i = 0; i < m_ehdr->e_phnum; i++) {
+			if (saved_phdr[i].p_filesz == 0u) {
+				continue;
+			}
+
+			segment_data[i] =
+			    std::make_unique<char[]>(static_cast<uint32_t>(saved_phdr[i].p_filesz));
+			if (!TryLoadSegment(reinterpret_cast<uint64_t>(segment_data[i].get()),
+			                    saved_phdr[i].p_offset, saved_phdr[i].p_filesz)) {
+				LOGF("SELF: omitting unavailable ELF segment %" PRIu16
+				     " from saved file: offset=0x%016" PRIx64 ", size=0x%016" PRIx64 "\n",
+				     i, saved_phdr[i].p_offset, saved_phdr[i].p_filesz);
+				saved_phdr[i].p_filesz = 0;
+				segment_data[i].reset();
+			}
+		}
+
 		Common::File f;
 		f.Create(file_name);
 
@@ -600,23 +627,19 @@ void Elf64::Save(const std::filesystem::path& file_name) {
 
 		SaveEhdr64(f, m_ehdr.get());
 
-		SavePhdr64(f, m_ehdr->e_phoff, m_ehdr->e_phnum, m_phdr.get());
+		SavePhdr64(f, m_ehdr->e_phoff, m_ehdr->e_phnum, saved_phdr.data());
 		SaveShdr64(f, m_ehdr->e_shoff, m_ehdr->e_shnum, m_shdr.get());
 
 		for (uint16_t i = 0; i < m_ehdr->e_phnum; i++) {
-			if (m_phdr[i].p_filesz == 0u) {
+			if (saved_phdr[i].p_filesz == 0u) {
 				continue;
 			}
 
-			auto buf = std::make_unique<char[]>(static_cast<uint32_t>(m_phdr[i].p_filesz));
-
-			LoadSegment(reinterpret_cast<uint64_t>(buf.get()), m_phdr[i].p_offset,
-			            m_phdr[i].p_filesz);
-
 			uint32_t bytes_written = 0;
 
-			f.Seek(m_phdr[i].p_offset);
-			f.Write(buf.get(), static_cast<uint32_t>(m_phdr[i].p_filesz), &bytes_written);
+			f.Seek(saved_phdr[i].p_offset);
+			f.Write(segment_data[i].get(), static_cast<uint32_t>(saved_phdr[i].p_filesz),
+			        &bytes_written);
 
 			EXIT_IF(bytes_written == 0);
 		}

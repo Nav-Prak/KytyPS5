@@ -22,6 +22,7 @@
 #include "libs/libs.h"
 #include "libs/network.h"
 #include "loader/runtimeLinker.h"
+#include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
 #include "loader/timer.h"
 
@@ -144,18 +145,43 @@ static void Init(const Config::ConfigOptions& cfg) {
 
 static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = false,
                     const std::filesystem::path& save_name = {}) {
-	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
-
-	auto* program = rt->LoadProgram(
-	    Libs::LibKernel::FileSystem::GetRealFilename(Common::PathToGenericString(elf)));
+	auto*      rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	const auto source =
+	    Libs::LibKernel::FileSystem::GetRealFilename(Common::PathToGenericString(elf));
+	auto* program = rt->LoadProgram(source);
 
 	if (dbg_print_reloc) {
 		program->dbg_print_reloc = true;
 	}
 
 	if (!save_name.empty()) {
-		rt->SaveProgram(program, Libs::LibKernel::FileSystem::GetRealFilename(
-		                             Common::PathToGenericString(save_name)));
+		const auto output =
+		    Libs::LibKernel::FileSystem::GetRealFilename(Common::PathToGenericString(save_name));
+		const auto source_absolute = std::filesystem::absolute(source).lexically_normal();
+		const auto output_absolute = std::filesystem::absolute(output).lexically_normal();
+		if (Common::EqualNoCase(Common::PathToGenericString(source_absolute),
+		                        Common::PathToGenericString(output_absolute))) {
+			EXIT("SELF extraction output must differ from the input: %s\n",
+			     Common::PathToString(output_absolute).c_str());
+		}
+		if (Common::File::IsFileExisting(output_absolute)) {
+			EXIT("SELF extraction output already exists: %s\n",
+			     Common::PathToString(output_absolute).c_str());
+		}
+		auto inventory = output_absolute;
+		inventory += ".imports.txt";
+		if (Common::File::IsFileExisting(inventory)) {
+			EXIT("SELF import inventory already exists: %s\n",
+			     Common::PathToString(inventory).c_str());
+		}
+		rt->SaveProgram(program, output_absolute);
+		if (program->import_symbols == nullptr) {
+			EXIT("SELF extraction has no import symbol database\n");
+		}
+		program->import_symbols->DbgDump(Common::PathToGenericString(inventory.parent_path()),
+		                                 Common::PathToString(inventory.filename()));
+		LOGF("Saved ELF: %s\n", Common::PathToString(output_absolute).c_str());
+		LOGF("Saved import inventory: %s\n", Common::PathToString(inventory).c_str());
 	}
 }
 
@@ -215,7 +241,10 @@ void Run(const RunOptions& options) {
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	Libs::InitAll(rt->Symbols());
 
-	LoadElf(options.elf);
+	LoadElf(options.elf, false, options.save_elf);
+	if (!options.save_elf.empty()) {
+		return;
+	}
 
 	Execute();
 }

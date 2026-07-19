@@ -12,6 +12,7 @@ struct RunOptions {
 	Config::ConfigOptions config;
 	std::filesystem::path app0_dir;
 	std::filesystem::path elf;
+	std::filesystem::path save_elf;
 };
 
 void Run(const RunOptions& options);

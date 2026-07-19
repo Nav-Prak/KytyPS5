@@ -288,6 +288,8 @@ public:
 	}
 
 private:
+	bool TryLoadSegment(uint64_t vaddr, uint64_t file_offset, uint64_t size);
+
 	void Clear();
 
 	std::unique_ptr<Common::File>  m_f;

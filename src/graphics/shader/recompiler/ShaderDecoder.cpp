@@ -618,6 +618,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::VBfeI32: return "v_bfe_i32";
 		case Opcode::VBfiB32: return "v_bfi_b32";
 		case Opcode::VAlignbitB32: return "v_alignbit_b32";
+		case Opcode::VAlignbyteB32: return "v_alignbyte_b32";
 		case Opcode::VMin3F32: return "v_min3_f32";
 		case Opcode::VMin3I32: return "v_min3_i32";
 		case Opcode::VMin3U32: return "v_min3_u32";
@@ -826,6 +827,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::TBufferStoreFormatXyz: return "tbuffer_store_format_xyz";
 		case Opcode::TBufferStoreFormatXyzw: return "tbuffer_store_format_xyzw";
 		case Opcode::BufferAtomicSwap: return "buffer_atomic_swap";
+		case Opcode::BufferAtomicSwapX2: return "buffer_atomic_swap_x2";
 		case Opcode::BufferAtomicAdd: return "buffer_atomic_add";
 		case Opcode::BufferAtomicSub: return "buffer_atomic_sub";
 		case Opcode::BufferAtomicSMin: return "buffer_atomic_smin";
@@ -835,6 +837,8 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::BufferAtomicAnd: return "buffer_atomic_and";
 		case Opcode::BufferAtomicOr: return "buffer_atomic_or";
 		case Opcode::BufferAtomicXor: return "buffer_atomic_xor";
+		case Opcode::BufferAtomicFMin: return "buffer_atomic_fmin";
+		case Opcode::BufferAtomicFMax: return "buffer_atomic_fmax";
 		case Opcode::FlatLoadUbyte: return "flat_load_ubyte";
 		case Opcode::FlatLoadSbyte: return "flat_load_sbyte";
 		case Opcode::FlatLoadUshort: return "flat_load_ushort";
@@ -1113,6 +1117,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::TBufferStoreFormatXyz:
 		case Opcode::TBufferStoreFormatXyzw:
 		case Opcode::BufferAtomicSwap:
+		case Opcode::BufferAtomicSwapX2:
 		case Opcode::BufferAtomicAdd:
 		case Opcode::BufferAtomicSub:
 		case Opcode::BufferAtomicSMin:
@@ -1122,6 +1127,8 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BufferAtomicAnd:
 		case Opcode::BufferAtomicOr:
 		case Opcode::BufferAtomicXor:
+		case Opcode::BufferAtomicFMin:
+		case Opcode::BufferAtomicFMax:
 		case Opcode::BufferLoadSbyte:
 		case Opcode::BufferLoadSshort:
 		case Opcode::FlatLoadUbyte:

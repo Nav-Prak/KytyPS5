@@ -344,6 +344,10 @@ static void VulkanFindPhysicalDevice(VkInstance instance, VkSurfaceKHR surface,
 			LOGF("samplerMirrorClampToEdge is not supported\n");
 			skip_device = true;
 		}
+		if (features12.shaderBufferInt64Atomics != VK_TRUE) {
+			LOGF("shaderBufferInt64Atomics is not supported\n");
+			skip_device = true;
+		}
 		if (features13.robustImageAccess != VK_TRUE) {
 			LOGF("robustImageAccess is not supported\n");
 			skip_device = true;
@@ -610,6 +614,7 @@ static VkDevice VulkanCreateDevice(VkPhysicalDevice physical_device, VkSurfaceKH
 	features12.sType                    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
 	features12.pNext                    = &depth_clip_control;
 	features12.samplerMirrorClampToEdge = VK_TRUE;
+	features12.shaderBufferInt64Atomics = VK_TRUE;
 
 	VkPhysicalDeviceSubgroupSizeControlFeatures subgroup_size_control {};
 	subgroup_size_control.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES;
@@ -617,7 +622,11 @@ static VkDevice VulkanCreateDevice(VkPhysicalDevice physical_device, VkSurfaceKH
 
 	VkPhysicalDeviceVulkan13Features supported_features13 {};
 	supported_features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
-	supported_features13.pNext = nullptr;
+
+	VkPhysicalDeviceVulkan12Features supported_features12 {};
+	supported_features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+	supported_features12.pNext = nullptr;
+	supported_features13.pNext = &supported_features12;
 
 	const auto robustness2_ext_enabled =
 	    HasExtension(device_extensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
@@ -626,13 +635,14 @@ static VkDevice VulkanCreateDevice(VkPhysicalDevice physical_device, VkSurfaceKH
 	supported_robustness2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT;
 	supported_robustness2.pNext = nullptr;
 	if (robustness2_ext_enabled) {
-		supported_features13.pNext = &supported_robustness2;
+		supported_features12.pNext = &supported_robustness2;
 	}
 
 	VkPhysicalDeviceFeatures2 supported_features2 {};
 	supported_features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
 	supported_features2.pNext = &supported_features13;
 	vkGetPhysicalDeviceFeatures2(physical_device, &supported_features2);
+	EXIT_NOT_IMPLEMENTED(supported_features12.shaderBufferInt64Atomics != VK_TRUE);
 
 	VkPhysicalDeviceFeatures device_features {};
 	device_features.fragmentStoresAndAtomics             = VK_TRUE;

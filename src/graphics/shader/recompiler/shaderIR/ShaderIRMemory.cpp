@@ -126,6 +126,22 @@ bool LowerBufferAtomicDword(const Decoder::Instruction& decoded, BasicBlock* blo
 	return true;
 }
 
+bool LowerBufferAtomicQword(const Decoder::Instruction& decoded, BasicBlock* block, Opcode op,
+                            std::string* error) {
+	Instruction inst;
+	inst.pc       = decoded.pc;
+	inst.op       = op;
+	inst.memory   = MemoryInfoFromDecoded(decoded, ResourceKind::Buffer);
+	inst.dst.kind = OperandKind::Null;
+	if ((decoded.glc && !LowerRegisterOperand(decoded.dst, &inst.dst, error)) ||
+	    !LowerSourceOperand(decoded.dst, &inst.src[0], error) ||
+	    !LowerBufferAddressSources(decoded, &inst, 1, error)) {
+		return false;
+	}
+	block->instructions.push_back(inst);
+	return true;
+}
+
 ResourceKind DsMemoryKind(const Decoder::Instruction& decoded) {
 	return decoded.gds ? ResourceKind::Gds : ResourceKind::Lds;
 }
@@ -519,6 +535,8 @@ bool LowerMemoryInstruction(const Decoder::Instruction& decoded, BasicBlock* blo
 			return LowerBufferStore(decoded, block, error);
 		case Decoder::Opcode::BufferAtomicSwap:
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicSwapU32, error);
+		case Decoder::Opcode::BufferAtomicSwapX2:
+			return LowerBufferAtomicQword(decoded, block, Opcode::AtomicSwapU64, error);
 		case Decoder::Opcode::BufferAtomicAdd:
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicAddU32, error);
 		case Decoder::Opcode::BufferAtomicSub:
@@ -537,6 +555,10 @@ bool LowerMemoryInstruction(const Decoder::Instruction& decoded, BasicBlock* blo
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicOrU32, error);
 		case Decoder::Opcode::BufferAtomicXor:
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicXorU32, error);
+		case Decoder::Opcode::BufferAtomicFMin:
+			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicFMinF32, error);
+		case Decoder::Opcode::BufferAtomicFMax:
+			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicFMaxF32, error);
 		case Decoder::Opcode::FlatLoadUbyte:
 		case Decoder::Opcode::FlatLoadSbyte:
 		case Decoder::Opcode::FlatLoadUshort:
@@ -688,6 +710,7 @@ bool IsMemoryOpcode(Decoder::Opcode opcode) {
 		case Decoder::Opcode::TBufferStoreFormatXyz:
 		case Decoder::Opcode::TBufferStoreFormatXyzw:
 		case Decoder::Opcode::BufferAtomicSwap:
+		case Decoder::Opcode::BufferAtomicSwapX2:
 		case Decoder::Opcode::BufferAtomicAdd:
 		case Decoder::Opcode::BufferAtomicSub:
 		case Decoder::Opcode::BufferAtomicSMin:
@@ -697,6 +720,8 @@ bool IsMemoryOpcode(Decoder::Opcode opcode) {
 		case Decoder::Opcode::BufferAtomicAnd:
 		case Decoder::Opcode::BufferAtomicOr:
 		case Decoder::Opcode::BufferAtomicXor:
+		case Decoder::Opcode::BufferAtomicFMin:
+		case Decoder::Opcode::BufferAtomicFMax:
 		case Decoder::Opcode::FlatLoadUbyte:
 		case Decoder::Opcode::FlatLoadSbyte:
 		case Decoder::Opcode::FlatLoadUshort:

@@ -1,8 +1,13 @@
 #include "graphics/shader/recompiler/ResourceMaterialization.h"
 
+#include "common/logging/log.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/host_gpu/hostMemory.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cstring>
 #include <fmt/format.h>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -55,7 +60,180 @@ uint64_t AddressSpecialization(const AddressResource&           resource,
 	           : snapshot.guest_base - snapshot.binding_base;
 }
 
+constexpr uint64_t MaxBindlessWindowBytes = 1ull * 1024ull * 1024ull * 1024ull;
+constexpr uint64_t MaxBindlessTableBytes  = 64ull * 1024ull * 1024ull;
+
+bool ReadGuestDwords(const SrtRuntime& runtime, uint64_t address, uint32_t* dst, uint32_t count) {
+	if (runtime.read_memory != nullptr) {
+		for (uint32_t i = 0; i < count; i++) {
+			if (!runtime.read_memory(runtime.userdata, address + i * 4ull, dst + i)) {
+				return false;
+			}
+		}
+		return true;
+	}
+	std::memcpy(dst, reinterpret_cast<const void*>(address), count * sizeof(uint32_t));
+	return true;
+}
+
+bool GuestRangeReadable(const SrtRuntime& runtime, uint64_t address, uint64_t size) {
+	if (size == 0 || address > AddressMask || size - 1u > AddressMask - address) {
+		return false;
+	}
+	if (runtime.read_memory == nullptr) {
+		// Live-memory evaluation: uninitialized descriptor heaps contain arbitrary bytes, so an
+		// unmapped base is the strongest signal that a table entry is not a real descriptor.
+		// Mapped-but-protected pages count as valid: the memory tracker protects GPU-owned pages
+		// and a CPU touch resolves through the page-fault handler.
+		return HostMemoryRangeIsMapped(address, size);
+	}
+	uint32_t   ignored = 0;
+	const auto last    = (address + size - 1u) & ~uint64_t {3};
+	return runtime.read_memory(runtime.userdata, address & ~uint64_t {3}, &ignored) &&
+	       runtime.read_memory(runtime.userdata, last, &ignored);
+}
+
+bool DecodeBindlessRawBuffer(const SrtRuntime& runtime, const uint32_t* entry, uint64_t* begin,
+                             uint64_t* end) {
+	// Buffer descriptors have TYPE=0. Reject texture prefixes and arbitrary record payloads before
+	// they can enlarge the synthetic binding window.
+	if ((entry[3] >> 30u) != 0) {
+		return false;
+	}
+	const auto base   = (static_cast<uint64_t>(entry[1] & 0xffffu) << 32u | entry[0]) & AddressMask;
+	const auto stride = (entry[1] >> 16u) & 0x3fffu;
+	const auto records = entry[2];
+	const auto bytes =
+	    stride == 0 ? static_cast<uint64_t>(records) : static_cast<uint64_t>(stride) * records;
+	if (base == 0 || bytes == 0 || bytes > MaxBindlessWindowBytes ||
+	    !GuestRangeReadable(runtime, base, bytes)) {
+		return false;
+	}
+	*begin = base;
+	*end   = base + bytes;
+	return true;
+}
+
+void WarnBindlessWindow(uint32_t first_use_pc, const std::string& reason) {
+	static std::atomic<uint32_t> log_count {0};
+	if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+		LOGF("bindless window at pc 0x%08" PRIx32
+		     " degraded to a null binding (accesses will be dropped): %s\n",
+		     first_use_pc, reason.c_str());
+	}
+}
+
+// GTA's runtime-selected V# pattern uses an 80-byte structured table. Dword 1 of each record is a
+// selector, and selector*16 addresses the actual four-dword V# within the same allocation. Resolve
+// only those referenced entries, then bind the union of their validated raw-buffer ranges.
+//
+// Descriptor heaps are populated lazily by the guest, so at any given dispatch the table may
+// still hold unrelated bytes. A table that cannot be resolved therefore degrades to a null
+// window (the shader-side descriptor checks drop the accesses) instead of failing the bind: on
+// real hardware such a dispatch only dereferences entries its input data selects, and those are
+// valid whenever the workload is real.
+bool BuildBindlessWindow(const SrtRuntime& runtime, const DescriptorValue& table,
+                         uint32_t first_use_pc, DescriptorValue* window, std::string* error) {
+	(void)error;
+	const auto table_base =
+	    (static_cast<uint64_t>(table.dwords[1] & 0xffffu) << 32u | table.dwords[0]) & AddressMask;
+	const auto table_stride  = (table.dwords[1] >> 16u) & 0x3fffu;
+	const auto table_records = table.dwords[2];
+	const auto table_bytes   = table_stride == 0
+	                               ? static_cast<uint64_t>(table_records)
+	                               : static_cast<uint64_t>(table_stride) * table_records;
+
+	*window             = {};
+	window->dword_count = 4;
+	if (table_base == 0 || table_bytes < 16) {
+		return true;
+	}
+	if (table_stride < 8 || table_bytes > MaxBindlessTableBytes ||
+	    !GuestRangeReadable(runtime, table_base, table_bytes)) {
+		WarnBindlessWindow(first_use_pc,
+		                   fmt::format("table is invalid: base=0x{:012x} stride={} records={} "
+		                               "bytes=0x{:x}",
+		                               table_base, table_stride, table_records, table_bytes));
+		return true;
+	}
+
+	std::vector<uint32_t> selectors;
+	selectors.reserve(std::min<uint32_t>(table_records, 65536u));
+	for (uint32_t record = 0; record < table_records; record++) {
+		uint32_t   selector = 0;
+		const auto selector_address =
+		    table_base + static_cast<uint64_t>(record) * table_stride + sizeof(uint32_t);
+		if (!ReadGuestDwords(runtime, selector_address, &selector, 1)) {
+			WarnBindlessWindow(first_use_pc, fmt::format("selector {} is unreadable", record));
+			return true;
+		}
+		const auto descriptor_offset = static_cast<uint64_t>(selector) * 16u;
+		if (descriptor_offset <= table_bytes && table_bytes - descriptor_offset >= 16u) {
+			selectors.push_back(selector);
+		}
+	}
+	std::sort(selectors.begin(), selectors.end());
+	selectors.erase(std::unique(selectors.begin(), selectors.end()), selectors.end());
+
+	uint64_t union_begin = UINT64_MAX;
+	uint64_t union_end   = 0;
+	for (const auto selector: selectors) {
+		uint32_t   entry[4]          = {};
+		const auto descriptor_offset = static_cast<uint64_t>(selector) * 16u;
+		if (!ReadGuestDwords(runtime, table_base + descriptor_offset, entry, 4)) {
+			continue;
+		}
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		if (!DecodeBindlessRawBuffer(runtime, entry, &begin, &end)) {
+			continue;
+		}
+		union_begin = std::min(union_begin, begin);
+		union_end   = std::max(union_end, end);
+	}
+	if (union_begin >= union_end) {
+		return true;
+	}
+	// Shifting the base for the device offset alignment is transparent to the shader because the
+	// binding start and the emitted rebase delta move together.
+	const auto aligned_begin = union_begin & ~(StorageBufferBindAlignment - 1u);
+	if (aligned_begin != union_begin &&
+	    !GuestRangeReadable(runtime, aligned_begin, union_begin - aligned_begin)) {
+		WarnBindlessWindow(first_use_pc,
+		                   fmt::format("aligned base 0x{:012x} below union base 0x{:012x} is "
+		                               "not readable",
+		                               aligned_begin, union_begin));
+		*window             = {};
+		window->dword_count = 4;
+		return true;
+	}
+	union_begin            = aligned_begin;
+	const auto union_bytes = union_end - union_begin;
+	if (union_bytes > MaxBindlessWindowBytes || union_bytes > UINT32_MAX) {
+		WarnBindlessWindow(first_use_pc,
+		                   fmt::format("union spans 0x{:x} bytes (base=0x{:012x}); too large "
+		                               "to bind",
+		                               union_bytes, union_begin));
+		*window             = {};
+		window->dword_count = 4;
+		return true;
+	}
+	window->dwords[0] = static_cast<uint32_t>(union_begin);
+	window->dwords[1] = static_cast<uint32_t>(union_begin >> 32u) & 0xffffu;
+	window->dwords[2] = static_cast<uint32_t>(union_bytes);
+	window->dwords[3] = 0;
+	return true;
+}
+
 } // namespace
+
+uint32_t BindlessWindowCount(const Program& program) {
+	uint32_t count = 0;
+	for (const auto& buffer: program.info.buffers) {
+		count += buffer.bindless ? 1u : 0u;
+	}
+	return count;
+}
 
 bool ValidateResourceSnapshot(const Program& program, const ResourceSnapshot& snapshot,
                               std::string* error) {
@@ -74,7 +252,8 @@ bool ValidateResourceSnapshot(const Program& program, const ResourceSnapshot& sn
 		}
 		return false;
 	}
-	if (snapshot.flattened_srt.size() != program.srt.reads.size()) {
+	if (snapshot.flattened_srt.size() !=
+	    program.srt.reads.size() + program.info.buffers.size() + BindlessWindowCount(program)) {
 		if (error != nullptr) {
 			*error = "flattened SRT snapshot does not match the shader plan";
 		}
@@ -209,9 +388,19 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 	std::vector<DescriptorSourceRequest> requests;
 	requests.reserve(program.info.buffers.size() + program.info.images.size() +
 	                 program.info.samplers.size() + program.info.addresses.size());
-	for (const auto& buffer: program.info.buffers) {
-		requests.push_back({buffer.source, buffer.first_use_pc});
+	// Tableless bindless buffers (V#s assembled from runtime pointers) have nothing to
+	// evaluate; they window over the tracked-buffer union below.
+	std::vector<uint32_t> buffer_slot(program.info.buffers.size(), UINT32_MAX);
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		const auto& buffer = program.info.buffers[i];
+		if (buffer.bindless && buffer.table_source <= ScalarProvenance::Unknown) {
+			continue;
+		}
+		buffer_slot[i] = static_cast<uint32_t>(requests.size());
+		requests.push_back(
+		    {buffer.bindless ? buffer.table_source : buffer.source, buffer.first_use_pc});
 	}
+	const auto buffer_request_count = static_cast<uint32_t>(requests.size());
 	for (const auto& image: program.info.images) {
 		requests.push_back({image.source, image.first_use_pc});
 	}
@@ -232,8 +421,72 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 
 	ResourceSnapshot next;
 	auto             cursor = values.begin();
-	next.buffers.assign(cursor, cursor + program.info.buffers.size());
-	cursor += program.info.buffers.size();
+	next.buffers.resize(program.info.buffers.size());
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		if (buffer_slot[i] != UINT32_MAX) {
+			next.buffers[i] = values[buffer_slot[i]];
+		} else {
+			next.buffers[i].dword_count = 4;
+		}
+	}
+	cursor += buffer_request_count;
+
+	// Fallback window for runtime pointer chases: the union of this dispatch's statically
+	// tracked buffers. Also used when a descriptor-table scan cannot produce a usable window,
+	// which otherwise pins polled memory at zero and can hang GPU-side spin loops.
+	DescriptorValue union_window;
+	union_window.dword_count = 4;
+	{
+		uint64_t union_begin = UINT64_MAX;
+		uint64_t union_end   = 0;
+		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+			if (program.info.buffers[i].bindless) {
+				continue;
+			}
+			const auto& descriptor = next.buffers[i];
+			const auto  base       = (static_cast<uint64_t>(descriptor.dwords[1] & 0xffffu) << 32u |
+			                          descriptor.dwords[0]) &
+			                         AddressMask;
+			const auto  stride     = (descriptor.dwords[1] >> 16u) & 0x3fffu;
+			const auto  records    = descriptor.dwords[2];
+			const auto  bytes      = stride == 0 ? static_cast<uint64_t>(records)
+			                                     : static_cast<uint64_t>(stride) * records;
+			if (base == 0 || bytes == 0) {
+				continue;
+			}
+			union_begin = std::min(union_begin, base);
+			union_end   = std::max(union_end, base + bytes);
+		}
+		if (union_begin < union_end) {
+			union_begin &= ~(StorageBufferBindAlignment - 1u);
+			const auto union_bytes = union_end - union_begin;
+			if (union_bytes <= MaxBindlessWindowBytes && union_bytes <= UINT32_MAX) {
+				union_window.dwords[0] = static_cast<uint32_t>(union_begin);
+				union_window.dwords[1] = static_cast<uint32_t>(union_begin >> 32u) & 0xffffu;
+				union_window.dwords[2] = static_cast<uint32_t>(union_bytes);
+			}
+		}
+	}
+
+	std::vector<uint32_t> bindless_windows;
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		if (!program.info.buffers[i].bindless) {
+			continue;
+		}
+		DescriptorValue window;
+		window.dword_count = 4;
+		if (buffer_slot[i] != UINT32_MAX) {
+			if (!BuildBindlessWindow(runtime, next.buffers[i], program.info.buffers[i].first_use_pc,
+			                         &window, error)) {
+				return false;
+			}
+		}
+		if (window.dwords[0] == 0 && window.dwords[1] == 0) {
+			window = union_window;
+		}
+		next.buffers[i] = window;
+		bindless_windows.push_back(window.dwords[0]);
+	}
 	next.images.assign(cursor, cursor + program.info.images.size());
 	cursor += program.info.images.size();
 	for (auto& descriptor: next.images) {
@@ -258,21 +511,68 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 			                          : base >= before ? base - before
 			                                           : 0;
 			next.addresses.push_back({base, binding_base});
-		} else {
-			if (!runtime.flat_memory_base.has_value()) {
-				if (error != nullptr) {
-					*error =
-					    fmt::format("unbased {} address at pc 0x{:08x} requires runtime "
-					                "guest-address translation",
-					                address.kind == ResourceKind::Flat ? "FLAT" : "global/scratch",
-					                address.first_use_pc);
-				}
-				return false;
+		} else if (runtime.flat_memory_base.has_value()) {
+			next.addresses.push_back({*runtime.flat_memory_base, *runtime.flat_memory_base, 0});
+		} else if (address.kind == ResourceKind::Flat) {
+			if (error != nullptr) {
+				*error = fmt::format("unbased FLAT address at pc 0x{:08x} requires runtime "
+				                     "guest-address translation",
+				                     address.first_use_pc);
 			}
-			next.addresses.push_back({*runtime.flat_memory_base, *runtime.flat_memory_base});
+			return false;
+		} else {
+			// Runtime pointer chase (global/scratch address computed on the GPU). Window the
+			// access over the union of this dispatch's tracked buffers: RAGE passes the
+			// buffers such pointers target alongside the pointers themselves. Addresses
+			// outside the window are dropped by the emitted bounds check.
+			uint64_t union_begin = UINT64_MAX;
+			uint64_t union_end   = 0;
+			for (const auto& descriptor: next.buffers) {
+				const auto base    = (static_cast<uint64_t>(descriptor.dwords[1] & 0xffffu) << 32u |
+				                      descriptor.dwords[0]) &
+				                     AddressMask;
+				const auto stride  = (descriptor.dwords[1] >> 16u) & 0x3fffu;
+				const auto records = descriptor.dwords[2];
+				const auto bytes   = stride == 0 ? static_cast<uint64_t>(records)
+				                                 : static_cast<uint64_t>(stride) * records;
+				if (base == 0 || bytes == 0) {
+					continue;
+				}
+				union_begin = std::min(union_begin, base);
+				union_end   = std::max(union_end, base + bytes);
+			}
+			if (union_begin < union_end) {
+				union_begin &= ~(StorageBufferBindAlignment - 1u);
+			}
+			const auto union_bytes = union_begin < union_end ? union_end - union_begin : 0;
+			if (union_bytes == 0 || union_bytes > MaxBindlessWindowBytes) {
+				WarnBindlessWindow(
+				    address.first_use_pc,
+				    fmt::format("unbased {} address window is unusable (span 0x{:x}); "
+				                "accesses will be dropped",
+				                address.kind == ResourceKind::Global ? "global" : "scratch",
+				                union_bytes));
+				next.addresses.push_back({0, 0, 0});
+			} else {
+				next.addresses.push_back({union_begin, union_begin, union_bytes});
+			}
 		}
 	}
 	next.flattened_srt = std::move(flattened_srt);
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		// Bindless buffers rebase through their window base instead; their binding is already
+		// aligned, so the generic remainder stays zero.
+		uint32_t remainder = 0;
+		if (!program.info.buffers[i].bindless) {
+			const auto base = (static_cast<uint64_t>(next.buffers[i].dwords[1] & 0xffffu) << 32u |
+			                   next.buffers[i].dwords[0]) &
+			                  AddressMask;
+			remainder       = static_cast<uint32_t>(base & (StorageBufferBindAlignment - 1u));
+		}
+		next.flattened_srt.push_back(remainder);
+	}
+	next.flattened_srt.insert(next.flattened_srt.end(), bindless_windows.begin(),
+	                          bindless_windows.end());
 	next.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	if (!ValidateResourceSnapshot(program, next, error)) {
 		return false;

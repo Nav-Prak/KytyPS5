@@ -1385,6 +1385,9 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		Common::LockGuard lock(m_mutex);
 
 		CheckBuffer();
+		auto cs_regs      = m_sh_ctx.GetCs().cs_regs;
+		cs_regs.wave_size = Pm4::ComputeDispatchWaveSize(mode);
+		m_sh_ctx.SetCsShader(cs_regs);
 		frame_num = GraphicsRunGetFrameNum();
 		if (GraphicsRunDebugDumpEnabled()) {
 			static std::atomic<uint32_t> log_count {0};

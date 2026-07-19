@@ -350,6 +350,7 @@ void CommandBuffer::Execute() {
 		     m_debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != VK_SUCCESS);
+	m_submitted_generation.store(GetRecordingGeneration(), std::memory_order_release);
 }
 
 void CommandBuffer::ExecuteWithSemaphore(VkSemaphore signal_semaphore) {
@@ -414,6 +415,7 @@ void CommandBuffer::ExecuteWithSemaphore(VkSemaphore signal_semaphore) {
 		     m_debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != VK_SUCCESS);
+	m_submitted_generation.store(GetRecordingGeneration(), std::memory_order_release);
 }
 
 void CommandBuffer::ExecuteWithSemaphore(VkSemaphore          wait_semaphore,
@@ -482,6 +484,27 @@ void CommandBuffer::ExecuteWithSemaphore(VkSemaphore          wait_semaphore,
 		     m_debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != VK_SUCCESS);
+	m_submitted_generation.store(GetRecordingGeneration(), std::memory_order_release);
+}
+
+bool CommandBuffer::IsRecordingGenerationComplete(uint64_t generation) const {
+	const auto current   = GetRecordingGeneration();
+	const auto submitted = m_submitted_generation.load(std::memory_order_acquire);
+	if (IsCommandBufferUseComplete(generation, current, submitted, false)) {
+		return true;
+	}
+	if (generation == 0 || current != generation || submitted != generation || IsInvalid()) {
+		return false;
+	}
+	const auto result =
+	    vkGetFenceStatus(g_render_ctx->GetGraphicCtx()->device, m_pool->fences[m_index]);
+	if (result != VK_SUCCESS && result != VK_NOT_READY) {
+		LOGF("vkGetFenceStatus failed: %s (%d), queue=%d index=%u generation=%" PRIu64 "\n",
+		     string_VkResult(result), static_cast<int>(result), m_queue, m_index, generation);
+		EXIT_NOT_IMPLEMENTED(true);
+	}
+	return IsCommandBufferUseComplete(generation, GetRecordingGeneration(), submitted,
+	                                  result == VK_SUCCESS);
 }
 
 void CommandBuffer::WaitForFence() {
@@ -526,7 +549,7 @@ void CommandBuffer::WaitForFenceAndReset() {
 		m_fence_waited = false;
 		vkResetCommandBuffer(m_pool->buffers[m_index],
 		                     VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT);
-		m_recording_generation++;
+		m_recording_generation.fetch_add(1, std::memory_order_release);
 	}
 	m_host_stream.Reset();
 	if (was_executed) {

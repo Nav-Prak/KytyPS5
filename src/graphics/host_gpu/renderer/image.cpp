@@ -40,9 +40,8 @@ TextureImageCreateParams MakeImageParams(const ImageInfo& info, bool storage) {
 	params.image_layout    = TextureUploadDestination::MipLevels;
 	params.allow_cube_view = !storage;
 	params.compatible_format_views =
-	    storage && (IsRgba8SrgbViewFormat(TextureGetFormat(info.format, params.format_usage)) ||
-	                info.format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) ||
-	                info.format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float));
+	    storage &&
+	    IsMutableStorageSampledViewFormat(TextureGetFormat(info.format, params.format_usage));
 	params.owner = storage ? "StorageTextureCache" : "TextureCache";
 	return params;
 }

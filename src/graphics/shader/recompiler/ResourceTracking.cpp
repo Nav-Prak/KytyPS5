@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <fmt/format.h>
+#include <map>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -21,6 +22,7 @@ const char* StageName(ShaderType stage) {
 bool IsAtomic(Opcode op) {
 	switch (op) {
 		case Opcode::AtomicSwapU32:
+		case Opcode::AtomicSwapU64:
 		case Opcode::AtomicAddU32:
 		case Opcode::AtomicSubU32:
 		case Opcode::AtomicSMinI32:
@@ -29,7 +31,9 @@ bool IsAtomic(Opcode op) {
 		case Opcode::AtomicUMaxU32:
 		case Opcode::AtomicAndU32:
 		case Opcode::AtomicOrU32:
-		case Opcode::AtomicXorU32: return true;
+		case Opcode::AtomicXorU32:
+		case Opcode::AtomicFMinF32:
+		case Opcode::AtomicFMaxF32: return true;
 		default: return false;
 	}
 }
@@ -190,6 +194,7 @@ public:
 			patch.inst->memory.sampler         = patch.sampler;
 			patch.inst->memory.resource_source = ScalarProvenance::Undefined;
 			patch.inst->memory.sampler_source  = ScalarProvenance::Undefined;
+			patch.inst->memory.bindless_sgprs  = patch.bindless_sgprs;
 		}
 		m_program.resource_tracking_complete = true;
 		return true;
@@ -197,9 +202,10 @@ public:
 
 private:
 	struct Patch {
-		Instruction* inst     = nullptr;
-		uint32_t     resource = 0;
-		uint32_t     sampler  = 0;
+		Instruction* inst           = nullptr;
+		uint32_t     resource       = 0;
+		uint32_t     sampler        = 0;
+		uint32_t     bindless_sgprs = UINT32_MAX;
 	};
 
 	bool Fail(uint32_t pc, std::string* error, const std::string& reason) const {
@@ -210,8 +216,7 @@ private:
 		return false;
 	}
 
-	std::string FormatInstructionContext(const std::vector<uint32_t>& path,
-	                                     uint32_t use_pc) const {
+	std::string FormatInstructionContext(const std::vector<uint32_t>& path, uint32_t use_pc) const {
 		std::vector<uint32_t> targets {use_pc};
 		for (const auto id: path) {
 			if (id < m_program.provenance.values.size()) {
@@ -225,10 +230,9 @@ private:
 		std::string context;
 		for (const auto target: targets) {
 			for (const auto& block: m_program.blocks) {
-				const auto found = std::find_if(block.instructions.begin(), block.instructions.end(),
-				                                [target](const Instruction& inst) {
-					                                return inst.pc == target;
-				                                });
+				const auto found =
+				    std::find_if(block.instructions.begin(), block.instructions.end(),
+				                 [target](const Instruction& inst) { return inst.pc == target; });
 				if (found == block.instructions.end()) {
 					continue;
 				}
@@ -252,10 +256,9 @@ private:
 		};
 		std::vector<UniformRead> reads;
 		for (const auto& block: m_program.blocks) {
-			const auto use = std::find_if(block.instructions.begin(), block.instructions.end(),
-			                              [use_pc](const Instruction& inst) {
-				                              return inst.pc == use_pc;
-			                              });
+			const auto use =
+			    std::find_if(block.instructions.begin(), block.instructions.end(),
+			                 [use_pc](const Instruction& inst) { return inst.pc == use_pc; });
 			if (use == block.instructions.end()) {
 				continue;
 			}
@@ -284,7 +287,7 @@ private:
 			for (const auto& block: m_program.blocks) {
 				for (size_t index = 0; index < block.instructions.size(); index++) {
 					const auto& inst = block.instructions[index];
-					const bool writes =
+					const bool  writes =
 					    (inst.dst.kind == OperandKind::Register && inst.dst.reg == read.source) ||
 					    (inst.dst2.kind == OperandKind::Register && inst.dst2.reg == read.source);
 					if (!writes) {
@@ -298,15 +301,14 @@ private:
 					const auto last  = std::min(index + 3, block.instructions.size());
 					detail += fmt::format("\n  writer context around 0x{:08x}:", inst.pc);
 					for (auto i = first; i < last; i++) {
-						detail += fmt::format("\n    {}", InstructionDiagnostic(block.instructions[i]));
+						detail +=
+						    fmt::format("\n    {}", InstructionDiagnostic(block.instructions[i]));
 					}
 					std::vector<Register> dependencies;
-					for (uint32_t source_index = 0; source_index < inst.src_count;
-					     source_index++) {
+					for (uint32_t source_index = 0; source_index < inst.src_count; source_index++) {
 						const auto& source = inst.src[source_index];
 						if (source.kind == OperandKind::Register &&
-						    source.reg.file == RegisterFile::Vector &&
-						    source.reg != read.source &&
+						    source.reg.file == RegisterFile::Vector && source.reg != read.source &&
 						    std::find(dependencies.begin(), dependencies.end(), source.reg) ==
 						        dependencies.end()) {
 							dependencies.push_back(source.reg);
@@ -328,13 +330,13 @@ private:
 	}
 
 	std::string FormatVectorDependency(Register source, uint32_t depth) const {
-		std::string detail = fmt::format("\n    vector dependency {} writers:",
-		                                 RegisterToString(source));
+		std::string detail =
+		    fmt::format("\n    vector dependency {} writers:", RegisterToString(source));
 		uint32_t writers = 0;
 		for (const auto& block: m_program.blocks) {
 			for (size_t index = 0; index < block.instructions.size(); index++) {
 				const auto& inst = block.instructions[index];
-				const bool writes =
+				const bool  writes =
 				    (inst.dst.kind == OperandKind::Register && inst.dst.reg == source) ||
 				    (inst.dst2.kind == OperandKind::Register && inst.dst2.reg == source);
 				if (!writes) {
@@ -381,6 +383,57 @@ private:
 		return detail;
 	}
 
+	// Recognizes a V# whose four dwords were fetched by one runtime SBufferLoadDwordX4 from a
+	// CPU-resolvable descriptor-table V#. Returns the interned table descriptor source, or
+	// Undefined when the source does not match the pattern.
+	uint32_t ClassifyBindlessSource(uint32_t source) {
+		if (const auto cached = m_bindless_sources.find(source);
+		    cached != m_bindless_sources.end()) {
+			return cached->second;
+		}
+		const auto classify = [&]() -> uint32_t {
+			const auto* descriptor = GetDescriptorSource(m_program, source);
+			if (descriptor == nullptr || descriptor->dword_count != 4) {
+				return ScalarProvenance::Undefined;
+			}
+			const auto& values = m_program.provenance.values;
+			const auto  first  = descriptor->dwords[0];
+			if (first >= values.size() || values[first].op != ScalarValueOp::ReadConstBuffer) {
+				return ScalarProvenance::Undefined;
+			}
+			const auto& base_node = values[first];
+			for (uint32_t i = 1; i < 4; i++) {
+				const auto id = descriptor->dwords[i];
+				if (id >= values.size()) {
+					return ScalarProvenance::Undefined;
+				}
+				const auto& node = values[id];
+				if (node.op != ScalarValueOp::ReadConstBuffer || node.pc != base_node.pc ||
+				    node.imm != base_node.imm + i * 4u ||
+				    !std::equal(node.args.begin(), node.args.begin() + 5, base_node.args.begin())) {
+					return ScalarProvenance::Undefined;
+				}
+			}
+			DescriptorValue table;
+			table.dword_count = 4;
+			for (uint32_t i = 0; i < 4; i++) {
+				table.dwords[i] = base_node.args[i];
+				if (!ScalarValueResolved(m_program, table.dwords[i])) {
+					return ScalarProvenance::Undefined;
+				}
+			}
+			return InternDescriptorSource(&m_program, table);
+		};
+		const auto table_source = classify();
+		m_bindless_sources.emplace(source, table_source);
+		return table_source;
+	}
+
+	bool SupportsBindlessAccess(const Instruction& inst) const {
+		return inst.memory.kind == ResourceKind::Buffer && !inst.memory.formatted &&
+		       !inst.memory.typed;
+	}
+
 	bool ValidateSource(uint32_t source, uint32_t dwords, uint32_t pc, std::string* error) const {
 		const auto* descriptor = GetDescriptorSource(m_program, source);
 		if (descriptor == nullptr || descriptor->dword_count != dwords) {
@@ -400,17 +453,18 @@ private:
 					const auto node_pc = id < m_program.provenance.values.size()
 					                         ? m_program.provenance.values[id].pc
 					                         : 0;
-					chain += fmt::format("{}{}:{}@0x{:08x}({})", chain.empty() ? "" : " -> ",
-					                     id, op, node_pc,
-					                     ScalarValueToString(m_program.provenance, id));
+					chain +=
+					    fmt::format("{}{}:{}@0x{:08x}({})", chain.empty() ? "" : " -> ", id, op,
+					                node_pc, ScalarValueToString(m_program.provenance, id));
 				}
-				return Fail(
-				    pc, error,
-				    fmt::format(
-				        "descriptor source {} dword {} contains an unknown value {} ({}){} path {}{}",
-				        source, i, value, ScalarValueToString(m_program.provenance, value),
-				        FormatValueArguments(value), chain, FormatInstructionContext(path, pc) +
-				                                                    FormatUniformVectorProducers(pc)));
+				return Fail(pc, error,
+				            fmt::format("descriptor source {} dword {} contains an unknown value "
+				                        "{} ({}){} path {}{}",
+				                        source, i, value,
+				                        ScalarValueToString(m_program.provenance, value),
+				                        FormatValueArguments(value), chain,
+				                        FormatInstructionContext(path, pc) +
+				                            FormatUniformVectorProducers(pc)));
 			}
 		}
 		const auto dynamic =
@@ -584,9 +638,35 @@ private:
 
 	bool Collect(Instruction* inst, std::string* error) {
 		if (IsAddress(*inst)) {
+			// Addresses whose provenance cannot be resolved are pointer chases computed on the
+			// GPU; demote them to the unbased runtime-address path, where the emitted code reads
+			// the live registers and rebases onto the bound window. Scalar loads remember their
+			// base SGPR pair because patching overwrites the resource field.
+			bool demoted_scalar = false;
+			if (inst->memory.resource_source != ScalarProvenance::Unknown &&
+			    (inst->op == Opcode::SLoadDword || inst->memory.kind == ResourceKind::Global ||
+			     inst->memory.kind == ResourceKind::Scratch)) {
+				std::string validate_error;
+				if (!ValidateSource(inst->memory.resource_source, 2, inst->pc, &validate_error)) {
+					// Keep the original source reachable for user-data collection: the base
+					// registers are not IR operands, so without this their user-SGPR roots
+					// would vanish from the push constants.
+					if (std::find(m_program.srt.dynamic_sources.begin(),
+					              m_program.srt.dynamic_sources.end(),
+					              inst->memory.resource_source) ==
+					    m_program.srt.dynamic_sources.end()) {
+						m_program.srt.dynamic_sources.push_back(inst->memory.resource_source);
+					}
+					inst->memory.resource_source = ScalarProvenance::Unknown;
+					if (inst->op == Opcode::SLoadDword) {
+						demoted_scalar              = true;
+						inst->memory.bindless_sgprs = inst->memory.resource;
+					}
+				}
+			}
 			const bool unbased = inst->memory.resource_source == ScalarProvenance::Unknown;
 			if ((!unbased && !ValidateSource(inst->memory.resource_source, 2, inst->pc, error)) ||
-			    (unbased && inst->memory.kind != ResourceKind::Flat &&
+			    (unbased && !demoted_scalar && inst->memory.kind != ResourceKind::Flat &&
 			     inst->memory.kind != ResourceKind::Global &&
 			     inst->memory.kind != ResourceKind::Scratch)) {
 				return unbased ? Fail(inst->pc, error, "scalar memory base is unresolved") : false;
@@ -595,15 +675,41 @@ private:
 			if (resource == UINT32_MAX) {
 				return Fail(inst->pc, error, "address resource limit exceeded");
 			}
-			m_patches.push_back({inst, resource, 0});
+			m_patches.push_back({inst, resource, 0, inst->memory.bindless_sgprs});
 			return true;
 		}
 		if (!IsBuffer(*inst) && !IsImage(*inst)) {
 			return true;
 		}
+		std::string validate_error;
 		if (!ValidateSource(inst->memory.resource_source, IsBuffer(*inst) ? 4u : 8u, inst->pc,
-		                    error)) {
-			return false;
+		                    &validate_error)) {
+			if (!IsBuffer(*inst) || !SupportsBindlessAccess(*inst)) {
+				if (error != nullptr) {
+					*error = std::move(validate_error);
+				}
+				return false;
+			}
+			// Table pattern when recognizable; otherwise the V# was assembled in registers from
+			// a runtime pointer. Either way the live quad holds the descriptor at the use, so
+			// the bindless emission path applies; a tableless buffer windows over the
+			// dispatch's tracked-buffer union at materialization.
+			const auto table_source = ClassifyBindlessSource(inst->memory.resource_source);
+			Patch      patch;
+			patch.inst           = inst;
+			patch.bindless_sgprs = inst->memory.resource * 4u;
+			patch.resource       = AddBuffer(*inst);
+			if (patch.resource == UINT32_MAX) {
+				return Fail(inst->pc, error, "buffer resource limit exceeded");
+			}
+			auto& buffer = m_info.buffers[patch.resource];
+			if (buffer.bindless && buffer.table_source != table_source) {
+				return Fail(inst->pc, error, "bindless buffer table source conflict");
+			}
+			buffer.bindless     = true;
+			buffer.table_source = table_source;
+			m_patches.push_back(patch);
+			return true;
 		}
 		Patch patch;
 		patch.inst     = inst;
@@ -629,9 +735,10 @@ private:
 		return true;
 	}
 
-	Program&           m_program;
-	ShaderInfo         m_info;
-	std::vector<Patch> m_patches;
+	Program&                     m_program;
+	ShaderInfo                   m_info;
+	std::vector<Patch>           m_patches;
+	std::map<uint32_t, uint32_t> m_bindless_sources;
 };
 
 } // namespace

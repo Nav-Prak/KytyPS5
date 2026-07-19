@@ -37,6 +37,11 @@ ShaderSubgroupConfiguration ConfigureShaderSubgroup(const GraphicContext&       
 	if (program.lane_mask_mode != ShaderLaneMaskMode::NativeWave) {
 		return {};
 	}
+	if (program.workgroup_wave64) {
+		return guest_wave_size == 64u ? ShaderSubgroupConfiguration {
+		                                     ShaderSubgroupMode::WorkgroupWave64, 0}
+		                              : ShaderSubgroupConfiguration {};
+	}
 	if (context.subgroup_size == guest_wave_size) {
 		return {ShaderSubgroupMode::Natural, 0};
 	}

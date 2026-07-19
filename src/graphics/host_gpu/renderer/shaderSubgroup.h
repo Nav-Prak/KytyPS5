@@ -11,6 +11,7 @@ enum class ShaderSubgroupMode {
 	Controlled,
 	PerInvocationGraphics,
 	FlattenedMasks,
+	WorkgroupWave64,
 	Unsupported
 };
 

@@ -264,7 +264,9 @@ bool AllocateBindings(Program* program, const BindingLayoutOptions& options, std
 		}
 		AddBinding(&next, DescriptorBindingKind::AddressMemory, std::move(resources));
 	}
-	if (!program->srt.reads.empty()) {
+	// Buffers always carry a bind-remainder dword (and bindless buffers a window base) in the
+	// flattened SRT, so the binding exists whenever the shader has SRT reads or buffers at all.
+	if (!program->srt.reads.empty() || !program->info.buffers.empty()) {
 		AddBinding(&next, DescriptorBindingKind::FlattenedSrt);
 	}
 

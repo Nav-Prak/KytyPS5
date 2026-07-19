@@ -12,6 +12,9 @@ bool HostMemoryQueryRange(uint64_t addr, uint64_t requested_size, HostMemoryAcce
 bool HostMemoryQueryReadable(uint64_t addr, uint64_t requested_size, uint64_t* readable_size);
 bool HostMemoryIsReadable(uint64_t addr);
 bool HostMemoryRangeIsReadable(uint64_t addr, uint64_t size);
+// True when the range is committed, regardless of current protection. Pages the memory tracker
+// has protected still count: a CPU touch faults and resolves through the page manager.
+bool HostMemoryRangeIsMapped(uint64_t addr, uint64_t size);
 
 } // namespace Libs::Graphics
 

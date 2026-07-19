@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/objects/label.h"
 #include "graphics/host_gpu/objects/textureCommon.h"
 #include "graphics/host_gpu/renderer/bufferCache.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/dummyTextureCache.h"
 #include "graphics/host_gpu/renderer/image.h"
 #include "graphics/host_gpu/renderer/imageView.h"
@@ -37,6 +38,21 @@ namespace {
 thread_local const void* g_texture_cache_lock_owner = nullptr;
 thread_local const void* g_texture_fault_owner      = nullptr;
 
+std::optional<uint8_t> UniformGuestByte(uint64_t address, uint64_t size) {
+	if (address == 0 || size == 0 || size > SIZE_MAX) {
+		return {};
+	}
+	std::vector<uint8_t> bytes(static_cast<size_t>(size));
+	if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), size)) {
+		return {};
+	}
+	if (!std::all_of(bytes.begin(), bytes.end(),
+	                 [&](uint8_t value) { return value == bytes[0]; })) {
+		return {};
+	}
+	return bytes[0];
+}
+
 [[nodiscard]] uint64_t HashSampledImageEdges(const Image& image) {
 	constexpr uint64_t page_mask  = TRACKER_PAGE_SIZE - 1;
 	const uint64_t     begin      = image.address;
@@ -58,6 +74,19 @@ thread_local const void* g_texture_fault_owner      = nullptr;
 		     image.address, image.size);
 	}
 	return XXH3_64bits(bytes.data(), static_cast<size_t>(head_size + tail_size));
+}
+
+void InitializeVideoOutDccContent(GraphicContext* ctx, VideoOutVulkanImage* image,
+                                  const VideoOutInfo& info, VideoOutDccInitialContent content) {
+	if (content != VideoOutDccInitialContent::Clear0000) {
+		EXIT("TextureCache: unsupported DCC native initialization, content=%u\n",
+		     static_cast<uint32_t>(content));
+	}
+	image->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+	UtilScratchBuffer scratch(info.size);
+	std::memset(scratch.Data(), 0, static_cast<size_t>(info.size));
+	UtilFillImage(ctx, image, scratch.Data(), info.size, info.pitch,
+	              static_cast<uint64_t>(VK_IMAGE_LAYOUT_GENERAL));
 }
 
 class FaultSafeTextureLock final {
@@ -100,18 +129,20 @@ struct TextureCache::CachedImage {
 		DepthTarget,
 		VideoOut
 	} kind = Kind::Texture;
-	Image            info;
-	RenderTargetInfo target;
-	DepthTargetInfo  depth;
-	VideoOutInfo     video_out;
-	GraphicContext*  ctx   = nullptr;
-	VulkanImage*     image = nullptr;
-	VulkanMemory     memory;
-	bool             gpu_modified        = false;
-	bool             buffer_modified     = false;
-	bool             stencil_initialized = false;
-	bool             registered          = false;
-	DccMetadataPlane video_out_render_dcc;
+	Image                  info;
+	RenderTargetInfo       target;
+	DepthTargetInfo        depth;
+	VideoOutInfo           video_out;
+	GraphicContext*        ctx   = nullptr;
+	VulkanImage*           image = nullptr;
+	VulkanMemory           memory;
+	bool                   gpu_modified        = false;
+	bool                   buffer_modified     = false;
+	bool                   stencil_initialized = false;
+	bool                   registered          = false;
+	SurfaceContentState    video_out_state     = SurfaceContentState::Uninitialized;
+	DccMetadataPlane       video_out_render_dcc;
+	std::optional<uint8_t> video_out_dcc_clear_code;
 
 	~CachedImage() {
 		if (ctx == nullptr || image == nullptr || registered) {
@@ -484,26 +515,16 @@ struct TextureCache::ReadbackWorker {
 		                                   Prospero::NumBytesPerElement(cached.info.format))
 		                             : MakeColorImageTransferInfo(cached.target);
 		const bool linear  = info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
-		const bool tiled_target = target && IsTiledRenderTarget(cached.target);
-		const bool tiled_storage =
-		    storage && info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
-		bool single_layer_storage = false;
-		if (storage) {
-			switch (static_cast<Prospero::ImageType>(cached.info.type)) {
-				case Prospero::ImageType::kColor2D:
-				case Prospero::ImageType::kColor2DArray:
-					single_layer_storage = cached.info.depth == 1;
-					break;
-				default: break;
-			}
-		}
+		const bool tiled_target      = target && IsTiledRenderTarget(cached.target);
+		const auto storage_layout    = storage ? ClassifyStorageImageReadbackLayout(cached.info)
+		                                       : StorageImageReadbackLayout::Unsupported;
+		const bool tiled_storage     = storage_layout == StorageImageReadbackLayout::RenderTarget;
+		const bool standard4_storage = storage_layout == StorageImageReadbackLayout::Standard4KB;
 		const bool basic_storage =
-		    !storage ||
-		    (single_layer_storage && cached.info.base_level == 0 && cached.info.levels == 1 &&
-		     cached.info.base_array == 0 && (linear || tiled_storage));
+		    !storage || storage_layout != StorageImageReadbackLayout::Unsupported;
 		const auto layers = target ? cached.target.layers : 1u;
-		if ((!linear && !tiled_target && !tiled_storage) || !basic_storage || info.levels != 1 ||
-		    info.size > UINT32_MAX) {
+		if ((!linear && !tiled_target && !tiled_storage && !standard4_storage) || !basic_storage ||
+		    info.levels != 1 || info.size > UINT32_MAX) {
 			EXIT("TextureCache: unsupported color-image readback layout, addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64 " extent=%ux%u pitch=%u bpe=%u levels=%u tile=%u kind=%u\n",
 			     info.address, info.size, info.width, info.height, info.pitch,
@@ -525,20 +546,24 @@ struct TextureCache::ReadbackWorker {
 		    MakeLayeredImageBufferCopies(layers, slice_size, info.pitch, info.width, info.height);
 		UtilFillBuffer(cached.ctx, download.data(), info.size, regions, cached.image,
 		               cached.image->layout);
-		if (tiled_target || tiled_storage) {
+		if (tiled_target || tiled_storage || standard4_storage) {
 			guest.resize(info.size);
-			const RenderTargetInfo layout =
-			    target ? cached.target : RenderTargetInfo {info.address,
-			                                               info.size,
-			                                               info.format,
-			                                               info.width,
-			                                               info.height,
-			                                               info.pitch,
-			                                               info.bytes_per_element,
-			                                               info.tile_mode,
-			                                               info.levels,
-			                                               1};
-			cache.m_tiler.TileImage(guest.data(), download.data(), layout);
+			if (standard4_storage) {
+				cache.m_tiler.TileImage(guest.data(), download.data(), cached.info);
+			} else {
+				const RenderTargetInfo layout =
+				    target ? cached.target : RenderTargetInfo {info.address,
+				                                               info.size,
+				                                               info.format,
+				                                               info.width,
+				                                               info.height,
+				                                               info.pitch,
+				                                               info.bytes_per_element,
+				                                               info.tile_mode,
+				                                               info.levels,
+				                                               1};
+				cache.m_tiler.TileImage(guest.data(), download.data(), layout);
+			}
 			Libs::LibKernel::Memory::WriteBacking(info.address, guest.data(), info.size);
 		} else {
 			Libs::LibKernel::Memory::WriteBacking(info.address, download.data(), info.size);
@@ -1291,13 +1316,13 @@ StorageTextureVulkanImage* TextureCache::FindStorageTexture(CommandBuffer*   com
 	const bool supported_depth_tile =
 	    info.tile == Prospero::GpuEnumValue(Prospero::TileMode::kDepth) &&
 	    IsSupportedStorageDepthTile(info.format, info.type, info.width, info.height, info.depth);
-	if (info.address == 0 || info.size == 0 || info.address >= TRACKER_ADDRESS_SIZE ||
-	    info.size > TRACKER_ADDRESS_SIZE - info.address || info.width == 0 || info.height == 0 ||
-	    info.depth == 0 || info.levels == 0 || info.levels > 16 || info.base_level >= info.levels ||
-	    info.view_levels != 1 || info.base_array != 0 || !supported_type ||
-	    (info.tile != Prospero::GpuEnumValue(Prospero::TileMode::kLinear) &&
-	     info.tile != Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) &&
-	     !supported_depth_tile) ||
+	const bool supported_tile =
+	    IsSupportedStorageTile(info.format, info.tile, supported_depth_tile);
+	if (command == nullptr || ctx == nullptr || info.address == 0 || info.size == 0 ||
+	    info.address >= TRACKER_ADDRESS_SIZE || info.size > TRACKER_ADDRESS_SIZE - info.address ||
+	    info.width == 0 || info.height == 0 || info.depth == 0 || info.levels == 0 ||
+	    info.levels > 16 || info.base_level >= info.levels || info.view_levels != 1 ||
+	    info.base_array != 0 || !supported_type || !supported_tile ||
 	    !IsSupportedStorageSwizzle(info.format, info.swizzle)) {
 		EXIT("TextureCache: unsupported storage-image request, command=%p ctx=%p "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
@@ -1456,10 +1481,16 @@ RenderTextureVulkanImage* TextureCache::FindRenderTarget(CommandBuffer*         
 		TileSizeAlign layout {};
 		TileGetTextureSize(format, info.width, info.height, expected_pitch, info.levels,
 		                   info.tile_mode, &layout, nullptr, nullptr);
-		if (expected_pitch != info.pitch || layout.align != 65536 || layout.size != info.size) {
+		const auto expected_size = layout.size <= UINT64_MAX / info.layers
+		                               ? static_cast<uint64_t>(layout.size) * info.layers
+		                               : UINT64_MAX;
+		if (!IsExactStandard64RenderTargetFootprint(info, expected_pitch, layout.size,
+		                                            layout.align)) {
 			EXIT("TextureCache: invalid Standard64KB render-target layout,"
-			     " size=0x%016" PRIx64 " expected=0x%08x align=0x%08x pitch=%u/%u\n",
-			     info.size, layout.size, layout.align, info.pitch, expected_pitch);
+			     " size=0x%016" PRIx64 " expected=0x%016" PRIx64
+			     " slice=0x%08x layers=%u align=0x%08x pitch=%u/%u\n",
+			     info.size, expected_size, layout.size, info.layers, layout.align, info.pitch,
+			     expected_pitch);
 		}
 	}
 	const auto rows = static_cast<uint64_t>(info.height - 1);
@@ -1520,6 +1551,7 @@ RenderTextureVulkanImage* TextureCache::FindRenderTarget(CommandBuffer*         
 		return static_cast<RenderTextureVulkanImage*>(match->image);
 	}
 	std::vector<CachedImage*>    retire;
+	std::vector<CachedImage*>    readback;
 	std::vector<CachedImage*>    buffer_owned_depth_retire;
 	std::shared_ptr<CachedImage> native_image_source;
 	for (const auto& entry: m_images) {
@@ -1581,6 +1613,10 @@ RenderTextureVulkanImage* TextureCache::FindRenderTarget(CommandBuffer*         
 				    cached.kind == CachedImage::Kind::RenderTarget ||
 				    (cached.kind == CachedImage::Kind::DepthTarget && target_buffer_overlap &&
 				     IsCoherentGuestImageSource(target_source, info.address, info.size));
+				if (supported && cached.kind == CachedImage::Kind::RenderTarget &&
+				    cached.gpu_modified) {
+					readback.push_back(&cached);
+				}
 				if (supported && cached.kind == CachedImage::Kind::DepthTarget) {
 					buffer_owned_depth_retire.push_back(&cached);
 				}
@@ -1603,6 +1639,15 @@ RenderTextureVulkanImage* TextureCache::FindRenderTarget(CommandBuffer*         
 		retire.push_back(&cached);
 	}
 	RequireRetirementIsolation(retire, "render target", info.address, info.size);
+	if (!readback.empty()) {
+		VulkanDeviceWaitIdle(ctx);
+		for (auto* cached: readback) {
+			const auto transfer = m_readback->DownloadColorImage(*cached);
+			m_memory_tracker.ForEachDownloadRange<true>(transfer.address, transfer.size,
+			                                            [](uint64_t, uint64_t) noexcept {});
+			cached->gpu_modified = false;
+		}
+	}
 	for (auto* cached: buffer_owned_depth_retire) {
 		// The exact formatted buffer owns the current bytes. Clear the stale-image marker only
 		// after coherence validation so normal retirement can remove the obsolete Vulkan shape.
@@ -2009,6 +2054,23 @@ TextureCache::RegisterVideoOutSurfaces(GraphicContext*                  ctx,
 			                           infos[j].size)) {
 				EXIT("TextureCache: video-out surfaces share pages, first=%zu second=%zu\n", i, j);
 			}
+			if ((infos[i].metadata_size != 0 &&
+			     ImagePageRangesOverlap(infos[i].metadata_address, infos[i].metadata_size,
+			                            infos[j].address, infos[j].size)) ||
+			    (infos[j].metadata_size != 0 &&
+			     ImagePageRangesOverlap(infos[j].metadata_address, infos[j].metadata_size,
+			                            infos[i].address, infos[i].size)) ||
+			    (infos[i].metadata_size != 0 && infos[j].metadata_size != 0 &&
+			     ImagePageRangesOverlap(infos[i].metadata_address, infos[i].metadata_size,
+			                            infos[j].metadata_address, infos[j].metadata_size))) {
+				EXIT("TextureCache: video-out data/metadata planes overlap, first=%zu second=%zu\n",
+				     i, j);
+			}
+		}
+	}
+	for (const auto& info: infos) {
+		if (info.metadata_size != 0) {
+			RegisterMeta(info.metadata_address, info.metadata_size);
 		}
 	}
 	std::lock_guard transaction(m_resource_mutex);
@@ -2047,13 +2109,37 @@ TextureCache::RegisterVideoOutSurfaces(GraphicContext*                  ctx,
 				    ImageOps::UploadVideoOut(ctx, static_cast<VideoOutVulkanImage*>(cached->image),
 				                             info, false);
 			    });
+			cached->video_out_state = SurfaceContentState::Coherent;
 		} else {
-			// A compressed guest surface cannot be decoded without its DCC metadata. Establish the
-			// normal tracked range, but leave the shared native image to be initialized by a GPU
-			// render/clear before any sampled or presentation read.
+			std::optional<uint8_t> metadata_code;
+			m_metadata_tracker.ForEachUploadRange(
+			    info.metadata_address, info.metadata_size, false,
+			    [](uint64_t, uint64_t) noexcept {},
+			    [&]() noexcept {
+				    metadata_code = UniformGuestByte(info.metadata_address, info.metadata_size);
+			    });
+			const auto initial_content = metadata_code.has_value()
+			                                 ? ClassifyVideoOutDccInitialContent(*metadata_code)
+			                                 : VideoOutDccInitialContent::Unsupported;
+			// The color payload is irrelevant for a recognized whole-surface DCC clear, but it
+			// still needs a tracked baseline so a later guest write invalidates native coherence.
 			m_memory_tracker.ForEachUploadRange(
 			    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
 			    []() noexcept {});
+			if (initial_content == VideoOutDccInitialContent::Unsupported) {
+				cached->video_out_state = SurfaceContentState::GuestCurrent;
+			} else {
+				InitializeVideoOutDccContent(ctx, static_cast<VideoOutVulkanImage*>(cached->image),
+				                             info, initial_content);
+				cached->video_out_state          = SurfaceContentState::Coherent;
+				cached->video_out_dcc_clear_code = *metadata_code;
+			}
+			if (graphics_debug_dump_enabled()) {
+				LOGF("TextureCache: video-out display DCC metadata addr=0x%016" PRIx64
+				     " size=0x%016" PRIx64 " uniform=%d code=0x%02x content=%u\n",
+				     info.metadata_address, info.metadata_size, metadata_code.has_value(),
+				     metadata_code.value_or(0), static_cast<uint32_t>(initial_content));
+			}
 		}
 		result.push_back(static_cast<VideoOutVulkanImage*>(cached->image));
 		m_images.push_back(std::move(cached));
@@ -2117,32 +2203,123 @@ void TextureCache::RefreshVideoOut(VideoOutVulkanImage* image, bool render_targe
 
 void TextureCache::AcquireVideoOut(VideoOutVulkanImage* image, const VideoOutAccess& access) {
 	if (image == nullptr) {
-		EXIT("TextureCache: invalid video-out acquisition\n");
+		EXIT("TextureCache: invalid video-out acquisition, image=%p\n",
+		     static_cast<const void*>(image));
 	}
+	std::lock_guard      transaction(m_resource_mutex);
+	FaultSafeTextureLock lock(this, m_lock);
+	const auto it = std::find_if(m_images.begin(), m_images.end(),
+	                             [image](const auto& cached) { return cached->image == image; });
+	if (it == m_images.end() || (*it)->kind != CachedImage::Kind::VideoOut) {
+		EXIT("TextureCache: acquired video-out image is not registered, image=%p\n",
+		     static_cast<const void*>(image));
+	}
+	auto&       cached              = **it;
+	const auto& info                = cached.video_out;
+	const bool  image_dirty         = m_memory_tracker.IsRegionCpuModified(info.address, info.size);
+	const bool  cached_buffer_dirty = cached.buffer_modified;
+	const bool  buffer_overlap      = m_buffer_cache.HasPageOverlap(info.address, info.size);
+	const bool  buffer_cpu_dirty =
+	    buffer_overlap && m_buffer_cache.IsRegionCpuModified(info.address, info.size);
+	const bool buffer_gpu_dirty =
+	    buffer_overlap && m_buffer_cache.IsRegionGpuModified(info.address, info.size);
+	const bool compressed = IsKnownCompressedVideoOut(info.compression);
+	const bool display_metadata_dirty =
+	    compressed &&
+	    m_metadata_tracker.IsRegionCpuModified(info.metadata_address, info.metadata_size);
+	const bool render_metadata_dirty =
+	    compressed && cached.video_out_render_dcc.address != 0 &&
+	    m_metadata_tracker.IsRegionCpuModified(cached.video_out_render_dcc.address,
+	                                           cached.video_out_render_dcc.size);
+	const bool metadata_dirty = display_metadata_dirty || render_metadata_dirty;
+	if (cached_buffer_dirty && !buffer_overlap) {
+		EXIT("TextureCache: video-out buffer ownership has no cached overlap, "
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+		     info.address, info.size);
+	}
+	const bool buffer_dirty = cached_buffer_dirty || buffer_cpu_dirty || buffer_gpu_dirty;
+	const bool guest_dirty  = image_dirty || buffer_dirty || metadata_dirty;
 	if (access.intent == VideoOutAccessIntent::FullOverwrite) {
-		std::lock_guard      transaction(m_resource_mutex);
-		FaultSafeTextureLock lock(this, m_lock);
-		const auto it = std::find_if(m_images.begin(), m_images.end(),
-		                             [image](const auto& cached) { return cached->image == image; });
-		if (it == m_images.end() || (*it)->kind != CachedImage::Kind::VideoOut ||
-		    !IsFullVideoOutOverwrite((*it)->video_out, access)) {
-			EXIT("TextureCache: invalid full video-out overwrite\n");
+		if (!IsFullVideoOutOverwrite(info, access)) {
+			EXIT("TextureCache: video-out overwrite is not a full surface, addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64
+			     " mip=%u layer=%u layers=%u offset=%u,%u extent=%ux%u surface=%ux%u\n",
+			     info.address, info.size, access.base_mip_level, access.base_array_layer,
+			     access.layer_count, access.offset_x, access.offset_y, access.width, access.height,
+			     info.width, info.height);
 		}
-		const auto& info = (*it)->video_out;
 		m_buffer_cache.ValidateGpuAccess(info.address, info.size, false, true);
-		if (m_buffer_cache.HasPageOverlap(info.address, info.size)) {
+		if (buffer_gpu_dirty) {
+			EXIT("TextureCache: full image overwrite requires ordered GPU buffer retirement, "
+			     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+			     info.address, info.size);
+		}
+		if (buffer_overlap) {
 			m_buffer_cache.SupersedeCpuRangeWithImage(info.address, info.size);
 		}
-		m_memory_tracker.ForEachUploadRange(
-		    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
-		(*it)->buffer_modified = false;
+		if (image_dirty) {
+			m_memory_tracker.ForEachUploadRange(
+			    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
+			    []() noexcept {});
+		}
+		cached.buffer_modified = false;
+		cached.video_out_dcc_clear_code.reset();
+		cached.video_out_state = cached.gpu_modified ? SurfaceContentState::NativeCurrent
+		                                             : SurfaceContentState::Uninitialized;
+		if (guest_dirty) {
+			LOGF("TextureCache: full video-out overwrite retired guest contents, "
+			     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
+			     " image_dirty=%d cached_buffer_dirty=%d buffer_cpu_dirty=%d\n",
+			     info.address, info.size, image_dirty, cached_buffer_dirty, buffer_cpu_dirty);
+		}
 		return;
 	}
-	RefreshVideoOut(image, false);
+	if (cached.gpu_modified || cached.video_out_state == SurfaceContentState::NativeCurrent) {
+		if (guest_dirty) {
+			EXIT("TextureCache: native-current video-out surface also has guest changes, "
+			     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " intent=%u\n",
+			     info.address, info.size, static_cast<uint32_t>(access.intent));
+		}
+		return;
+	}
+	if (!image_dirty && !buffer_dirty && !metadata_dirty) {
+		if (cached.video_out_state == SurfaceContentState::Coherent) {
+			return;
+		}
+		EXIT("TextureCache: compressed video-out access requires native contents, "
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " intent=%u state=%u\n",
+		     info.address, info.size, static_cast<uint32_t>(access.intent),
+		     static_cast<uint32_t>(cached.video_out_state));
+	}
+	if (info.compression != VideoOutCompression::Uncompressed) {
+		EXIT("TextureCache: compressed video-out preserve/present is unsupported, "
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " image_dirty=%d cached_buffer_dirty=%d buffer_cpu_dirty=%d"
+		     " buffer_gpu_dirty=%d display_metadata_dirty=%d render_metadata_dirty=%d"
+		     " intent=%u state=%u\n",
+		     info.address, info.size, image_dirty, cached_buffer_dirty, buffer_cpu_dirty,
+		     buffer_gpu_dirty, display_metadata_dirty, render_metadata_dirty,
+		     static_cast<uint32_t>(access.intent), static_cast<uint32_t>(cached.video_out_state));
+	}
+	if (buffer_dirty) {
+		const auto source = m_buffer_cache.ObtainBufferForImage(info.address, info.size);
+		if (!IsCoherentGuestImageSource(source, info.address, info.size)) {
+			EXIT("TextureCache: invalid video-out source, addr=0x%016" PRIx64 " size=0x%016" PRIx64
+			     " buffer=%p current=%d source=0x%016" PRIx64 "+0x%016" PRIx64
+			     " buffer_modified=%d\n",
+			     info.address, info.size, static_cast<const void*>(source.buffer),
+			     source.cpu_current, source.address, source.size, cached.buffer_modified);
+		}
+		cached.buffer_modified = false;
+	}
+	m_memory_tracker.ForEachUploadRange(
+	    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
+	    [&]() noexcept { ImageOps::UploadVideoOut(cached.ctx, image, info, true); });
+	cached.video_out_state = SurfaceContentState::Coherent;
 }
 
 void TextureCache::BindVideoOutRenderMetadata(VideoOutVulkanImage* image,
-	                                            uint64_t             metadata_address) {
+                                              uint64_t             metadata_address) {
 	if (image == nullptr || metadata_address == 0) {
 		EXIT("TextureCache: invalid video-out render metadata binding\n");
 	}
@@ -2150,8 +2327,9 @@ void TextureCache::BindVideoOutRenderMetadata(VideoOutVulkanImage* image,
 	{
 		std::lock_guard      transaction(m_resource_mutex);
 		FaultSafeTextureLock lock(this, m_lock);
-		const auto it = std::find_if(m_images.begin(), m_images.end(),
-		                             [image](const auto& cached) { return cached->image == image; });
+		const auto it = std::find_if(m_images.begin(), m_images.end(), [image](const auto& cached) {
+			return cached->image == image;
+		});
 		if (it == m_images.end() || (*it)->kind != CachedImage::Kind::VideoOut ||
 		    !IsKnownCompressedVideoOut((*it)->video_out.compression)) {
 			EXIT("TextureCache: render DCC binding requires a compressed video-out image\n");
@@ -2167,22 +2345,99 @@ void TextureCache::BindVideoOutRenderMetadata(VideoOutVulkanImage* image,
 			}
 			return;
 		}
+		if (metadata_address >= TRACKER_ADDRESS_SIZE ||
+		    metadata_size > TRACKER_ADDRESS_SIZE - metadata_address ||
+		    ImageRangeOverlaps((*it)->video_out.address, (*it)->video_out.size, metadata_address,
+		                       metadata_size) ||
+		    ImageRangeOverlaps((*it)->video_out.metadata_address, (*it)->video_out.metadata_size,
+		                       metadata_address, metadata_size)) {
+			EXIT("TextureCache: invalid video-out render DCC range, addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 "\n",
+			     metadata_address, metadata_size);
+		}
 	}
 	RegisterMeta(metadata_address, metadata_size);
+	if (QueryRegion(metadata_address, metadata_size).gpu_metadata_bytes) {
+		EXIT("TextureCache: video-out render DCC is already GPU-owned, addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 "\n",
+		     metadata_address, metadata_size);
+	}
+	std::optional<uint8_t> metadata_code;
+	m_metadata_tracker.ForEachUploadRange(
+	    metadata_address, metadata_size, false, [](uint64_t, uint64_t) noexcept {},
+	    [&]() noexcept { metadata_code = UniformGuestByte(metadata_address, metadata_size); });
+	if (graphics_debug_dump_enabled()) {
+		LOGF("TextureCache: video-out render DCC metadata addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " uniform=%d code=0x%02x\n",
+		     metadata_address, metadata_size, metadata_code.has_value(), metadata_code.value_or(0));
+	}
 	std::lock_guard      transaction(m_resource_mutex);
 	FaultSafeTextureLock lock(this, m_lock);
 	const auto it = std::find_if(m_images.begin(), m_images.end(),
 	                             [image](const auto& cached) { return cached->image == image; });
-	if (it == m_images.end() || (*it)->video_out_render_dcc.address != 0) {
+	if (it == m_images.end() || (*it)->kind != CachedImage::Kind::VideoOut ||
+	    (*it)->video_out_render_dcc.address != 0) {
 		EXIT("TextureCache: video-out render metadata binding raced image state\n");
+	}
+	if ((*it)->video_out_state == SurfaceContentState::Coherent &&
+	    (!(*it)->video_out_dcc_clear_code.has_value() || !metadata_code.has_value() ||
+	     *(*it)->video_out_dcc_clear_code != *metadata_code)) {
+		EXIT("TextureCache: coherent video-out render/display DCC contents differ, "
+		     "display_uniform=%d display_code=0x%02x render_uniform=%d render_code=0x%02x\n",
+		     (*it)->video_out_dcc_clear_code.has_value(),
+		     (*it)->video_out_dcc_clear_code.value_or(0), metadata_code.has_value(),
+		     metadata_code.value_or(0));
 	}
 	(*it)->video_out_render_dcc = {metadata_address, metadata_size};
 }
 
-bool TextureCache::ConsumeVideoOutDccMetadataTransfer(CommandBuffer*, uint64_t, uint64_t,
-	                                                    uint64_t, uint64_t) {
-	// Upstream's cache split retains the real compute transfer until native/display metadata
-	// ownership is represented by the new sparse image index.
+bool TextureCache::ConsumeVideoOutDccMetadataTransfer(CommandBuffer* command,
+                                                      uint64_t source_address, uint64_t source_size,
+                                                      uint64_t destination_address,
+                                                      uint64_t destination_size) {
+	if (command == nullptr || command->IsInvalid() || source_address == 0 || source_size == 0 ||
+	    destination_address == 0 || destination_size == 0) {
+		return false;
+	}
+	std::lock_guard      transaction(m_resource_mutex);
+	FaultSafeTextureLock lock(this, m_lock);
+	for (const auto& cached: m_images) {
+		if (cached->kind != CachedImage::Kind::VideoOut ||
+		    !IsKnownCompressedVideoOut(cached->video_out.compression) ||
+		    cached->video_out_render_dcc.address != source_address ||
+		    cached->video_out.metadata_address != destination_address) {
+			continue;
+		}
+		const auto active_size = ComputeVideoOutDccActiveMetadataSize(
+		    cached->video_out.size, cached->video_out.compression);
+		if (active_size == 0 || source_size != active_size || destination_size != active_size ||
+		    source_size > cached->video_out_render_dcc.size ||
+		    destination_size > cached->video_out.metadata_size) {
+			EXIT("TextureCache: video-out DCC transfer has invalid active coverage, "
+			     "source=0x%016" PRIx64 "+0x%016" PRIx64 " destination=0x%016" PRIx64
+			     "+0x%016" PRIx64 " expected=0x%016" PRIx64 "\n",
+			     source_address, source_size, destination_address, destination_size, active_size);
+		}
+		const auto source_meta      = m_surface_metas.find(source_address);
+		const auto destination_meta = m_surface_metas.find(destination_address);
+		if (source_meta == m_surface_metas.end() || destination_meta == m_surface_metas.end() ||
+		    source_meta->second.size != cached->video_out_render_dcc.size ||
+		    destination_meta->second.size != cached->video_out.metadata_size ||
+		    !source_meta->second.gpu_modified || !destination_meta->second.gpu_modified ||
+		    !m_metadata_tracker.IsRegionGpuModified(source_address, source_size) ||
+		    !m_metadata_tracker.IsRegionGpuModified(destination_address, destination_size) ||
+		    m_metadata_tracker.IsRegionCpuModified(source_address, source_size) ||
+		    m_metadata_tracker.IsRegionCpuModified(destination_address, destination_size) ||
+		    !cached->gpu_modified ||
+		    cached->video_out_state != SurfaceContentState::NativeCurrent) {
+			EXIT("TextureCache: video-out DCC transfer requires one native-current image and "
+			     "GPU-owned metadata planes\n");
+		}
+		// Both guest planes encode the same native-current pixels. Their byte-level repacking has
+		// no host operation, but retaining the image preserves the command's ownership lifetime.
+		command->RetainResourceUntilFence(cached);
+		return true;
+	}
 	return false;
 }
 
@@ -2446,11 +2701,51 @@ void TextureCache::MarkGpuWritten(VulkanImage* image) {
 				meta->second.gpu_modified = true;
 			}
 		}
+		if (cached->kind == CachedImage::Kind::VideoOut &&
+		    IsKnownCompressedVideoOut(cached->video_out.compression)) {
+			const DccMetadataPlane planes[] = {
+			    {cached->video_out.metadata_address, cached->video_out.metadata_size},
+			    cached->video_out_render_dcc,
+			};
+			for (const auto& plane: planes) {
+				if (plane.address == 0 && plane.size == 0) {
+					continue;
+				}
+				if (plane.address == 0 || plane.size == 0) {
+					EXIT("TextureCache: video-out has an incomplete DCC metadata plane\n");
+				}
+				auto meta = m_surface_metas.find(plane.address);
+				if (meta == m_surface_metas.end() || meta->second.size != plane.size) {
+					EXIT("TextureCache: video-out DCC metadata is missing or mismatched, "
+					     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+					     plane.address, plane.size);
+				}
+				m_buffer_cache.ValidateGpuAccess(plane.address, plane.size, false, true);
+				const bool cpu_modified =
+				    m_metadata_tracker.IsRegionCpuModified(plane.address, plane.size);
+				if (meta->second.gpu_modified && cpu_modified) {
+					EXIT("TextureCache: video-out write races CPU-modified DCC metadata, "
+					     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+					     plane.address, plane.size);
+				}
+				if (!meta->second.gpu_modified) {
+					m_metadata_tracker.ForEachUploadRange(
+					    plane.address, plane.size, true, [](uint64_t, uint64_t) noexcept {},
+					    []() noexcept {});
+					meta->second.gpu_modified = true;
+				}
+				meta->second.clear_mask = 0;
+			}
+		}
 		if (!cached->gpu_modified) {
 			for (uint32_t i = 0; i < cached->RangeCount(); i++) {
 				m_memory_tracker.MarkRegionAsGpuModified(cached->Address(i), cached->Size(i));
 			}
 			cached->gpu_modified = true;
+		}
+		if (cached->kind == CachedImage::Kind::VideoOut) {
+			cached->video_out_state = SurfaceContentState::NativeCurrent;
+			cached->video_out_dcc_clear_code.reset();
 		}
 		return;
 	}
@@ -2717,8 +3012,12 @@ bool TextureCache::InvalidateMemoryFromGPU(uint64_t vaddr, uint64_t size,
 		m_metadata_tracker.UntrackMemory(it->first, it->second.size);
 		it = m_surface_metas.erase(it);
 	}
-	auto             match  = m_images.end();
-	BufferImageWrite action = BufferImageWrite::None;
+	struct BufferImageTransition {
+		CachedImage*     cached = nullptr;
+		BufferImageWrite action = BufferImageWrite::None;
+	};
+	std::vector<BufferImageTransition> transitions;
+	transitions.reserve(m_images.size());
 	for (auto it = m_images.begin(); it != m_images.end(); ++it) {
 		auto& cached = **it;
 		if (!cached.OverlapsRange(vaddr, size, false)) {
@@ -2727,44 +3026,64 @@ bool TextureCache::InvalidateMemoryFromGPU(uint64_t vaddr, uint64_t size,
 		const auto next = ClassifyBufferImageWrite(vaddr, size, cached.Address(), cached.Size(),
 		                                           cached.BufferBinding(), cached.gpu_modified,
 		                                           formatted_buffer_write, cached.buffer_modified);
-		if (match != m_images.end() || next == BufferImageWrite::None ||
-		    next == BufferImageWrite::Unsupported) {
+		if (next == BufferImageWrite::None || next == BufferImageWrite::Unsupported) {
 			EXIT("TextureCache: unsupported GPU invalidation alias, addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64 " cached_kind=%u cached=0x%016" PRIx64 "+0x%016" PRIx64
-			     " gpu_modified=%d buffer_modified=%d formatted=%d ambiguous=%d\n",
+			     " gpu_modified=%d buffer_modified=%d formatted=%d ambiguous=0\n",
 			     vaddr, size, static_cast<uint32_t>(cached.kind), cached.Address(), cached.Size(),
-			     cached.gpu_modified, cached.buffer_modified, formatted_buffer_write,
-			     match != m_images.end());
+			     cached.gpu_modified, cached.buffer_modified, formatted_buffer_write);
 		}
-		match  = it;
-		action = next;
+		for (const auto& transition: transitions) {
+			if (!CanBatchRenderTargetBufferWrites(transition.action, transition.cached->Address(),
+			                                      transition.cached->Size(), next, cached.Address(),
+			                                      cached.Size())) {
+				EXIT("TextureCache: unsupported GPU invalidation alias set, addr=0x%016" PRIx64
+				     " size=0x%016" PRIx64 " first_kind=%u first=0x%016" PRIx64 "+0x%016" PRIx64
+				     " first_action=%u next_kind=%u next=0x%016" PRIx64 "+0x%016" PRIx64
+				     " next_action=%u formatted=%d\n",
+				     vaddr, size, static_cast<uint32_t>(transition.cached->kind),
+				     transition.cached->Address(), transition.cached->Size(),
+				     static_cast<uint32_t>(transition.action), static_cast<uint32_t>(cached.kind),
+				     cached.Address(), cached.Size(), static_cast<uint32_t>(next),
+				     formatted_buffer_write);
+			}
+		}
+		transitions.push_back({&cached, next});
 	}
-	if (match == m_images.end()) {
+	if (transitions.empty()) {
 		return false;
 	}
-	auto& cached = **match;
-	switch (action) {
-		case BufferImageWrite::InvalidateTexture:
-		case BufferImageWrite::InvalidateVideoOut:
-		case BufferImageWrite::InvalidateStorageTexture:
-		case BufferImageWrite::InvalidateDepthTarget:
-		case BufferImageWrite::InvalidateRenderTarget: cached.buffer_modified = true; return true;
-		case BufferImageWrite::SynchronizeRenderTarget:
-		case BufferImageWrite::SynchronizeStorageTexture:
-			SynchronizeColorImageToBufferLocked(cached, vaddr, size);
-			return true;
-		case BufferImageWrite::SynchronizeDepthTarget:
-			SynchronizeDepthImageToBufferLocked(cached, vaddr, size);
-			return true;
-		case BufferImageWrite::SynchronizeVideoOut:
-			SynchronizeColorImageToBufferLocked(cached, vaddr, size);
-			return true;
-		case BufferImageWrite::None:
-		case BufferImageWrite::Unsupported:
-			EXIT("TextureCache: invalid GPU invalidation action %u\n",
-			     static_cast<uint32_t>(action));
+	for (const auto& transition: transitions) {
+		auto& cached = *transition.cached;
+		switch (transition.action) {
+			case BufferImageWrite::InvalidateTexture:
+			case BufferImageWrite::InvalidateVideoOut:
+			case BufferImageWrite::InvalidateStorageTexture:
+			case BufferImageWrite::InvalidateDepthTarget:
+			case BufferImageWrite::InvalidateRenderTarget: cached.buffer_modified = true; break;
+			case BufferImageWrite::SynchronizeRenderTarget:
+				// A raw writable window may contain multiple page-isolated targets. Publish each
+				// exact backing reconstructed by its readback; surrounding buffer bytes remain
+				// guest current and are uploaded normally when BufferCache creates or expands its
+				// owner.
+				SynchronizeColorImageToBufferLocked(cached, cached.Address(), cached.Size());
+				break;
+			case BufferImageWrite::SynchronizeStorageTexture:
+				SynchronizeColorImageToBufferLocked(cached, vaddr, size);
+				break;
+			case BufferImageWrite::SynchronizeDepthTarget:
+				SynchronizeDepthImageToBufferLocked(cached, vaddr, size);
+				break;
+			case BufferImageWrite::SynchronizeVideoOut:
+				SynchronizeColorImageToBufferLocked(cached, vaddr, size);
+				break;
+			case BufferImageWrite::None:
+			case BufferImageWrite::Unsupported:
+				EXIT("TextureCache: invalid GPU invalidation action %u\n",
+				     static_cast<uint32_t>(transition.action));
+		}
 	}
-	return false;
+	return true;
 }
 
 DepthStencilVulkanImage* TextureCache::FindDepthTargetByRange(CommandBuffer* command,
@@ -2872,6 +3191,7 @@ TextureCache::RegionInfo TextureCache::QueryRegion(uint64_t vaddr, uint64_t size
 		const bool bytes = cached->OverlapsRange(vaddr, size, false);
 		result.image_bytes |= bytes;
 		result.gpu_image_bytes |= bytes && cached->gpu_modified;
+		result.non_buffer_owned_image_bytes |= bytes && !cached->buffer_modified;
 		result.non_sampled_pages |= cached->kind != CachedImage::Kind::Texture;
 	}
 	for (const auto& [address, metadata]: m_surface_metas) {
@@ -2894,9 +3214,9 @@ uint64_t TextureCache::BufferCompatiblePrefixSize(uint64_t vaddr, uint64_t size)
 	auto                 prefix = size;
 	for (const auto& cached: m_images) {
 		for (uint32_t range = 0; range < cached->RangeCount(); range++) {
-			prefix = std::min(prefix,
-			                  ImagePageRangePrefixBefore(vaddr, size, cached->Address(range),
-			                                             cached->Size(range)));
+			prefix =
+			    std::min(prefix, ImagePageRangePrefixBefore(vaddr, size, cached->Address(range),
+			                                                cached->Size(range)));
 		}
 	}
 	for (const auto& [address, meta]: m_surface_metas) {

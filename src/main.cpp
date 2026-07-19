@@ -43,6 +43,7 @@ static void PrintUsage() {
 	::printf("kyty_emulator --game <dir|elf> [options]\n\n");
 	::printf("Options:\n");
 	::printf("  --game <dir|elf>                     Game directory or ELF to load.\n");
+	::printf("  --save-elf <path>                    Save a SELF as an ELF and exit.\n");
 	::printf("  --screen-width <num>                 Window width. Default: 1280.\n");
 	::printf("  --screen-height <num>                Window height. Default: 720.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
@@ -64,6 +65,8 @@ static void PrintUsage() {
 	::printf("  --pipeline-dump-folder <path>        Pipeline dump folder.\n");
 	::printf("  --ngg-rectlist-draw <true|false>     Draw rect-list auto draws using the NGG "
 	         "4-vertex path.\n");
+	::printf("  --cs-skip-unresolved <true|false>    Skip compute dispatches whose shaders fail\n"
+	         "                                        recompilation instead of aborting.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
 }
 
@@ -151,6 +154,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("--game must point to an existing directory or ELF: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--save-elf") {
+			options.save_elf = Common::FixFilenameSlash(value);
 		} else if (arg == "--screen-width") {
 			options.config.screen_width = static_cast<uint32_t>(Common::ToInt32(value));
 		} else if (arg == "--screen-height") {
@@ -223,6 +228,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			options.config.pipeline_dump_folder = value;
 		} else if (arg == "--ngg-rectlist-draw") {
 			if (!ParseBool(value, options.config.ngg_rectlist_draw_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--cs-skip-unresolved") {
+			if (!ParseBool(value, options.config.cs_skip_unresolved_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

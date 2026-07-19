@@ -171,11 +171,17 @@ bool CanMergeBufferCacheQueueMask(uint64_t queue_mask, uint32_t queue) noexcept 
 }
 
 struct BufferCache::CachedBuffer {
+	struct QueueUse {
+		CommandBuffer* command    = nullptr;
+		uint64_t       generation = 0;
+	};
+
 	uint64_t                      vaddr      = 0;
 	uint64_t                      size       = 0;
 	uint64_t                      queue_mask = 0;
 	GraphicContext*               ctx        = nullptr;
 	std::shared_ptr<VulkanBuffer> buffer;
+	std::array<QueueUse, 64>      queue_uses {};
 };
 
 struct BufferCache::ReadbackWorker {
@@ -706,13 +712,16 @@ std::pair<VulkanBuffer*, uint64_t> BufferCache::ObtainBuffer(CommandBuffer*  com
 		     begin, end - begin);
 	}
 	// Cache allocations are tracker-page aligned, but byte-disjoint buffers and images may share
-	// an edge page. Clean read-only buffer and image views may coexist; Kyty retains a hard failure
-	// when either cache owns newer GPU bytes. Writable buffers delegate the ownership transition
-	// to TextureCache, which distinguishes raw texture-data writes from formatted target paths.
+	// an edge page. Clean read-only views may coexist, and a buffer-owned stale image may be read
+	// through the current buffer owner. Native-current image bytes and dirty-buffer/clean-image
+	// contradictions remain hard failures. Writable buffers delegate their ownership transition to
+	// TextureCache, which distinguishes raw texture-data writes from formatted target paths.
 	if (texture_pages.image_pages && texture_region.image_bytes) {
-		const bool coherent_read = is_read && !is_written &&
-		                           !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-		                           !texture_region.gpu_image_bytes;
+		const bool coherent_read =
+		    is_read && !is_written &&
+		    IsRawBufferImageReadCoherent(texture_region.gpu_image_bytes,
+		                                 texture_region.non_buffer_owned_image_bytes,
+		                                 m_memory_tracker.IsRegionGpuModified(vaddr, size));
 		if (!coherent_read) {
 			if (!is_written) {
 				EXIT("BufferCache: unsupported buffer/image alias, addr=0x%016" PRIx64
@@ -767,11 +776,24 @@ std::pair<VulkanBuffer*, uint64_t> BufferCache::ObtainBuffer(CommandBuffer*  com
 					     old.vaddr, old.size, static_cast<const void*>(old.ctx),
 					     static_cast<const void*>(ctx), static_cast<const void*>(old.buffer.get()));
 				}
+				uint64_t completed_queues = 0;
+				for (uint32_t old_queue = 0; old_queue < old.queue_uses.size(); old_queue++) {
+					const auto old_queue_mask = uint64_t {1} << old_queue;
+					if ((old.queue_mask & old_queue_mask) == 0 || old_queue == queue) {
+						continue;
+					}
+					const auto& use = old.queue_uses[old_queue];
+					if (use.command != nullptr &&
+					    use.command->IsRecordingGenerationComplete(use.generation)) {
+						completed_queues |= old_queue_mask;
+					}
+				}
+				old.queue_mask &= ~completed_queues;
 				if (!CanMergeBufferCacheQueueMask(old.queue_mask, queue)) {
 					EXIT("BufferCache: cross-queue overlap merge is unsupported, "
 					     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " used_queues=0x%016" PRIx64
-					     " requested_queue=%u\n",
-					     old.vaddr, old.size, old.queue_mask, queue);
+					     " completed_queues=0x%016" PRIx64 " requested_queue=%u\n",
+					     old.vaddr, old.size, old.queue_mask, completed_queues, queue);
 				}
 				std::vector<std::pair<uint64_t, uint64_t>> uploads;
 				m_memory_tracker.ForEachUploadRange(
@@ -874,8 +896,34 @@ std::pair<VulkanBuffer*, uint64_t> BufferCache::ObtainBuffer(CommandBuffer*  com
 		m_gpu_modified_ranges.Add(vaddr, size);
 	}
 	cached.queue_mask |= queue_mask;
+	cached.queue_uses[queue] = {.command    = command,
+	                            .generation = command->GetRecordingGeneration()};
 	command->RetainResourceUntilFence(cached.buffer);
 	return {cached.buffer.get(), vaddr - cached.vaddr};
+}
+
+uint64_t BufferCache::ReadOnlyBufferCompatiblePrefixSize(uint64_t vaddr, uint64_t size) {
+	if (m_texture_cache == nullptr || vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
+	    size > TRACKER_ADDRESS_SIZE - vaddr) {
+		EXIT("BufferCache: invalid read-only prefix request, addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 " texture_cache=%p\n",
+		     vaddr, size, static_cast<const void*>(m_texture_cache));
+	}
+	const auto      begin = AlignDown(vaddr);
+	const auto      end   = AlignUp(vaddr + size);
+	std::lock_guard transaction(m_resource_mutex);
+	const auto      bytes = m_texture_cache->QueryRegion(vaddr, size);
+	const auto      pages = begin == vaddr && end - begin == size
+	                            ? bytes
+	                            : m_texture_cache->QueryRegion(begin, end - begin);
+	const bool      incoherent_image =
+	    pages.image_pages && bytes.image_bytes &&
+	    !IsRawBufferImageReadCoherent(bytes.gpu_image_bytes, bytes.non_buffer_owned_image_bytes,
+	                                  m_memory_tracker.IsRegionGpuModified(vaddr, size));
+	if (!pages.metadata_pages && !incoherent_image) {
+		return size;
+	}
+	return m_texture_cache->BufferCompatiblePrefixSize(vaddr, size);
 }
 
 bool BufferCache::UploadHostData(CommandBuffer* command, GraphicContext* ctx, const void* src,
@@ -918,17 +966,21 @@ VulkanBuffer* BufferCache::ObtainNullBuffer(CommandBuffer* command, GraphicConte
 
 BufferImageCopySource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
-	    size > TRACKER_ADDRESS_SIZE - vaddr || (vaddr & (TRACKER_PAGE_SIZE - 1)) != 0 ||
-	    (size & (TRACKER_PAGE_SIZE - 1)) != 0) {
-		EXIT("BufferCache: invalid image source, addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " page_aligned=%d\n",
-		     vaddr, size,
-		     (vaddr & (TRACKER_PAGE_SIZE - 1)) == 0 && (size & (TRACKER_PAGE_SIZE - 1)) == 0);
+	    size > TRACKER_ADDRESS_SIZE - vaddr) {
+		EXIT("BufferCache: invalid image source, addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+		     vaddr, size);
 	}
+	// Image bases may be sub-page aligned (for example, a linear render target in an allocation
+	// pool), while ownership is tracked per 4 KiB page. Resolve every touched tracker page so a
+	// download cannot clear an edge page while leaving dirty-byte ownership behind. The returned
+	// source still names the exact image bytes.
+	const auto tracking_address = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+	const auto tracking_end     = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+	const auto tracking_size    = tracking_end - tracking_address;
 	FaultSafeCacheLock lock(this, m_mutex);
-	const bool         cpu_modified = m_memory_tracker.IsRegionCpuModified(vaddr, size);
-	const bool         gpu_modified = m_memory_tracker.IsRegionGpuModified(vaddr, size);
-	const auto         dirty_ranges = m_gpu_modified_ranges.Intersections(vaddr, size);
+	const bool cpu_modified = m_memory_tracker.IsRegionCpuModified(tracking_address, tracking_size);
+	const bool gpu_modified = m_memory_tracker.IsRegionGpuModified(tracking_address, tracking_size);
+	const auto dirty_ranges = m_gpu_modified_ranges.Intersections(tracking_address, tracking_size);
 	if (gpu_modified != !dirty_ranges.empty()) {
 		EXIT("BufferCache: image-source tracker and byte ownership disagree, addr=0x%016" PRIx64
 		     " size=0x%016" PRIx64 " tracker_dirty=%d byte_ranges=%zu\n",
@@ -968,7 +1020,7 @@ BufferImageCopySource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t
 		auto     backing_writes = ReserveBackingWrites(m_page_manager, dirty_ranges);
 		uint64_t downloaded     = 0;
 		m_memory_tracker.ForEachDownloadRange<true>(
-		    vaddr, size,
+		    tracking_address, tracking_size,
 		    [&](uint64_t address, uint64_t bytes) noexcept {
 			    ValidateDirtyPages(m_gpu_modified_ranges, address, bytes, "image");
 		    },
@@ -994,7 +1046,7 @@ BufferImageCopySource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t
 			     " size=0x%016" PRIx64 "\n",
 			     vaddr, size);
 		}
-		m_gpu_modified_ranges.Subtract(vaddr, size);
+		m_gpu_modified_ranges.Subtract(tracking_address, tracking_size);
 	}
 	auto owner = m_buffers.upper_bound(vaddr);
 	if (owner == m_buffers.begin()) {
@@ -1012,7 +1064,7 @@ BufferImageCopySource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t
 	if (cpu_modified) {
 		std::vector<std::pair<uint64_t, uint64_t>> uploads;
 		m_memory_tracker.ForEachUploadRange(
-		    vaddr, size, false,
+		    tracking_address, tracking_size, false,
 		    [&](uint64_t address, uint64_t bytes) noexcept {
 			    uploads.emplace_back(address, bytes);
 		    },
@@ -1029,9 +1081,9 @@ BufferImageCopySource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t
 			     vaddr, size);
 		}
 	}
-	if (m_memory_tracker.IsRegionCpuModified(vaddr, size) ||
-	    m_memory_tracker.IsRegionGpuModified(vaddr, size) ||
-	    !m_gpu_modified_ranges.Intersections(vaddr, size).empty()) {
+	if (m_memory_tracker.IsRegionCpuModified(tracking_address, tracking_size) ||
+	    m_memory_tracker.IsRegionGpuModified(tracking_address, tracking_size) ||
+	    !m_gpu_modified_ranges.Intersections(tracking_address, tracking_size).empty()) {
 		EXIT("BufferCache: image source did not become coherent, addr=0x%016" PRIx64
 		     " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
@@ -1251,8 +1303,8 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 void BufferCache::SupersedeCpuRangeWithImage(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
 	    size > TRACKER_ADDRESS_SIZE - vaddr) {
-		EXIT("BufferCache: invalid image-superseded range, addr=0x%016" PRIx64
-		     " size=0x%016" PRIx64 "\n",
+		EXIT("BufferCache: invalid image-superseded range, addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		     "\n",
 		     vaddr, size);
 	}
 	FaultSafeCacheLock lock(this, m_mutex);
@@ -1260,8 +1312,7 @@ void BufferCache::SupersedeCpuRangeWithImage(uint64_t vaddr, uint64_t size) {
 	const auto         dirty_ranges = m_gpu_modified_ranges.Intersections(vaddr, size);
 	if (gpu_modified || !dirty_ranges.empty()) {
 		EXIT("BufferCache: image overwrite cannot supersede GPU-current buffer bytes, "
-		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " tracker_dirty=%d byte_ranges=%zu\n",
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " tracker_dirty=%d byte_ranges=%zu\n",
 		     vaddr, size, gpu_modified, dirty_ranges.size());
 	}
 	const bool cpu_modified = m_memory_tracker.IsRegionCpuModified(vaddr, size);

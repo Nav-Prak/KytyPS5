@@ -66,7 +66,7 @@ bool ResolveHtileClearTarget(const HW::DepthRenderTarget& z, uint64_t descriptor
 	const bool  single_sample_metadata_compat = depth_single_sample_metadata_compatible(
 	    z.z_info.tile_mode_index, z.z_info.num_samples, z.z_info.embedded_sample_locations,
 	    z.z_info.plane_compression);
-	const bool  supported_depth_state =
+	const bool supported_depth_state =
 	    z.z_info.tile_surface_enable && depth_policy != nullptr &&
 	    (z.z_info.tile_mode_index == 0 || single_sample_metadata_compat) &&
 	    (z.z_info.num_samples == 0 || msaa_compat) && z.z_info.zrange_precision <= 1 &&
@@ -74,12 +74,11 @@ bool ResolveHtileClearTarget(const HW::DepthRenderTarget& z, uint64_t descriptor
 	    (!z.z_info.embedded_sample_locations || single_sample_metadata_compat) &&
 	    !z.z_info.partially_resident && z.z_info.num_mip_levels == 0 &&
 	    (z.z_info.plane_compression == 0 || single_sample_metadata_compat) &&
-	    z.depth_view.current_mip_level == 0 &&
-	    z.depth_view.slice_start == 0 && z.depth_view.slice_max == 0 &&
-	    z.depth_info.addr5_swizzle_mask == 0 && z.depth_info.array_mode == 0 &&
-	    z.depth_info.pipe_config == 0 && z.depth_info.bank_width == 0 &&
-	    z.depth_info.bank_height == 0 && z.depth_info.macro_tile_aspect == 0 &&
-	    z.depth_info.num_banks == 0;
+	    z.depth_view.current_mip_level == 0 && z.depth_view.slice_start == 0 &&
+	    z.depth_view.slice_max == 0 && z.depth_info.addr5_swizzle_mask == 0 &&
+	    z.depth_info.array_mode == 0 && z.depth_info.pipe_config == 0 &&
+	    z.depth_info.bank_width == 0 && z.depth_info.bank_height == 0 &&
+	    z.depth_info.macro_tile_aspect == 0 && z.depth_info.num_banks == 0;
 	const bool supported_stencil_state =
 	    z.stencil_info.tile_mode_index == 0 && z.stencil_info.tile_split == 0 &&
 	    !z.stencil_info.expclear_enabled &&
@@ -318,8 +317,7 @@ bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t grou
 	}
 	const bool vector_clear =
 	    resource.max_byte_extent == 16 && descriptor.Stride() == 16 &&
-	    descriptor.Format() ==
-	        Prospero::GpuEnumValue(Prospero::BufferFormat::k32_32_32_32UInt) &&
+	    descriptor.Format() == Prospero::GpuEnumValue(Prospero::BufferFormat::k32_32_32_32UInt) &&
 	    descriptor.DstSelXYZW() == DstSel(4, 5, 6, 7) && resources.user_data.size() == 8;
 	const bool packed_scalar_clear =
 	    resource.source == 2 && resource.max_byte_extent == 4 && descriptor.Stride() == 4 &&
@@ -342,11 +340,11 @@ bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t grou
 	      resources.user_data[8] != descriptor.NumRecords() || resources.user_data[9] != 1))) {
 		return false;
 	}
-	const bool common_dispatch =
-	    input.threads_num[0] == 64 && input.threads_num[1] == 1 &&
-	    input.threads_num[2] == 1 && group_x != 0 && group_y == 1 && group_z == 1 &&
-	    input.group_id[0] && !input.group_id[1] && !input.group_id[2] &&
-	    input.thread_ids_num == 1 && input.wave_size == 32 && !input.tg_size_en;
+	const bool common_dispatch = input.threads_num[0] == 64 && input.threads_num[1] == 1 &&
+	                             input.threads_num[2] == 1 && group_x != 0 && group_y == 1 &&
+	                             group_z == 1 && input.group_id[0] && !input.group_id[1] &&
+	                             !input.group_id[2] && input.thread_ids_num == 1 &&
+	                             input.wave_size == 32 && !input.tg_size_en;
 	const bool vector_full_dispatch =
 	    vector_clear && input.dispatch_thread_dimensions &&
 	    input.dispatch_threads_num[0] == group_x && input.dispatch_threads_num[1] == 1 &&
@@ -357,9 +355,8 @@ bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t grou
 	    input.dispatch_threads_num[0] == 0 && input.dispatch_threads_num[1] == 0 &&
 	    input.dispatch_threads_num[2] == 0 && mode == 0x41u &&
 	    static_cast<uint64_t>(group_x) * input.threads_num[0] == descriptor.NumRecords();
-	const bool full_dispatch =
-	    common_dispatch && (vector_full_dispatch || scalar_full_dispatch);
-	const auto size = BufferDescriptorSize(descriptor);
+	const bool full_dispatch = common_dispatch && (vector_full_dispatch || scalar_full_dispatch);
+	const auto size          = BufferDescriptorSize(descriptor);
 	if (!full_dispatch || size == 0) {
 		return false;
 	}
@@ -392,10 +389,12 @@ static bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input, Com
 	return true;
 }
 
-bool ResolveVideoOutDccMetadataTransferDispatch(
-    const ShaderComputeInputInfo& input, uint32_t group_x, uint32_t group_y, uint32_t group_z,
-    uint32_t mode, ShaderBufferResource* source, ShaderBufferResource* destination,
-    uint64_t* transfer_size) {
+bool ResolveVideoOutDccMetadataTransferDispatch(const ShaderComputeInputInfo& input,
+                                                uint32_t group_x, uint32_t group_y,
+                                                uint32_t group_z, uint32_t mode,
+                                                ShaderBufferResource* source,
+                                                ShaderBufferResource* destination,
+                                                uint64_t*             transfer_size) {
 	if (source == nullptr || destination == nullptr || transfer_size == nullptr ||
 	    input.stage.program == nullptr || input.stage.resources == nullptr) {
 		return false;
@@ -414,9 +413,9 @@ bool ResolveVideoOutDccMetadataTransferDispatch(
 	ShaderBufferResource                        source_descriptor {};
 	ShaderBufferResource                        destination_descriptor {};
 	for (uint32_t i = 0; i < 2; i++) {
-		const auto& resource = program.info.buffers[i];
-		const auto& raw      = resources.buffers[i];
-		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(raw);
+		const auto& resource   = program.info.buffers[i];
+		const auto& raw        = resources.buffers[i];
+		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(raw);
 		if (raw.dword_count != 4 || !resource.formatted || resource.atomic || resource.scalar ||
 		    resource.packed_stride != descriptor.PackedStride() || descriptor.SwizzleEnabled() ||
 		    descriptor.IndexStride() != 0 || descriptor.AddTid()) {
@@ -440,8 +439,7 @@ bool ResolveVideoOutDccMetadataTransferDispatch(
 	    source_descriptor.Format() != Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt) ||
 	    destination_descriptor.Format() !=
 	        Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8UInt) ||
-	    source_descriptor.DstSelXYZW() != 0x204 ||
-	    destination_descriptor.DstSelXYZW() != 0x22c) {
+	    source_descriptor.DstSelXYZW() != 0x204 || destination_descriptor.DstSelXYZW() != 0x22c) {
 		return false;
 	}
 	const auto source_size      = BufferDescriptorSize(source_descriptor);
@@ -453,9 +451,9 @@ bool ResolveVideoOutDccMetadataTransferDispatch(
 	    !input.dispatch_thread_dimensions && input.dispatch_threads_num[0] == 0 &&
 	    input.dispatch_threads_num[1] == 0 && input.dispatch_threads_num[2] == 0 &&
 	    input.threads_num[0] == 8 && input.threads_num[1] == 8 && input.threads_num[2] == 1 &&
-	    input.group_id[0] && input.group_id[1] && !input.group_id[2] &&
-	    input.thread_ids_num == 2 && input.wave_size == 32 && !input.tg_size_en && group_x != 0 &&
-	    group_y != 0 && group_z == 1 && mode == 0x41u;
+	    input.group_id[0] && input.group_id[1] && !input.group_id[2] && input.thread_ids_num == 2 &&
+	    input.wave_size == 32 && !input.tg_size_en && group_x != 0 && group_y != 0 &&
+	    group_z == 1 && mode == 0x41u;
 	const uint64_t launched_threads =
 	    static_cast<uint64_t>(group_x) * group_y * input.threads_num[0] * input.threads_num[1];
 	if (!dispatch_shape || launched_threads > UINT32_MAX / 8u ||
@@ -463,26 +461,26 @@ bool ResolveVideoOutDccMetadataTransferDispatch(
 	    destination_descriptor.NumRecords() != launched_threads * 4u) {
 		return false;
 	}
-	*source         = source_descriptor;
-	*destination    = destination_descriptor;
-	*transfer_size  = source_size;
+	*source        = source_descriptor;
+	*destination   = destination_descriptor;
+	*transfer_size = source_size;
 	return true;
 }
 
 static bool TryConsumeVideoOutDccMetadataTransfer(const ShaderComputeInputInfo& input,
-	                                               CommandBuffer* command, uint32_t group_x,
-	                                               uint32_t group_y, uint32_t group_z,
-	                                               uint32_t mode) {
+                                                  CommandBuffer* command, uint32_t group_x,
+                                                  uint32_t group_y, uint32_t group_z,
+                                                  uint32_t mode) {
 	ShaderBufferResource source {};
 	ShaderBufferResource destination {};
 	uint64_t             transfer_size = 0;
-	if (!ResolveVideoOutDccMetadataTransferDispatch(input, group_x, group_y, group_z, mode,
-	                                               &source, &destination, &transfer_size)) {
+	if (!ResolveVideoOutDccMetadataTransferDispatch(input, group_x, group_y, group_z, mode, &source,
+	                                                &destination, &transfer_size)) {
 		return false;
 	}
 	auto* cache = g_render_ctx->GetTextureCache();
 	if (!cache->ConsumeVideoOutDccMetadataTransfer(command, source.Base48(), transfer_size,
-	                                             destination.Base48(), transfer_size)) {
+	                                               destination.Base48(), transfer_size)) {
 		return false;
 	}
 	LOGF("GraphicsRenderDispatchDirect: virtual video-out DCC metadata transfer "
@@ -540,6 +538,18 @@ void RenderDispatchDirect(uint64_t submit_id, CommandBuffer* buffer, HW::Context
 	ShaderComputeInputInfo    input_info {};
 	std::span<const uint32_t> cs_shader;
 	if (!ShaderCompileInfoCS(&cs_regs, &sh_regs, &input_info, &cs_shader)) {
+		if (Config::CsSkipUnresolvedEnabled()) {
+			static std::atomic<uint64_t> skipped_dispatches {0};
+			const auto                   count = skipped_dispatches.fetch_add(1) + 1;
+			if (count <= 64 || count % 1024 == 0) {
+				LOGF_COLOR(Log::Color::BrightYellow,
+				           "GraphicsRenderDispatchDirect: skipping dispatch with unresolved CS "
+				           "shader 0x%016" PRIx64 " groups=%ux%ux%u skipped_total=%" PRIu64 "\n",
+				           cs_regs.cs_regs.data_addr, thread_group_x, thread_group_y,
+				           thread_group_z, count);
+			}
+			return;
+		}
 		EXIT("ShaderCompileInfoCS failed for dispatch with CS shader 0x%016" PRIx64 "\n",
 		     cs_regs.cs_regs.data_addr);
 	}
@@ -566,7 +576,7 @@ void RenderDispatchDirect(uint64_t submit_id, CommandBuffer* buffer, HW::Context
 		return;
 	}
 	if (TryConsumeVideoOutDccMetadataTransfer(input_info, buffer, thread_group_x, thread_group_y,
-	                                         thread_group_z, mode)) {
+	                                          thread_group_z, mode)) {
 		return;
 	}
 	const auto sampled_images = std::count_if(
@@ -594,8 +604,8 @@ void RenderDispatchDirect(uint64_t submit_id, CommandBuffer* buffer, HW::Context
 			     " stride=%u records=%u format=%u raw=%08x/%08x/%08x/%08x\n",
 			     i, buffer.source, buffer.read, buffer.written, buffer.formatted, buffer.atomic,
 			     buffer.scalar, buffer.max_byte_extent, buffer.packed_stride,
-			     resources.buffers[i].dword_count, r.Base48(), r.Stride(), r.NumRecords(), r.Format(),
-			     r.fields[0], r.fields[1], r.fields[2], r.fields[3]);
+			     resources.buffers[i].dword_count, r.Base48(), r.Stride(), r.NumRecords(),
+			     r.Format(), r.fields[0], r.fields[1], r.fields[2], r.fields[3]);
 		}
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			const auto& image = program.info.images[i];

@@ -41,6 +41,10 @@ struct CompileResult {
 	std::string           ir_dump;
 	IR::Program           program;
 	IR::ResourceSnapshot  resources;
+	// True when the failure came from evaluating the runtime user-data/SRT snapshot
+	// (materialization/specialization); those may succeed on a later bind. Failures in the
+	// static phases (decode, CFG, tracking, emission) never will.
+	bool runtime_failure = false;
 };
 
 bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,

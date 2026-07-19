@@ -115,10 +115,7 @@ void EmitWqmB64(EmitterState* state, const IR::Instruction& inst) {
 		EmitStoreU32(state, OffsetRegisterOperand(inst.dst, 1), ret_high);
 		return;
 	}
-	const auto ballot = state->builder.AllocateId();
-	state->builder.AddFunction({OpGroupNonUniformBallot, state->vec4_uint_type, ballot,
-	                            ConstantU32(state, ScopeSubgroup),
-	                            EmitLaneMaskOperandActiveBool(state, inst.src[0])});
+	const auto ballot = EmitWaveBallot(state, EmitLaneMaskOperandActiveBool(state, inst.src[0]));
 	const auto low  = state->builder.AllocateId();
 	const auto high = state->builder.AllocateId();
 	state->builder.AddFunction({OpCompositeExtract, state->uint_type, low, ballot, 0});
@@ -258,33 +255,54 @@ void EmitSaveexecB64(EmitterState* state, const IR::Instruction& inst) {
 }
 
 void EmitReadFirstLaneU32(EmitterState* state, const IR::Instruction& inst) {
-	const auto src         = EmitValueLoad(state, inst.src[0]);
-	const auto active      = EmitExecActiveBool(state);
-	const auto ballot      = state->builder.AllocateId();
-	const auto first_lane  = state->builder.AllocateId();
-	const auto first_value = state->builder.AllocateId();
-	state->builder.AddFunction({OpGroupNonUniformBallot, state->vec4_uint_type, ballot,
-	                            ConstantU32(state, ScopeSubgroup), active});
-	state->builder.AddFunction({OpGroupNonUniformBallotFindLSB, state->uint_type, first_lane,
-	                            ConstantU32(state, ScopeSubgroup), ballot});
-	state->builder.AddFunction({OpGroupNonUniformShuffle, state->uint_type, first_value,
-	                            ConstantU32(state, ScopeSubgroup), src, first_lane});
+	const auto src        = EmitValueLoad(state, inst.src[0]);
+	const auto active     = EmitExecActiveBool(state);
+	const auto ballot     = EmitWaveBallot(state, active);
+	uint32_t   first_lane = 0;
+	if (state->workgroup_wave64) {
+		const auto low          = state->builder.AllocateId();
+		const auto high         = state->builder.AllocateId();
+		const auto low_i32      = state->builder.AllocateId();
+		const auto high_i32     = state->builder.AllocateId();
+		const auto low_lane     = state->builder.AllocateId();
+		const auto high_lane0   = state->builder.AllocateId();
+		const auto high_lane    = state->builder.AllocateId();
+		const auto low_non_zero = state->builder.AllocateId();
+		first_lane              = state->builder.AllocateId();
+		state->builder.AddFunction({OpCompositeExtract, state->uint_type, low, ballot, 0});
+		state->builder.AddFunction({OpCompositeExtract, state->uint_type, high, ballot, 1});
+		state->builder.AddFunction(
+		    {OpExtInst, state->int_type, low_i32, state->glsl_std450, GlslFindILsb, low});
+		state->builder.AddFunction(
+		    {OpExtInst, state->int_type, high_i32, state->glsl_std450, GlslFindILsb, high});
+		state->builder.AddFunction({OpBitcast, state->uint_type, low_lane, low_i32});
+		state->builder.AddFunction({OpBitcast, state->uint_type, high_lane0, high_i32});
+		state->builder.AddFunction(
+		    {OpIAdd, state->uint_type, high_lane, high_lane0, ConstantU32(state, 32u)});
+		state->builder.AddFunction(
+		    {OpINotEqual, state->bool_type, low_non_zero, low, ConstantU32(state, 0u)});
+		state->builder.AddFunction(
+		    {OpSelect, state->uint_type, first_lane, low_non_zero, low_lane, high_lane});
+	} else {
+		first_lane = state->builder.AllocateId();
+		state->builder.AddFunction({OpGroupNonUniformBallotFindLSB, state->uint_type, first_lane,
+		                            ConstantU32(state, ScopeSubgroup), ballot});
+	}
+	const auto first_value = EmitWaveShuffleU32(state, src, first_lane);
 	EmitStoreU32(state, inst.dst, first_value);
 }
 
 uint32_t EmitLaneIndex(EmitterState* state, const IR::Operand& operand) {
 	const auto lane = state->builder.AllocateId();
 	state->builder.AddFunction({OpBitwiseAnd, state->uint_type, lane, EmitValueLoad(state, operand),
-	                            ConstantU32(state, 63)});
+	                            ConstantU32(state, state->wave_size == 32u ? 31u : 63u)});
 	return lane;
 }
 
 void EmitReadLaneU32(EmitterState* state, const IR::Instruction& inst) {
 	const auto src   = EmitValueLoad(state, inst.src[0]);
 	const auto lane  = EmitLaneIndex(state, inst.src[1]);
-	const auto value = state->builder.AllocateId();
-	state->builder.AddFunction({OpGroupNonUniformShuffle, state->uint_type, value,
-	                            ConstantU32(state, ScopeSubgroup), src, lane});
+	const auto value = EmitWaveShuffleU32(state, src, lane);
 	EmitStoreU32(state, inst.dst, value);
 }
 
@@ -319,7 +337,6 @@ void EmitPermlaneB32(EmitterState* state, const IR::Instruction& inst, bool x16)
 	const auto index0    = state->builder.AllocateId();
 	const auto index1    = state->builder.AllocateId();
 	const auto target    = state->builder.AllocateId();
-	const auto shuffled  = state->builder.AllocateId();
 	const auto value     = EmitValueLoad(state, inst.src[0]);
 	const auto src1      = EmitValueLoad(state, inst.src[1]);
 	const auto src2      = EmitValueLoad(state, inst.src[2]);
@@ -344,8 +361,7 @@ void EmitPermlaneB32(EmitterState* state, const IR::Instruction& inst, bool x16)
 	state->builder.AddFunction(
 	    {OpBitwiseAnd, state->uint_type, index1, index0, ConstantU32(state, 15)});
 	state->builder.AddFunction({OpBitwiseOr, state->uint_type, target, row_value, index1});
-	state->builder.AddFunction({OpGroupNonUniformShuffle, state->uint_type, shuffled,
-	                            ConstantU32(state, ScopeSubgroup), value, target});
+	const auto shuffled = EmitWaveShuffleU32(state, value, target);
 	uint32_t ret = shuffled;
 	if (!inst.dst.op_sel) {
 		const auto source_active = EmitLaneIndexActiveBool(state, target);

@@ -74,6 +74,7 @@ bool InstructionMaySplitSpirvBlock(const IR::Instruction& inst) {
 		case IR::Opcode::BufferStoreShort:
 		case IR::Opcode::BufferStoreDword:
 		case IR::Opcode::AtomicSwapU32:
+		case IR::Opcode::AtomicSwapU64:
 		case IR::Opcode::AtomicAddU32:
 		case IR::Opcode::AtomicSubU32:
 		case IR::Opcode::AtomicSMinI32:
@@ -83,6 +84,8 @@ bool InstructionMaySplitSpirvBlock(const IR::Instruction& inst) {
 		case IR::Opcode::AtomicAndU32:
 		case IR::Opcode::AtomicOrU32:
 		case IR::Opcode::AtomicXorU32:
+		case IR::Opcode::AtomicFMinF32:
+		case IR::Opcode::AtomicFMaxF32:
 		case IR::Opcode::FlatLoadUbyte:
 		case IR::Opcode::FlatLoadSbyte:
 		case IR::Opcode::FlatLoadUshort:
@@ -345,10 +348,9 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 
 	for (const auto& inst: decoded.instructions) {
 		if (data.loads.empty() &&
-		    (inst.opcode == Decoder::Opcode::VAddI32 ||
-		     inst.opcode == Decoder::Opcode::VSadU32) &&
+		    (inst.opcode == Decoder::Opcode::VAddI32 || inst.opcode == Decoder::Opcode::VSadU32) &&
 		    IsDecodedVgpr(inst.dst) && inst.dst.reg < vgprs.size()) {
-			const Decoder::Operand* index = nullptr;
+			const Decoder::Operand* index  = nullptr;
 			const Decoder::Operand* offset = nullptr;
 			if (inst.opcode == Decoder::Opcode::VAddI32) {
 				if (IsDecodedVgpr(inst.src0) && IsDecodedSgpr(inst.src1)) {
@@ -361,8 +363,8 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 			} else if (IsDecodedVgpr(inst.src2)) {
 				uint32_t zero = 1;
 				index         = &inst.src2;
-				if (IsDecodedSgpr(inst.src0) &&
-				    TryDecodedOperandConstant(sgprs, inst.src1, zero) && zero == 0) {
+				if (IsDecodedSgpr(inst.src0) && TryDecodedOperandConstant(sgprs, inst.src1, zero) &&
+				    zero == 0) {
 					offset = &inst.src0;
 				} else if (IsDecodedSgpr(inst.src1) &&
 				           TryDecodedOperandConstant(sgprs, inst.src0, zero) && zero == 0) {
@@ -501,7 +503,7 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 				} else if (inst.opcode == Decoder::Opcode::VCndmaskB32) {
 					EmbeddedFetchVgprInfo src0_info {};
 					EmbeddedFetchVgprInfo src1_info {};
-					const bool valid_sources =
+					const bool            valid_sources =
 					    IsDecodedVgpr(inst.src0) && inst.src0.reg < vgprs.size() &&
 					    IsDecodedVgpr(inst.src1) && inst.src1.reg < vgprs.size();
 					if (valid_sources) {
@@ -516,8 +518,9 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 						const auto* vertex =
 						    src0_info.type == EmbeddedFetchValueType::VertexIndex
 						        ? &src0_info
-						        : (src1_info.type == EmbeddedFetchValueType::VertexIndex ? &src1_info
-						                                                          : nullptr);
+						        : (src1_info.type == EmbeddedFetchValueType::VertexIndex
+						               ? &src1_info
+						               : nullptr);
 						const bool has_instance =
 						    src0_info.type == EmbeddedFetchValueType::InstanceIndex ||
 						    src1_info.type == EmbeddedFetchValueType::InstanceIndex;
@@ -564,8 +567,7 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 						load.attrib_id    = buffer.attrib_id;
 						load.components   = DecodedDstSize(inst);
 						load.prolog_loads = buffer.prolog_loads;
-						if (data.loads.empty() &&
-						    !vgprs[inst.src0.reg].vertex_offset_conflict) {
+						if (data.loads.empty() && !vgprs[inst.src0.reg].vertex_offset_conflict) {
 							data.vertex_offset_sgpr = vgprs[inst.src0.reg].vertex_offset_sgpr;
 						}
 						data.loads.push_back(load);
@@ -786,6 +788,14 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	ir.shader_hash     = options.shader_hash;
 	ir.user_data_base  = options.user_data_base;
 	ir.user_data_count = options.user_data_count;
+	if (options.stage == ShaderType::Compute && options.wave_size == 64u &&
+	    options.compute_input_info != nullptr) {
+		const auto* cs = options.compute_input_info;
+		const auto  threads = static_cast<uint64_t>(cs->threads_num[0]) *
+		                     static_cast<uint64_t>(cs->threads_num[1]) *
+		                     static_cast<uint64_t>(cs->threads_num[2]);
+		ir.workgroup_wave64 = threads == 64u;
+	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR LowerProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
@@ -804,9 +814,19 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 			     rewritten);
 		}
 	}
+	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR BuildScalarProvenance\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	if (!IR::BuildScalarProvenance(&ir, error)) {
 		return false;
 	}
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64
+	     " IR BuildScalarProvenance values=%" PRIu64 " descriptors=%" PRIu64
+	     " elapsed_ms=%" PRIu64 "\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+	     static_cast<uint64_t>(ir.provenance.values.size()),
+	     static_cast<uint64_t>(ir.provenance.descriptors.size()), phase_ms());
+	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR BuildSrtPlan\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	std::string srt_error;
 	if (!IR::BuildSrtPlan(&ir, &srt_error)) {
 		LOGF("%s SRT planning failed: %s\n", GetDumpLabel(options), srt_error.c_str());
@@ -815,14 +835,29 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		}
 		return false;
 	}
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64
+	     " IR BuildSrtPlan reads=%" PRIu64 " dynamic=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+	     static_cast<uint64_t>(ir.srt.reads.size()),
+	     static_cast<uint64_t>(ir.srt.dynamic_reads.size()), phase_ms());
 	ir.dispatcher_fallback = dispatcher_fallback;
 	if (!dispatcher_reason.empty()) {
 		ir.fallback_reason = dispatcher_reason;
 	}
 
+	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TrackResources\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	if (!IR::PatchSrtReads(&ir, error) || !IR::TrackResources(&ir, error)) {
 		return false;
 	}
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64
+	     " IR TrackResources buffers=%" PRIu64 " images=%" PRIu64 " samplers=%" PRIu64
+	     " addresses=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+	     static_cast<uint64_t>(ir.info.buffers.size()),
+	     static_cast<uint64_t>(ir.info.images.size()),
+	     static_cast<uint64_t>(ir.info.samplers.size()),
+	     static_cast<uint64_t>(ir.info.addresses.size()), phase_ms());
 	if (options.stage == ShaderType::Vertex) {
 		ir.info.vertex_offset_sgpr = embedded_fetch.vertex_offset_sgpr;
 	}
@@ -839,6 +874,8 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		}
 	}
 
+	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR MaterializeResources\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	IR::ResourceSnapshot resources;
 	if (options.resource_snapshot != nullptr) {
 		resources = *options.resource_snapshot;
@@ -861,12 +898,20 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		runtime.userdata    = options.read_memory_data;
 		runtime.flat_memory_base = options.flat_memory_base;
 		if (!IR::MaterializeResources(ir, runtime, &resources, error)) {
+			result->runtime_failure = true;
 			return false;
 		}
 	}
 	if (!IR::SpecializeResources(&ir, resources, error)) {
+		result->runtime_failure = true;
 		return false;
 	}
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64
+	     " IR MaterializeResources descriptors=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+	     static_cast<uint64_t>(resources.buffers.size() + resources.images.size() +
+	                           resources.samplers.size() + resources.addresses.size()),
+	     phase_ms());
 
 	ShaderVertexInputInfo  default_vertex {};
 	ShaderPixelInputInfo   default_pixel {};
@@ -878,6 +923,8 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	    options.pixel_input_info != nullptr ? options.pixel_input_info : &default_pixel;
 	info_options.compute =
 	    options.compute_input_info != nullptr ? options.compute_input_info : &default_compute;
+	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR AllocateBindings\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	if (!IR::CollectShaderInfo(&ir, info_options, error)) {
 		return false;
 	}
@@ -887,6 +934,10 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	if (!IR::AllocateBindings(&ir, layout_options, error)) {
 		return false;
 	}
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64
+	     " IR AllocateBindings bindings=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+	     static_cast<uint64_t>(ir.bindings.descriptors.size()), phase_ms());
 	std::string ir_dump;
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(cfg, ir);

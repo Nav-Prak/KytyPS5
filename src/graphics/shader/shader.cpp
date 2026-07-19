@@ -31,6 +31,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -116,7 +117,26 @@ static std::unordered_map<ShaderStageProgramKey,
                   g_shader_program_cache;
 static std::mutex g_shader_program_cache_mutex;
 
+// Programs whose recompilation failed in a static phase (decode/CFG/tracking/emission) while
+// --cs-skip-unresolved is active. Those failures can never succeed on a later bind, so cache
+// them to keep skipped dispatches from rerunning the recompiler. Runtime-snapshot failures
+// (materialization/specialization) are never cached and retry on the next bind.
+static std::unordered_set<ShaderStageProgramKey, ShaderStageProgramKeyHash> g_shader_skip_cache;
+static std::mutex g_shader_skip_cache_mutex;
+
 static constexpr uint32_t ShaderMaxPermutationsPerProgram = 64;
+
+static bool ReadShaderGuestDword(void* /*userdata*/, uint64_t address, uint32_t* value) {
+	// GPU-owned guest pages are deliberately protected while their native resource is current.
+	// They are still valid SRT memory: the CPU read below enters the memory tracker's fault path,
+	// synchronizes the native bytes, and restores guest access. Reject only genuinely unmapped
+	// addresses here; a protection-based readability test incorrectly skips those dispatches.
+	if (value == nullptr || !HostMemoryRangeIsMapped(address, sizeof(*value))) {
+		return false;
+	}
+	std::memcpy(value, reinterpret_cast<const void*>(address), sizeof(*value));
+	return true;
+}
 
 static std::span<const uint32_t> MakeShaderSpirvView(const std::vector<uint32_t>& spirv) {
 	return {spirv.data(), spirv.size()};
@@ -1009,6 +1029,7 @@ static void ShaderAppendNativeSpecialization(std::vector<uint32_t>*             
                                              const ShaderRecompiler::IR::Program& program) {
 	EXIT_IF(ids == nullptr || !program.binding_layout_complete);
 	ids->push_back(static_cast<uint32_t>(program.lane_mask_mode));
+	ids->push_back(static_cast<uint32_t>(program.workgroup_wave64));
 	ids->push_back(program.bindings.descriptor_set);
 	ids->push_back(program.bindings.push_constant_offset);
 	ids->push_back(program.bindings.push_constant_size);
@@ -1182,8 +1203,25 @@ bool ShaderCompileInfoCS(const HW::ComputeShaderInfo* regs, const HW::ShaderRegi
 		}
 	}
 
+	if (Config::CsSkipUnresolvedEnabled()) {
+		std::scoped_lock lock(g_shader_skip_cache_mutex);
+		if (g_shader_skip_cache.contains(key)) {
+			return false;
+		}
+	}
+
 	std::vector<uint32_t> compiled_spirv;
-	if (!ShaderCompileSpirvCS(regs, sh, info, &compiled_spirv)) {
+	bool                  static_failure = false;
+	if (!ShaderCompileSpirvCS(regs, sh, info, &compiled_spirv, &static_failure)) {
+		if (static_failure) {
+			std::scoped_lock lock(g_shader_skip_cache_mutex);
+			if (g_shader_skip_cache.insert(key).second) {
+				LOGF_COLOR(Log::Color::BrightYellow,
+				           "ShaderRecompiler CS skip cached: hash=0x%016" PRIx64
+				           " unique_skipped=%" PRIu64 "\n",
+				           shader_hash, static_cast<uint64_t>(g_shader_skip_cache.size()));
+			}
+		}
 		return false;
 	}
 
@@ -1506,13 +1544,17 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo* regs, const HW::ShaderRegis
 }
 
 bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo* regs, const HW::ShaderRegisters* sh,
-                          ShaderComputeInputInfo* input_info, std::vector<uint32_t>* spirv) {
+                          ShaderComputeInputInfo* input_info, std::vector<uint32_t>* spirv,
+                          bool* static_failure) {
 	KYTY_PROFILER_FUNCTION(profiler::colors::CyanA700);
 
 	EXIT_IF(regs == nullptr);
 	EXIT_IF(sh == nullptr);
 	EXIT_IF(input_info == nullptr);
 	EXIT_IF(spirv == nullptr);
+	if (static_failure != nullptr) {
+		*static_failure = false;
+	}
 
 	const uint64_t shader_addr = regs->cs_regs.data_addr;
 	const auto     code = ShaderGetMappedCode(shader_addr, "ShaderRecompiler CS", shader_addr);
@@ -1530,10 +1572,24 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo* regs, const HW::ShaderReg
 	options.dump_ir              = ShaderRecompilerTextDumpEnabled();
 	options.early_dump           = options.dump_ir;
 	options.dump_label           = "ShaderRecompiler CS";
+	options.read_memory          = ReadShaderGuestDword;
 
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
 	if (!ShaderRecompiler::TryRecompile(code, options, &result, &error)) {
+		if (Config::CsSkipUnresolvedEnabled()) {
+			if (static_failure != nullptr) {
+				*static_failure = !result.runtime_failure;
+			}
+			constexpr size_t SkipReasonLimit = 300;
+			auto             reason          = error.substr(0, SkipReasonLimit);
+			std::replace(reason.begin(), reason.end(), '\n', ' ');
+			LOGF_COLOR(Log::Color::BrightYellow,
+			           "ShaderRecompiler CS skip: hash=0x%016" PRIx64 " reason=%s%s\n",
+			           options.shader_hash, reason.c_str(),
+			           error.size() > SkipReasonLimit ? "..." : "");
+			return false;
+		}
 		error += " CS user data:";
 		for (uint32_t i = 0; i < options.user_data_count; i++) {
 			error += fmt::format(" s{}=0x{:08x}", i, options.user_data[i]);
@@ -1556,10 +1612,10 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo* regs, const HW::ShaderReg
 				const auto descriptor_base =
 				    (static_cast<uint64_t>(probe[descriptor_offset + 1] & 0xffffu) << 32u) |
 				    probe[descriptor_offset];
-				const auto stride = (probe[descriptor_offset + 1] >> 16u) & 0x3fffu;
-				const auto records = probe[descriptor_offset + 2];
-				const auto bytes = stride == 0 ? static_cast<uint64_t>(records)
-				                               : static_cast<uint64_t>(stride) * records;
+				const auto         stride  = (probe[descriptor_offset + 1] >> 16u) & 0x3fffu;
+				const auto         records = probe[descriptor_offset + 2];
+				const auto         bytes   = stride == 0 ? static_cast<uint64_t>(records)
+				                                         : static_cast<uint64_t>(stride) * records;
 				constexpr uint64_t MaxProbeBytes = 64ull * 1024ull * 1024ull;
 				if (descriptor_base == 0 || records == 0 || stride < 8 || bytes == 0 ||
 				    bytes > MaxProbeBytes ||
@@ -1572,8 +1628,8 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo* regs, const HW::ShaderReg
 				for (uint32_t record = 0; record < records; record++) {
 					uint32_t selector = 0;
 					std::memcpy(&selector,
-					            reinterpret_cast<const void*>(descriptor_base +
-					                                          static_cast<uint64_t>(record) * stride + 4u),
+					            reinterpret_cast<const void*>(
+					                descriptor_base + static_cast<uint64_t>(record) * stride + 4u),
 					            sizeof(selector));
 					selectors.push_back(selector);
 				}
@@ -1582,8 +1638,8 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo* regs, const HW::ShaderReg
 				error += fmt::format(
 				    " CS buffer table candidate s[{}:{}]+0x{:02x} base=0x{:016x} stride={} "
 				    "records={} bytes=0x{:x} selector_dword1_unique={}",
-				    first, first + 1, descriptor_offset * 4u, descriptor_base, stride, records, bytes,
-				    selectors.size());
+				    first, first + 1, descriptor_offset * 4u, descriptor_base, stride, records,
+				    bytes, selectors.size());
 				const auto selector_limit = std::min<size_t>(selectors.size(), 32);
 				for (size_t i = 0; i < selector_limit; i++) {
 					const auto selector = selectors[i];
@@ -1597,12 +1653,13 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo* regs, const HW::ShaderReg
 					std::memcpy(selected_descriptor.data(),
 					            reinterpret_cast<const void*>(descriptor_base + table_offset),
 					            sizeof(selected_descriptor));
-					error += fmt::format("({:08x}/{:08x}/{:08x}/{:08x})",
-					                     selected_descriptor[0], selected_descriptor[1],
-					                     selected_descriptor[2], selected_descriptor[3]);
+					error += fmt::format("({:08x}/{:08x}/{:08x}/{:08x})", selected_descriptor[0],
+					                     selected_descriptor[1], selected_descriptor[2],
+					                     selected_descriptor[3]);
 				}
 				if (selectors.size() > selector_limit) {
-					error += fmt::format(" selectors_omitted={}", selectors.size() - selector_limit);
+					error +=
+					    fmt::format(" selectors_omitted={}", selectors.size() - selector_limit);
 				}
 			}
 		}

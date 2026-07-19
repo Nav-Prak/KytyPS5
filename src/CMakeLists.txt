@@ -269,7 +269,7 @@ add_executable(shader_stage_runtime_tests EXCLUDE_FROM_ALL
 	graphics/shader/recompiler/ScalarProvenance.cpp
 	graphics/shader/recompiler/SrtWalker.cpp
 )
-target_link_libraries(shader_stage_runtime_tests fmt::fmt)
+target_link_libraries(shader_stage_runtime_tests common fmt::fmt)
 target_include_directories(shader_stage_runtime_tests PRIVATE ${inc_headers})
 
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
@@ -283,8 +283,17 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	graphics/shader/recompiler/ResourceMaterialization.cpp
 	graphics/shader/recompiler/ShaderInfoCollection.cpp
 	graphics/shader/recompiler/BindingLayout.cpp
+	graphics/shader/recompiler/shaderIR/ShaderIRLog.cpp
+	graphics/shader/recompiler/ShaderCFG.cpp
+	graphics/shader/recompiler/ShaderDecoder.cpp
+	graphics/shader/recompiler/VectorAluOps.cpp
+	graphics/shader/recompiler/ScalarAluOps.cpp
+	graphics/shader/recompiler/MemoryOps.cpp
+	graphics/shader/recompiler/ImageOps.cpp
+	graphics/shader/recompiler/ExportOps.cpp
+	graphics/shader/recompiler/ExecMask.cpp
 )
-target_link_libraries(resource_tracking_tests fmt::fmt)
+target_link_libraries(resource_tracking_tests common fmt::fmt)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
 if (MSVC)
 	target_compile_options(resource_tracking_tests PRIVATE /EHsc)

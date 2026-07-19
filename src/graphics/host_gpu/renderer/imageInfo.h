@@ -313,10 +313,10 @@ ComputeVideoOutDccMetadataSize(uint64_t color_size, VideoOutCompression compress
 // 16 KiB buffer-cache units; the separately registered plane retains its larger allocation
 // alignment.
 [[nodiscard]] inline constexpr uint64_t
-ComputeVideoOutDccActiveMetadataSize(uint64_t color_size,
+ComputeVideoOutDccActiveMetadataSize(uint64_t            color_size,
                                      VideoOutCompression compression) noexcept {
 	constexpr uint64_t DCC_DATA_BYTES_PER_META_BYTE = 256;
-	constexpr uint64_t ACTIVE_METADATA_ALIGNMENT     = 16 * 1024;
+	constexpr uint64_t ACTIVE_METADATA_ALIGNMENT    = 16 * 1024;
 	if (!IsKnownCompressedVideoOut(compression) || color_size == 0 ||
 	    color_size > UINT64_MAX - (DCC_DATA_BYTES_PER_META_BYTE - 1)) {
 		return 0;
@@ -326,8 +326,7 @@ ComputeVideoOutDccActiveMetadataSize(uint64_t color_size,
 	if (metadata_bytes > UINT64_MAX - (ACTIVE_METADATA_ALIGNMENT - 1)) {
 		return 0;
 	}
-	return (metadata_bytes + ACTIVE_METADATA_ALIGNMENT - 1) &
-	       ~(ACTIVE_METADATA_ALIGNMENT - 1);
+	return (metadata_bytes + ACTIVE_METADATA_ALIGNMENT - 1) & ~(ACTIVE_METADATA_ALIGNMENT - 1);
 }
 
 [[nodiscard]] inline constexpr bool IsFullVideoOutOverwrite(const VideoOutInfo&   info,
@@ -530,6 +529,14 @@ IsSupportedDisplayRenderTargetTileMode(uint32_t tile_mode) noexcept {
 }
 
 [[nodiscard]] inline constexpr bool
+IsExactStandard64RenderTargetFootprint(const RenderTargetInfo& info, uint64_t expected_pitch,
+                                       uint64_t slice_size, uint64_t alignment) noexcept {
+	return info.layers != 0 && expected_pitch <= UINT32_MAX && info.pitch == expected_pitch &&
+	       alignment == 65536u && slice_size <= UINT32_MAX &&
+	       slice_size <= UINT64_MAX / info.layers && info.size == slice_size * info.layers;
+}
+
+[[nodiscard]] inline constexpr bool
 IsSupportedStandard64RenderTarget(const RenderTargetInfo& info) noexcept {
 	if (info.tile_mode != Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB) ||
 	    info.address == 0 || (info.address & 0xffffu) != 0 || info.width == 0 || info.height == 0 ||
@@ -543,8 +550,7 @@ IsSupportedStandard64RenderTarget(const RenderTargetInfo& info) noexcept {
 		return false;
 	}
 	const auto slice_size = expected_pitch * padded_height * info.bytes_per_element;
-	return slice_size <= UINT32_MAX && slice_size <= UINT64_MAX / info.layers &&
-	       info.size == slice_size * info.layers;
+	return IsExactStandard64RenderTargetFootprint(info, expected_pitch, slice_size, 65536u);
 }
 
 [[nodiscard]] inline constexpr bool IsTiledRenderTarget(const RenderTargetInfo& info) noexcept {
@@ -717,8 +723,8 @@ SelectDepthTransitionSource(bool depth_load_clear, bool sampled_native_available
 // A native storage-buffer descriptor cannot represent holes, so callers can expose this prefix
 // while the shader's ordinary descriptor bounds checks reject accesses beyond it.
 [[nodiscard]] inline uint64_t ImagePageRangePrefixBefore(uint64_t address, uint64_t size,
-                                                        uint64_t blocked_address,
-                                                        uint64_t blocked_size) {
+                                                         uint64_t blocked_address,
+                                                         uint64_t blocked_size) {
 	if (size == 0 || blocked_size == 0 || address > UINT64_MAX - size ||
 	    blocked_address > UINT64_MAX - blocked_size) {
 		EXIT("invalid image page-prefix range\n");
@@ -749,7 +755,7 @@ SelectDepthTransitionSource(bool depth_load_clear, bool sampled_native_available
 
 [[nodiscard]] inline bool IsRgba8SrgbReinterpretation(VkFormat cached, VkFormat requested) noexcept;
 [[nodiscard]] inline bool IsCompatibleStorageSampledViewFormat(VkFormat cached,
-                                                                VkFormat requested) noexcept;
+                                                               VkFormat requested) noexcept;
 [[nodiscard]] inline bool IsMutableStorageSampledViewFormat(VkFormat format) noexcept;
 
 [[nodiscard]] inline bool IsR32UintFloatReinterpretation(VkFormat cached,
@@ -830,6 +836,15 @@ ClassifyHostWriteOverlap(uint64_t write_address, uint64_t write_size, uint64_t i
 	           : HostWriteOverlap::Unsupported;
 }
 
+// A read-only raw buffer may consume GPU-dirty buffer bytes through BufferCache when every
+// overlapping image has already yielded ownership to that cache. Native-current image bytes, or
+// dirty buffer bytes over an image that has not been invalidated, remain incoherent.
+[[nodiscard]] inline constexpr bool
+IsRawBufferImageReadCoherent(bool gpu_image_bytes, bool non_buffer_owned_image_bytes,
+                             bool buffer_gpu_modified) noexcept {
+	return !gpu_image_bytes && (!buffer_gpu_modified || !non_buffer_owned_image_bytes);
+}
+
 [[nodiscard]] inline BufferImageWrite
 ClassifyBufferImageWrite(uint64_t buffer_address, uint64_t buffer_size, uint64_t image_address,
                          uint64_t image_size, BufferImageBinding binding, bool image_gpu_modified,
@@ -848,9 +863,17 @@ ClassifyBufferImageWrite(uint64_t buffer_address, uint64_t buffer_size, uint64_t
 	const bool buffer_page_aligned =
 	    ((buffer_address | buffer_size) & (TRACKER_PAGE_SIZE - 1)) == 0;
 	const bool image_page_aligned = ((image_address | image_size) & (TRACKER_PAGE_SIZE - 1)) == 0;
+	// Byte-overlap of the two ranges. A page-or-larger overlap marks a real data overlap between a
+	// raw compute write window and an image, as opposed to incidental edge-page adjacency.
+	const auto overlap_begin = buffer_address > image_address ? buffer_address : image_address;
+	const auto buffer_end    = buffer_address + buffer_size;
+	const auto image_end     = image_address + image_size;
+	const auto overlap_end   = buffer_end < image_end ? buffer_end : image_end;
+	const auto overlap_bytes = overlap_end > overlap_begin ? overlap_end - overlap_begin : 0;
 	switch (binding) {
 		case BufferImageBinding::Texture:
-			return contained && image_page_aligned && !image_gpu_modified
+			return !image_gpu_modified && !image_buffer_modified && image_page_aligned &&
+			               (contained || image_contained)
 			           ? BufferImageWrite::InvalidateTexture
 			           : BufferImageWrite::Unsupported;
 		case BufferImageBinding::VideoOut:
@@ -860,6 +883,28 @@ ClassifyBufferImageWrite(uint64_t buffer_address, uint64_t buffer_size, uint64_t
 			return image_gpu_modified ? BufferImageWrite::SynchronizeVideoOut
 			                          : BufferImageWrite::InvalidateVideoOut;
 		case BufferImageBinding::RenderTarget:
+			// Rebinding a containing raw window after it has already invalidated the target is
+			// idempotent, including for an unaligned target. The buffer cache owns the current
+			// bytes and the native image remains stale; no image-to-buffer synchronization is
+			// needed.
+			if (image_contained && !image_gpu_modified && image_buffer_modified) {
+				return BufferImageWrite::InvalidateRenderTarget;
+			}
+			// A clean or already buffer-owned page-aligned target can also accept any real partial
+			// byte overlap. BufferCache preserves exact dirty byte ranges and folds them into
+			// coherent guest backing before the target reloads. Page-only adjacency has zero byte
+			// overlap and remains on the strict path below.
+			if (!image_gpu_modified && image_page_aligned && overlap_bytes != 0) {
+				return BufferImageWrite::InvalidateRenderTarget;
+			}
+			// A containing writable buffer supersedes every byte of a render target even when the
+			// buffer is a raw bindless window rather than an exact formatted view. A GPU-current
+			// image must first publish its backing.
+			if (image_contained && !image_buffer_modified &&
+			    (!exact || (buffer_page_aligned && buffer_formatted))) {
+				return image_gpu_modified ? BufferImageWrite::SynchronizeRenderTarget
+				                          : BufferImageWrite::InvalidateRenderTarget;
+			}
 			if (!exact || !buffer_page_aligned || !buffer_formatted) {
 				return BufferImageWrite::Unsupported;
 			}
@@ -870,6 +915,13 @@ ClassifyBufferImageWrite(uint64_t buffer_address, uint64_t buffer_size, uint64_t
 			           ? BufferImageWrite::InvalidateRenderTarget
 			           : BufferImageWrite::Unsupported;
 		case BufferImageBinding::StorageTexture:
+			// A non-exact raw buffer window may fully cover a storage image whose native
+			// copy is not current. The first bind invalidates a clean image; later binds are
+			// idempotent while buffer/guest memory owns the current bytes. Keep exact raw
+			// aliases, partial aliases, and GPU-current images on the stricter path below.
+			if (image_contained && !exact && image_page_aligned && !image_gpu_modified) {
+				return BufferImageWrite::InvalidateStorageTexture;
+			}
 			if (!buffer_page_aligned || !image_page_aligned || !buffer_formatted) {
 				return BufferImageWrite::Unsupported;
 			}
@@ -892,6 +944,25 @@ ClassifyBufferImageWrite(uint64_t buffer_address, uint64_t buffer_size, uint64_t
 		case BufferImageBinding::Unsupported: return BufferImageWrite::Unsupported;
 	}
 	return BufferImageWrite::Unsupported;
+}
+
+[[nodiscard]] inline bool
+CanBatchRenderTargetBufferWrites(BufferImageWrite left_action, uint64_t left_address,
+                                 uint64_t left_size, BufferImageWrite right_action,
+                                 uint64_t right_address, uint64_t right_size) {
+	const auto isolated_action = [](BufferImageWrite action) noexcept {
+		return action == BufferImageWrite::InvalidateTexture ||
+		       action == BufferImageWrite::InvalidateStorageTexture ||
+		       action == BufferImageWrite::InvalidateRenderTarget ||
+		       action == BufferImageWrite::SynchronizeRenderTarget;
+	};
+	// DownloadRange changes ownership at tracker-page granularity. Byte-disjoint targets that share
+	// an edge page therefore cannot be transitioned independently, even when one raw window fully
+	// contains both. Page-isolated clean sampled/storage images and render targets may be validated
+	// as a set and then transitioned in any order because each action publishes or invalidates only
+	// its exact image backing.
+	return isolated_action(left_action) && isolated_action(right_action) &&
+	       !ImagePageRangesOverlap(left_address, left_size, right_address, right_size);
 }
 
 [[nodiscard]] inline StorageBufferRebind
@@ -1008,7 +1079,7 @@ ClassifyStorageRenderTargetOverlap(const ImageInfo& storage, VkFormat storage_fo
 }
 
 [[nodiscard]] inline bool IsRgba8SrgbReinterpretation(VkFormat cached,
-                                                       VkFormat requested) noexcept {
+                                                      VkFormat requested) noexcept {
 	return (cached == VK_FORMAT_R8G8B8A8_UNORM && requested == VK_FORMAT_R8G8B8A8_SRGB) ||
 	       (cached == VK_FORMAT_R8G8B8A8_SRGB && requested == VK_FORMAT_R8G8B8A8_UNORM) ||
 	       (cached == VK_FORMAT_B8G8R8A8_UNORM && requested == VK_FORMAT_B8G8R8A8_SRGB) ||
@@ -1047,8 +1118,8 @@ ClassifyStorageImageOverlap(uint64_t requested_address, uint64_t requested_size,
 	if (!ImagePageRangesOverlap(requested_address, requested_size, cached_address, cached_size)) {
 		return StorageImageOverlap::None;
 	}
-	const bool retire_target = render_target && same_context && !buffer_modified &&
-	                           gpu_modified == tracker_gpu_modified;
+	const bool retire_target =
+	    render_target && same_context && !buffer_modified && gpu_modified == tracker_gpu_modified;
 	if (!ImageRangeOverlaps(requested_address, requested_size, cached_address, cached_size)) {
 		return render_target ? (retire_target ? StorageImageOverlap::RetireTarget
 		                                      : StorageImageOverlap::Unsupported)
@@ -1057,15 +1128,15 @@ ClassifyStorageImageOverlap(uint64_t requested_address, uint64_t requested_size,
 	if (sampled && same_context && !gpu_modified && !buffer_modified && !tracker_gpu_modified) {
 		return StorageImageOverlap::RetireSampled;
 	}
-	const auto delta = cached_address >= requested_address ? cached_address - requested_address
-	                                                     : UINT64_MAX;
+	const auto delta =
+	    cached_address >= requested_address ? cached_address - requested_address : UINT64_MAX;
 	const bool contained = delta <= requested_size && cached_size <= requested_size - delta;
 	return retire_target && contained ? StorageImageOverlap::RetireTarget
 	                                  : StorageImageOverlap::Unsupported;
 }
 
 [[nodiscard]] inline bool IsCompatibleStorageSampledViewFormat(VkFormat cached,
-                                                                VkFormat requested) noexcept {
+                                                               VkFormat requested) noexcept {
 	return cached == requested || IsRgba8SrgbReinterpretation(cached, requested) ||
 	       IsR32UintFloatReinterpretation(cached, requested) ||
 	       (cached == VK_FORMAT_R8_UINT && requested == VK_FORMAT_R8_UNORM) ||
@@ -1136,7 +1207,7 @@ ClassifyRenderTargetOverlap(const RenderTargetInfo& cached, bool cached_gpu_modi
 	}
 	if (!ImageRangeOverlaps(cached.address, cached.size, requested.address, requested.size)) {
 		return same_context && !cached_buffer_modified ? RenderTargetOverlap::RetireTarget
-		                                                : RenderTargetOverlap::Unsupported;
+		                                               : RenderTargetOverlap::Unsupported;
 	}
 	const bool expand = requested.layers > cached.layers &&
 	                    IsCompatibleRenderTargetBacking(requested, cached) &&

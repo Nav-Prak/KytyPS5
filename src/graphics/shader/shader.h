@@ -240,8 +240,11 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo* regs, const HW::ShaderRegi
 bool ShaderCompileSpirvPS(const HW::PixelShaderInfo* regs, const HW::ShaderRegisters* sh,
                           ShaderLaneMaskMode lane_mask_mode, ShaderPixelInputInfo* input_info,
                           std::vector<uint32_t>* spirv);
+// On a skipped failure (--cs-skip-unresolved), static_failure reports whether the failure came
+// from a static recompiler phase and therefore can never succeed on a later bind.
 bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo* regs, const HW::ShaderRegisters* sh,
-                          ShaderComputeInputInfo* input_info, std::vector<uint32_t>* spirv);
+                          ShaderComputeInputInfo* input_info, std::vector<uint32_t>* spirv,
+                          bool* static_failure = nullptr);
 bool ShaderBindingResearchGuardEnabled();
 bool ShaderAddressValid(uint64_t addr);
 

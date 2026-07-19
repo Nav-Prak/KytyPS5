@@ -106,6 +106,7 @@ enum class Opcode {
 	BitCompare0B32,
 	BitCompare1B32,
 	AlignBitU32,
+	AlignByteU32,
 	ShiftLeftAddU32,
 	AddShiftLeftU32,
 	XorAddU32,
@@ -312,6 +313,7 @@ enum class Opcode {
 	BufferStoreShort,
 	BufferStoreDword,
 	AtomicSwapU32,
+	AtomicSwapU64,
 	AtomicAddU32,
 	AtomicSubU32,
 	AtomicSMinI32,
@@ -321,6 +323,8 @@ enum class Opcode {
 	AtomicAndU32,
 	AtomicOrU32,
 	AtomicXorU32,
+	AtomicFMinF32,
+	AtomicFMaxF32,
 	FlatLoadUbyte,
 	FlatLoadSbyte,
 	FlatLoadUshort,
@@ -430,14 +434,17 @@ struct MemoryInfo {
 	// exact scalar definitions reaching this instruction before that patching step.
 	uint32_t resource_source = 0;
 	uint32_t sampler_source  = 0;
-	bool     data_signed     = false;
-	bool     typed           = false;
-	bool     formatted       = false;
-	bool     image_has_mip   = false;
-	bool     glc             = false;
-	bool     slc             = false;
-	bool     idxen           = false;
-	bool     offen           = false;
+	// First SGPR of the V# quad for bindless accesses; the emitter reads the descriptor from
+	// these live registers because resource tracking overwrites the resource field.
+	uint32_t bindless_sgprs = UINT32_MAX;
+	bool     data_signed    = false;
+	bool     typed          = false;
+	bool     formatted      = false;
+	bool     image_has_mip  = false;
+	bool     glc            = false;
+	bool     slc            = false;
+	bool     idxen          = false;
+	bool     offen          = false;
 
 	bool operator==(const MemoryInfo& other) const = default;
 };
@@ -585,11 +592,16 @@ struct BufferResource {
 	uint32_t packed_stride     = 0;
 	uint32_t descriptor_format = 0;
 	uint32_t image_alias       = NoImageAlias;
-	bool     read              = false;
-	bool     written           = false;
-	bool     atomic            = false;
-	bool     formatted         = false;
-	bool     scalar            = false;
+	// GPU-selected descriptor: the V# is fetched at runtime from a descriptor table whose own
+	// V# (table_source) is CPU-resolvable. The dense binding covers the union of all table
+	// entries and accesses are rebased in the shader from the live SGPR descriptor.
+	uint32_t table_source = 0;
+	bool     bindless     = false;
+	bool     read         = false;
+	bool     written      = false;
+	bool     atomic       = false;
+	bool     formatted    = false;
+	bool     scalar       = false;
 
 	bool operator==(const BufferResource& other) const = default;
 };
@@ -739,6 +751,9 @@ struct Program {
 	uint32_t                wave_size           = 64;
 	uint32_t                user_data_base      = 0;
 	uint32_t                user_data_count     = 64;
+	// A single 64-lane guest wave occupies the entire workgroup. Cross-lane operations may
+	// therefore use workgroup memory when the host exposes only 32-lane subgroups.
+	bool                    workgroup_wave64    = false;
 	bool                    dispatcher_fallback = false;
 	CFG::FailureKind        cfg_failure_kind    = CFG::FailureKind::None;
 	std::string             fallback_reason;

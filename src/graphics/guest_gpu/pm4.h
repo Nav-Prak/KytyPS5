@@ -942,8 +942,20 @@ constexpr uint32_t COMPUTE_PGM_RSRC1_SGPRS_SHIFT  = 6;
 constexpr uint32_t COMPUTE_PGM_RSRC1_SGPRS_MASK   = 0xF;
 constexpr uint32_t COMPUTE_PGM_RSRC1_BULKY_SHIFT  = 24;
 constexpr uint32_t COMPUTE_PGM_RSRC1_BULKY_MASK   = 0x1;
-constexpr uint32_t COMPUTE_PGM_RSRC1_W32_EN_SHIFT = 30;
-constexpr uint32_t COMPUTE_PGM_RSRC1_W32_EN_MASK  = 0x1;
+constexpr uint32_t COMPUTE_PGM_RSRC1_MEM_ORDERED_SHIFT = 30;
+constexpr uint32_t COMPUTE_PGM_RSRC1_MEM_ORDERED_MASK  = 0x1;
+
+// On GFX10+, compute wave size is dispatch state. It is not encoded in
+// COMPUTE_PGM_RSRC1; bit 30 of that register is MEM_ORDERED.
+constexpr uint32_t COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT = 15;
+constexpr uint32_t COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_MASK  = 0x1;
+
+constexpr uint32_t ComputeDispatchWaveSize(uint32_t initiator) {
+	return (((initiator >> COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT) &
+	         COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_MASK) != 0u)
+	           ? 32u
+	           : 64u;
+}
 
 constexpr uint32_t COMPUTE_PGM_RSRC2                      = 0x213;
 constexpr uint32_t COMPUTE_PGM_RSRC2_SCRATCH_EN_SHIFT     = 0;

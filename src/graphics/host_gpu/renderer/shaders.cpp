@@ -447,6 +447,15 @@ static void ConfigureSubgroupSize(const GraphicContext* gctx, VkShaderStageFlagB
 			}
 			return;
 		}
+		case ShaderSubgroupMode::WorkgroupWave64: {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("Vulkan running one 64-lane compute wave through workgroup cross-lane "
+				     "emulation (host subgroup=%u)\n",
+				     gctx->subgroup_size);
+			}
+			return;
+		}
 		case ShaderSubgroupMode::Controlled: break;
 		case ShaderSubgroupMode::Unsupported:
 		default:

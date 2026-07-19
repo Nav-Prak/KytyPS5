@@ -321,6 +321,14 @@ void AddDescriptorAnnotationsAndNames(EmitterState* state) {
 	if (state->storage_buffer_variable != 0) {
 		Decorate(state->storage_buffer_variable, "buffers", IR::DescriptorBindingKind::Buffers);
 	}
+	if (state->storage_buffer_uint64_variable != 0) {
+		Decorate(state->storage_buffer_uint64_variable, "buffers_uint64",
+		         IR::DescriptorBindingKind::Buffers);
+		state->builder.AddAnnotation(
+		    {OpDecorate, state->storage_buffer_variable, DecorationAliased});
+		state->builder.AddAnnotation(
+		    {OpDecorate, state->storage_buffer_uint64_variable, DecorationAliased});
+	}
 	if (state->address_memory_variable != 0) {
 		Decorate(state->address_memory_variable, "address_memory",
 		         IR::DescriptorBindingKind::AddressMemory);
@@ -436,6 +444,15 @@ void EmitHeaderAndTypes(EmitterState* state) {
 	state->ptr_storage_buffer_uint      = state->builder.AllocateId();
 	state->storage_buffer_array_type    = state->builder.AllocateId();
 	state->ptr_storage_buffer_array     = state->builder.AllocateId();
+	if (state->needs_int64_atomics) {
+		state->uint64_type                       = state->builder.AllocateId();
+		state->storage_runtime_array_uint64_type = state->builder.AllocateId();
+		state->storage_buffer_uint64_type        = state->builder.AllocateId();
+		state->ptr_storage_buffer_uint64_block   = state->builder.AllocateId();
+		state->ptr_storage_buffer_uint64         = state->builder.AllocateId();
+		state->storage_buffer_uint64_array_type  = state->builder.AllocateId();
+		state->ptr_storage_buffer_uint64_array   = state->builder.AllocateId();
+	}
 	if (state->address_memory_variable != 0) {
 		state->address_memory_array_type = state->builder.AllocateId();
 		state->ptr_address_memory_array  = state->builder.AllocateId();
@@ -451,6 +468,11 @@ void EmitHeaderAndTypes(EmitterState* state) {
 	state->ptr_workgroup_array = state->builder.AllocateId();
 	state->ptr_workgroup_uint  = state->builder.AllocateId();
 	state->lds_variable        = state->builder.AllocateId();
+	if (state->workgroup_wave64) {
+		state->wave_scratch_array_type    = state->builder.AllocateId();
+		state->ptr_workgroup_wave_scratch = state->builder.AllocateId();
+		state->wave_scratch_variable      = state->builder.AllocateId();
+	}
 	for (auto& image: state->sampled_images) {
 		image.image_type         = state->builder.AllocateId();
 		image.sampled_image_type = state->builder.AllocateId();
@@ -498,6 +520,10 @@ void EmitHeaderAndTypes(EmitterState* state) {
 
 	state->builder.AddCapability({CapabilityShader});
 	state->builder.AddCapability({CapabilityImageQuery});
+	if (state->needs_int64_atomics) {
+		state->builder.AddCapability({CapabilityInt64});
+		state->builder.AddCapability({CapabilityInt64Atomics});
+	}
 	if (state->needs_image_gather_extended) {
 		state->builder.AddCapability({CapabilityImageGatherExtended});
 	}
@@ -563,6 +589,9 @@ void EmitHeaderAndTypes(EmitterState* state) {
 	if (state->stage == ShaderType::Compute || state->needs_function_lds) {
 		state->builder.AddName(state->lds_variable, "lds_dwords");
 	}
+	if (state->wave_scratch_variable != 0) {
+		state->builder.AddName(state->wave_scratch_variable, "guest_wave64_scratch");
+	}
 	AddInputAnnotationsAndNames(state);
 	AddOutputAnnotationsAndNames(state);
 	AddDescriptorAnnotationsAndNames(state);
@@ -571,11 +600,30 @@ void EmitHeaderAndTypes(EmitterState* state) {
 	    {OpDecorate, state->storage_runtime_array_type, DecorationArrayStride, 4});
 	state->builder.AddAnnotation(
 	    {OpMemberDecorate, state->storage_buffer_type, 0, DecorationOffset, 0});
+	if (state->needs_coherent_storage_buffer) {
+		state->builder.AddAnnotation(
+		    {OpMemberDecorate, state->storage_buffer_type, 0, DecorationCoherent});
+	}
 	state->builder.AddAnnotation({OpDecorate, state->storage_buffer_type, DecorationBlock});
+	if (state->needs_int64_atomics) {
+		state->builder.AddAnnotation(
+		    {OpDecorate, state->storage_runtime_array_uint64_type, DecorationArrayStride, 8});
+		state->builder.AddAnnotation(
+		    {OpMemberDecorate, state->storage_buffer_uint64_type, 0, DecorationOffset, 0});
+		if (state->needs_coherent_storage_buffer) {
+			state->builder.AddAnnotation(
+			    {OpMemberDecorate, state->storage_buffer_uint64_type, 0, DecorationCoherent});
+		}
+		state->builder.AddAnnotation(
+		    {OpDecorate, state->storage_buffer_uint64_type, DecorationBlock});
+	}
 
 	state->builder.AddType({OpTypeVoid, state->void_type});
 	state->builder.AddType({OpTypeBool, state->bool_type});
 	state->builder.AddType({OpTypeInt, state->uint_type, 32, 0});
+	if (state->needs_int64_atomics) {
+		state->builder.AddType({OpTypeInt, state->uint64_type, 64, 0});
+	}
 	state->builder.AddType(
 	    {OpTypeStruct, state->uint_pair_type, state->uint_type, state->uint_type});
 	state->builder.AddType({OpTypeInt, state->int_type, 32, 1});
@@ -696,6 +744,24 @@ void EmitHeaderAndTypes(EmitterState* state) {
 		                        StorageClassStorageBuffer, state->storage_buffer_array_type});
 		state->builder.AddType({OpVariable, state->ptr_storage_buffer_array,
 		                        state->storage_buffer_variable, StorageClassStorageBuffer});
+		if (state->needs_int64_atomics) {
+			state->builder.AddType({OpTypeRuntimeArray,
+			                        state->storage_runtime_array_uint64_type, state->uint64_type});
+			state->builder.AddType({OpTypeStruct, state->storage_buffer_uint64_type,
+			                        state->storage_runtime_array_uint64_type});
+			state->builder.AddType({OpTypePointer, state->ptr_storage_buffer_uint64_block,
+			                        StorageClassStorageBuffer, state->storage_buffer_uint64_type});
+			state->builder.AddType({OpTypePointer, state->ptr_storage_buffer_uint64,
+			                        StorageClassStorageBuffer, state->uint64_type});
+			state->builder.AddType({OpTypeArray, state->storage_buffer_uint64_array_type,
+			                        state->storage_buffer_uint64_type, count});
+			state->builder.AddType({OpTypePointer, state->ptr_storage_buffer_uint64_array,
+			                        StorageClassStorageBuffer,
+			                        state->storage_buffer_uint64_array_type});
+			state->builder.AddType({OpVariable, state->ptr_storage_buffer_uint64_array,
+			                        state->storage_buffer_uint64_variable,
+			                        StorageClassStorageBuffer});
+		}
 	}
 	if (state->gds_variable != 0) {
 		state->builder.AddType({OpVariable, state->ptr_storage_buffer, state->gds_variable,
@@ -749,6 +815,15 @@ void EmitHeaderAndTypes(EmitterState* state) {
 			state->builder.AddType({OpVariable, state->ptr_workgroup_array, state->lds_variable,
 			                        StorageClassWorkgroup});
 		}
+	}
+	if (state->wave_scratch_variable != 0) {
+		const auto scratch_size = ConstantU32(state, 66u);
+		state->builder.AddType({OpTypeArray, state->wave_scratch_array_type, state->uint_type,
+		                        scratch_size});
+		state->builder.AddType({OpTypePointer, state->ptr_workgroup_wave_scratch,
+		                        StorageClassWorkgroup, state->wave_scratch_array_type});
+		state->builder.AddType({OpVariable, state->ptr_workgroup_wave_scratch,
+		                        state->wave_scratch_variable, StorageClassWorkgroup});
 	}
 	for (uint32_t i = 0; i < state->sampled_images.size(); i++) {
 		auto&      image     = state->sampled_images[i];
@@ -894,6 +969,9 @@ void AllocateRegisterVariables(EmitterState* state) {
 void AllocateDescriptorVariables(EmitterState* state) {
 	if (DescriptorBinding(*state, IR::DescriptorBindingKind::Buffers) != nullptr) {
 		state->storage_buffer_variable = state->builder.AllocateId();
+		if (state->needs_int64_atomics) {
+			state->storage_buffer_uint64_variable = state->builder.AllocateId();
+		}
 	}
 	if (DescriptorBinding(*state, IR::DescriptorBindingKind::AddressMemory) != nullptr) {
 		state->address_memory_variable = state->builder.AllocateId();

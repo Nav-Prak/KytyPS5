@@ -860,6 +860,64 @@ uint32_t MoveBlockBefore(Graph* graph, uint32_t block_id, uint32_t before_id) {
 	return RemapId(block_id, id_map);
 }
 
+bool SplitOneConditionalLoopHeader(Graph* graph) {
+	for (const auto& loop: graph->natural_loops) {
+		const auto* header = graph->FindBlock(loop.header);
+		if (header == nullptr || header->terminator.kind != TerminatorKind::ConditionalBranch ||
+		    header->terminator.true_block == loop.merge ||
+		    header->terminator.false_block == loop.merge) {
+			continue;
+		}
+
+		const auto original_block_count = static_cast<uint32_t>(graph->blocks.size());
+		const auto header_id            = loop.header;
+		BasicBlock synthetic;
+		synthetic.id         = original_block_count;
+		synthetic.start_pc   = header->start_pc;
+		synthetic.end_pc     = header->start_pc;
+		synthetic.inst_begin = header->inst_begin;
+		synthetic.inst_end   = header->inst_begin;
+		synthetic.successors = {header_id};
+		synthetic.terminator.kind       = TerminatorKind::Branch;
+		synthetic.terminator.condition  = BranchCondition::Always;
+		synthetic.terminator.true_block = header_id;
+		graph->blocks.push_back(std::move(synthetic));
+
+		for (uint32_t block_id = 0; block_id < original_block_count; block_id++) {
+			auto& block = graph->blocks[block_id];
+			ReplaceValue(&block.successors, header_id, original_block_count);
+			ReplaceTerminatorTarget(&block.terminator, header_id, original_block_count);
+		}
+		if (graph->entry_block == header_id) {
+			graph->entry_block = original_block_count;
+		}
+
+		MoveBlockBefore(graph, original_block_count, header_id);
+		RebuildPredecessors(graph);
+		RecomputeAnalyses(graph);
+		return true;
+	}
+	return false;
+}
+
+bool SplitConditionalLoopHeaders(Graph* graph, std::string* error) {
+	const auto original_block_count = static_cast<uint32_t>(graph->blocks.size());
+	const auto split_budget =
+	    std::max<uint32_t>(8u, std::min<uint32_t>(64u, original_block_count));
+	for (uint32_t splits = 0; splits < split_budget; splits++) {
+		if (!SplitOneConditionalLoopHeader(graph)) {
+			return true;
+		}
+	}
+	SetFailure(graph, FailureKind::StructuredControlFlow, graph->entry_block,
+	           fmt::format("CFG conditional loop-header splitting exceeded budget: "
+	                       "original_blocks={} current_blocks={} split_budget={}",
+	                       original_block_count, static_cast<uint64_t>(graph->blocks.size()),
+	                       split_budget),
+	           error);
+	return false;
+}
+
 std::vector<uint32_t> DominatedBlocks(const Graph& graph, uint32_t header,
                                       uint32_t stop_block = UINT32_MAX) {
 	std::vector<uint32_t> blocks;
@@ -924,6 +982,23 @@ bool IsInsideLoopConstruct(const Graph& graph, const NaturalLoop& loop, uint32_t
 	       (loop.merge == UINT32_MAX || !graph.Dominates(loop.merge, block_id));
 }
 
+bool IsLoopControlConditional(const Graph& graph, const BasicBlock& block) {
+	if (block.terminator.kind != TerminatorKind::ConditionalBranch) {
+		return false;
+	}
+	for (const auto& loop: graph.natural_loops) {
+		if (!IsInsideLoopConstruct(graph, loop, block.id)) {
+			continue;
+		}
+		const auto is_loop_target = [&loop](uint32_t target) { return target == loop.merge; };
+		if (is_loop_target(block.terminator.true_block) ||
+		    is_loop_target(block.terminator.false_block)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 bool SelectionMergeLeavesContainingLoop(const Graph& graph, uint32_t header, uint32_t merge) {
 	for (const auto& loop: graph.natural_loops) {
 		if (IsInsideLoopConstruct(graph, loop, header) &&
@@ -946,7 +1021,6 @@ bool SplitSharedMergeBlock(Graph* graph, uint32_t merge,
 	if (merge_block == nullptr) {
 		return false;
 	}
-
 	std::vector<uint32_t> construct_predecessors;
 	std::vector<uint32_t> external_predecessors;
 	for (auto pred: merge_block->predecessors) {
@@ -1020,7 +1094,7 @@ bool SplitOneSelectionMerge(Graph* graph) {
 	for (uint32_t block_id = 0; block_id < original_block_count; block_id++) {
 		const auto* block = graph->FindBlock(block_id);
 		if (block == nullptr || block->terminator.kind != TerminatorKind::ConditionalBranch ||
-		    Contains(loop_headers, block_id)) {
+		    Contains(loop_headers, block_id) || IsLoopControlConditional(*graph, *block)) {
 			continue;
 		}
 
@@ -1383,7 +1457,7 @@ bool Structurize(Graph* graph, std::string* error) {
 		return false;
 	}
 
-	if (!SplitSharedMergeBlocks(graph, error)) {
+	if (!SplitConditionalLoopHeaders(graph, error) || !SplitSharedMergeBlocks(graph, error)) {
 		return false;
 	}
 	ClearStructuredTerminators(graph);
@@ -1422,7 +1496,7 @@ bool Structurize(Graph* graph, std::string* error) {
 
 	for (auto& block: graph->blocks) {
 		if (block.terminator.kind != TerminatorKind::ConditionalBranch ||
-		    block.terminator.loop_header) {
+		    block.terminator.loop_header || IsLoopControlConditional(*graph, block)) {
 			continue;
 		}
 

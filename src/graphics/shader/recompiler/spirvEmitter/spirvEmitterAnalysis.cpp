@@ -164,6 +164,7 @@ bool IsPairDwordOpcode(IR::Opcode op) {
 		case IR::Opcode::BitReplicateB64B32:
 		case IR::Opcode::ShiftLeftLogicalU64:
 		case IR::Opcode::ShiftRightLogicalU64:
+		case IR::Opcode::AtomicSwapU64:
 		case IR::Opcode::SelectU64: return true;
 		default: return false;
 	}
@@ -179,6 +180,7 @@ uint32_t PairDwordSourceCount(IR::Opcode op, uint32_t src_count) {
 		case IR::Opcode::BitwiseNotU64:
 		case IR::Opcode::SaveexecB64:
 		case IR::Opcode::WqmB64:
+		case IR::Opcode::AtomicSwapU64:
 		case IR::Opcode::MoveU64: return std::min<uint32_t>(src_count, 1u);
 		default: return src_count;
 	}
@@ -363,6 +365,28 @@ bool ProgramNeedsPixelValidMask(const IR::Program& program) {
 	for (const auto& block: program.blocks) {
 		for (const auto& inst: block.instructions) {
 			if (inst.op == IR::Opcode::Export && inst.export_info.vm) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+bool ProgramNeedsCoherentStorageBuffer(const IR::Program& program) {
+	for (const auto& block: program.blocks) {
+		for (const auto& inst: block.instructions) {
+			if (inst.memory.glc && IsStorageBufferMemoryKind(inst.memory.kind)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+bool ProgramNeedsInt64Atomics(const IR::Program& program) {
+	for (const auto& block: program.blocks) {
+		for (const auto& inst: block.instructions) {
+			if (inst.op == IR::Opcode::AtomicSwapU64) {
 				return true;
 			}
 		}

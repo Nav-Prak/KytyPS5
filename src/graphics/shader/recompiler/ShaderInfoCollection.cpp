@@ -145,7 +145,7 @@ void CollectComputeInputs(const Program& program, const ShaderComputeInputInfo* 
 			AddInput(info, StageInputKind::GlobalInvocationId, 0, 3, "gl_GlobalInvocationID");
 		}
 	}
-	if (NeedsLocalInvocationIndex(program)) {
+	if (program.workgroup_wave64 || NeedsLocalInvocationIndex(program)) {
 		AddInput(info, StageInputKind::LocalInvocationIndex, 0, 1, "gl_LocalInvocationIndex");
 	}
 }

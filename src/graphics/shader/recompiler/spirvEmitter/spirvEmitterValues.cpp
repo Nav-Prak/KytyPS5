@@ -56,6 +56,102 @@ uint32_t EmitTrueBool(EmitterState* state) {
 	return ret;
 }
 
+namespace {
+
+void EmitGuestWaveWorkgroupBarrier(EmitterState* state) {
+	const auto semantics = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
+	state->builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+	                            ConstantU32(state, ScopeWorkgroup),
+	                            ConstantU32(state, semantics)});
+}
+
+uint32_t EmitGuestWaveScratchPointer(EmitterState* state, uint32_t index) {
+	const auto pointer = state->builder.AllocateId();
+	state->builder.AddFunction({OpAccessChain, state->ptr_workgroup_uint, pointer,
+	                            state->wave_scratch_variable, index});
+	return pointer;
+}
+
+} // namespace
+
+uint32_t EmitWaveShuffleU32(EmitterState* state, uint32_t value, uint32_t lane) {
+	if (!state->workgroup_wave64) {
+		const auto shuffled = state->builder.AllocateId();
+		state->builder.AddFunction({OpGroupNonUniformShuffle, state->uint_type, shuffled,
+		                            ConstantU32(state, ScopeSubgroup), value, lane});
+		return shuffled;
+	}
+
+	const auto self = EmitLocalInvocationIndex(state);
+	state->builder.AddFunction({OpStore, EmitGuestWaveScratchPointer(state, self), value});
+	EmitGuestWaveWorkgroupBarrier(state);
+
+	const auto bounded_lane = state->builder.AllocateId();
+	const auto shuffled     = state->builder.AllocateId();
+	state->builder.AddFunction(
+	    {OpBitwiseAnd, state->uint_type, bounded_lane, lane, ConstantU32(state, 63u)});
+	state->builder.AddFunction(
+	    {OpLoad, state->uint_type, shuffled, EmitGuestWaveScratchPointer(state, bounded_lane)});
+	// Prevent the next cross-lane operation from overwriting scratch before both native
+	// subgroups have consumed the current value.
+	EmitGuestWaveWorkgroupBarrier(state);
+	return shuffled;
+}
+
+uint32_t EmitWaveBallot(EmitterState* state, uint32_t predicate) {
+	if (!state->workgroup_wave64) {
+		const auto ballot = state->builder.AllocateId();
+		state->builder.AddFunction({OpGroupNonUniformBallot, state->vec4_uint_type, ballot,
+		                            ConstantU32(state, ScopeSubgroup), predicate});
+		return ballot;
+	}
+
+	const auto lane       = EmitLocalInvocationIndex(state);
+	const auto lane_zero  = state->builder.AllocateId();
+	const auto low_word   = EmitGuestWaveScratchPointer(state, ConstantU32(state, 64u));
+	const auto high_word  = EmitGuestWaveScratchPointer(state, ConstantU32(state, 65u));
+	state->builder.AddFunction(
+	    {OpIEqual, state->bool_type, lane_zero, lane, ConstantU32(state, 0u)});
+	EmitIfCondition(state, lane_zero, [&]() {
+		state->builder.AddFunction({OpStore, low_word, ConstantU32(state, 0u)});
+		state->builder.AddFunction({OpStore, high_word, ConstantU32(state, 0u)});
+	});
+	EmitGuestWaveWorkgroupBarrier(state);
+
+	const auto high_half  = state->builder.AllocateId();
+	const auto word_index = state->builder.AllocateId();
+	const auto bit_index  = state->builder.AllocateId();
+	const auto bit        = state->builder.AllocateId();
+	state->builder.AddFunction(
+	    {OpUGreaterThanEqual, state->bool_type, high_half, lane, ConstantU32(state, 32u)});
+	state->builder.AddFunction({OpSelect, state->uint_type, word_index, high_half,
+	                            ConstantU32(state, 65u), ConstantU32(state, 64u)});
+	state->builder.AddFunction(
+	    {OpBitwiseAnd, state->uint_type, bit_index, lane, ConstantU32(state, 31u)});
+	state->builder.AddFunction(
+	    {OpShiftLeftLogical, state->uint_type, bit, ConstantU32(state, 1u), bit_index});
+	EmitIfCondition(state, predicate, [&]() {
+		const auto ignored = state->builder.AllocateId();
+		const auto pointer = EmitGuestWaveScratchPointer(state, word_index);
+		state->builder.AddFunction(
+		    {OpAtomicOr, state->uint_type, ignored, pointer, ConstantU32(state, ScopeWorkgroup),
+		     ConstantU32(state,
+		                 MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory),
+		     bit});
+	});
+	EmitGuestWaveWorkgroupBarrier(state);
+
+	const auto low    = state->builder.AllocateId();
+	const auto high   = state->builder.AllocateId();
+	const auto ballot = state->builder.AllocateId();
+	state->builder.AddFunction({OpLoad, state->uint_type, low, low_word});
+	state->builder.AddFunction({OpLoad, state->uint_type, high, high_word});
+	EmitGuestWaveWorkgroupBarrier(state);
+	state->builder.AddFunction({OpCompositeConstruct, state->vec4_uint_type, ballot, low, high,
+	                            ConstantU32(state, 0u), ConstantU32(state, 0u)});
+	return ballot;
+}
+
 DppTargetLane EmitDppQuadPermTargetLane(EmitterState* state, uint32_t subid, uint32_t control) {
 	const auto quad_base = state->builder.AllocateId();
 	const auto lane      = state->builder.AllocateId();
@@ -172,9 +268,7 @@ uint32_t EmitDppValueU32(EmitterState* state, const IR::Operand& operand, uint32
 	}
 
 	const auto target   = EmitDppTargetLane(state, operand.dpp_ctrl);
-	const auto shuffled = state->builder.AllocateId();
-	state->builder.AddFunction({OpGroupNonUniformShuffle, state->uint_type, shuffled,
-	                            ConstantU32(state, ScopeSubgroup), value, target.lane});
+	const auto shuffled = EmitWaveShuffleU32(state, value, target.lane);
 	if (operand.dpp_fetch_inactive) {
 		return shuffled;
 	}
@@ -379,6 +473,9 @@ uint32_t EmitConditionBool(EmitterState* state, const IR::Operand& operand) {
 }
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState* state) {
+	if (state->workgroup_wave64) {
+		return EmitLocalInvocationIndex(state);
+	}
 	if (state->subgroup_local_invocation_id_variable == 0) {
 		return ConstantU32(state, 0);
 	}
@@ -649,9 +746,7 @@ uint32_t EmitLaneMaskOperandActiveBool(EmitterState* state, const IR::Operand& o
 
 uint32_t EmitLaneIndexActiveBool(EmitterState* state, uint32_t lane) {
 	if (state->per_invocation_masks) {
-		const auto ballot = state->builder.AllocateId();
-		state->builder.AddFunction({OpGroupNonUniformBallot, state->vec4_uint_type, ballot,
-		                            ConstantU32(state, ScopeSubgroup), EmitExecActiveBool(state)});
+		const auto ballot = EmitWaveBallot(state, EmitExecActiveBool(state));
 		return EmitBallotLaneActiveBool(state, ballot, lane);
 	}
 	const auto lane_low = state->builder.AllocateId();
@@ -680,9 +775,7 @@ uint32_t EmitLaneIndexActiveBool(EmitterState* state, uint32_t lane) {
 }
 
 uint32_t EmitSubgroupLaneActiveBool(EmitterState* state, uint32_t lane) {
-	const auto active_ballot = state->builder.AllocateId();
-	state->builder.AddFunction({OpGroupNonUniformBallot, state->vec4_uint_type, active_ballot,
-	                            ConstantU32(state, ScopeSubgroup), EmitTrueBool(state)});
+	const auto active_ballot = EmitWaveBallot(state, EmitTrueBool(state));
 	return EmitBallotLaneActiveBool(state, active_ballot, lane);
 }
 uint32_t EmitBallotLaneActiveBool(EmitterState* state, uint32_t active_ballot, uint32_t lane) {

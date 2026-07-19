@@ -108,6 +108,7 @@ bool IsDsWrite(IR::Opcode op) {
 bool IsAtomic(IR::Opcode op) {
 	switch (op) {
 		case IR::Opcode::AtomicSwapU32:
+		case IR::Opcode::AtomicSwapU64:
 		case IR::Opcode::AtomicAddU32:
 		case IR::Opcode::AtomicSubU32:
 		case IR::Opcode::AtomicSMinI32:
@@ -116,7 +117,9 @@ bool IsAtomic(IR::Opcode op) {
 		case IR::Opcode::AtomicUMaxU32:
 		case IR::Opcode::AtomicAndU32:
 		case IR::Opcode::AtomicOrU32:
-		case IR::Opcode::AtomicXorU32: return true;
+		case IR::Opcode::AtomicXorU32:
+		case IR::Opcode::AtomicFMinF32:
+		case IR::Opcode::AtomicFMaxF32: return true;
 		default: return false;
 	}
 }
@@ -236,7 +239,7 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 	if (!program.info.addresses.empty()) {
 		Expect(Kind::AddressMemory, Dense(program.info.addresses.size()));
 	}
-	if (!program.srt.reads.empty()) {
+	if (!program.srt.reads.empty() || !program.info.buffers.empty()) {
 		Expect(Kind::FlattenedSrt);
 	}
 	if (!program.bindings.user_data_registers.empty() && program.bindings.push_constant_size == 0) {
@@ -447,6 +450,7 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 	state.compute_input_info = compute_input_info;
 	state.stage              = program.stage;
 	state.wave_size          = program.wave_size;
+	state.workgroup_wave64   = program.workgroup_wave64;
 	state.debug_printf_enabled =
 	    program.stage == ShaderType::Vertex && Config::SpirvDebugPrintfEnabled();
 	state.per_invocation_masks = program.lane_mask_mode == ShaderLaneMaskMode::PerInvocation;
@@ -466,6 +470,8 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 	state.needs_image_gather_extended        = ProgramNeedsImageGatherExtended(program);
 	state.needs_function_lds                 = ProgramNeedsFunctionLds(program);
 	state.needs_pixel_valid_mask             = ProgramNeedsPixelValidMask(program);
+	state.needs_coherent_storage_buffer      = ProgramNeedsCoherentStorageBuffer(program);
+	state.needs_int64_atomics                = ProgramNeedsInt64Atomics(program);
 	ComputeReachableBlocks(&state, program);
 	AllocateInputVariables(&state);
 	AllocateOutputVariables(&state);

@@ -781,7 +781,11 @@ private:
 			if (incoming.empty()) {
 				return ScalarProvenance::Undefined;
 			}
-			if (incoming.size() == 1) {
+			// A phi is a fixed-point boundary.  Once allocated, keep its identity
+			// stable even if transient work-list states make its incoming values
+			// coalesce.  Dropping back to the lone value can make a loop alternate
+			// between the phi and an expanded symbolic expression forever.
+			if (incoming.size() == 1 && *phi == ScalarProvenance::Undefined) {
 				return incoming[0];
 			}
 			if (*phi == ScalarProvenance::Undefined) {
@@ -916,6 +920,25 @@ bool DescriptorSourceResolved(const Program& program, uint32_t source) {
 		}
 	}
 	return true;
+}
+
+bool ScalarValueResolved(const Program& program, uint32_t value) {
+	std::vector<uint8_t> visited(program.provenance.values.size());
+	return ValueResolved(program.provenance, value, &visited);
+}
+
+uint32_t InternDescriptorSource(Program* program, const DescriptorValue& descriptor) {
+	if (program == nullptr || descriptor.dword_count == 0 || descriptor.dword_count > 8) {
+		return ScalarProvenance::Unknown;
+	}
+	auto& descriptors = program->provenance.descriptors;
+	for (uint32_t i = 0; i < descriptors.size(); i++) {
+		if (descriptors[i] == descriptor) {
+			return i + 2u;
+		}
+	}
+	descriptors.push_back(descriptor);
+	return static_cast<uint32_t>(descriptors.size() - 1) + 2u;
 }
 
 std::string ScalarValueToString(const ScalarProvenance& provenance, uint32_t value) {

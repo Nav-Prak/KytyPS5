@@ -311,15 +311,14 @@ void TestDynamicPhiResource() {
   Check(BuildScalarProvenance(&program, &error) &&
             BuildSrtPlan(&program, &error) && PatchSrtReads(&program, &error),
         error.c_str());
-  const auto original_source =
-      program.blocks[3].instructions[0].memory.resource_source;
-  Check(
-      !TrackResources(&program, &error) &&
-          error.find("unsupported GPU selection") != std::string::npos &&
-          program.blocks[3].instructions[0].memory.resource_source ==
-              original_source &&
-          !program.resource_tracking_complete,
-      "control-flow descriptor was patched without an executable GPU selector");
+  // Control-flow-selected raw descriptors execute through the live-register bindless path:
+  // whichever branch ran, the quad holds the selected V# at the use.
+  Check(TrackResources(&program, &error), error.c_str());
+  Check(program.resource_tracking_complete && program.info.buffers.size() == 1 &&
+            program.info.buffers[0].bindless &&
+            program.info.buffers[0].table_source == ScalarProvenance::Undefined &&
+            program.blocks[3].instructions[0].memory.bindless_sgprs == 0,
+        "control-flow descriptor did not track as a live-register bindless buffer");
 }
 
 void TestTrackingRequiresCompletedSrtPlan() {
@@ -375,10 +374,13 @@ void TestCyclicResourceIsRejected() {
   Check(BuildScalarProvenance(&program, &error) &&
             BuildSrtPlan(&program, &error) && PatchSrtReads(&program, &error),
         error.c_str());
-  Check(!TrackResources(&program, &error) &&
-            error.find("unsupported GPU selection") != std::string::npos &&
-            !program.resource_tracking_complete,
-        "cyclic descriptor was patched without a bindless/direct path");
+  // Loop-varying raw descriptors execute through the live-register bindless path: each
+  // iteration reads the quad the loop computed.
+  Check(TrackResources(&program, &error), error.c_str());
+  Check(program.resource_tracking_complete && program.info.buffers.size() == 1 &&
+            program.info.buffers[0].bindless &&
+            program.info.buffers[0].table_source == ScalarProvenance::Undefined,
+        "cyclic descriptor did not track as a live-register bindless buffer");
 }
 
 void TestUnknownSourceFailsWithoutPatching() {
@@ -392,7 +394,12 @@ void TestUnknownSourceFailsWithoutPatching() {
   unsupported.dst = Sgpr(4);
   unsupported.src[0] = Sgpr(20);
   unsupported.src_count = 1;
-  program.blocks[0].instructions = {valid, unsupported, BufferUse(0x44, 4)};
+  // Unknown-source raw buffers now track as bindless, so the transactional-failure case uses
+  // an image: image descriptors cannot window and still reject unknown provenance.
+  program.blocks[0].instructions = {
+      valid, unsupported,
+      ImageUse(0x44, Opcode::ImageSample, ResourceKind::Image,
+               Decoder::ImageDimension::Dim2D, 1, 3)};
 
   std::string error;
   Check(BuildScalarProvenance(&program, &error) &&
@@ -1150,6 +1157,8 @@ void TestRuntimeSpecializationCoversBakedBufferAndAddressFields() {
 
   ResourceSnapshot buffer_snapshot;
   buffer_snapshot.buffers.resize(1);
+  // One bind-remainder dword per buffer rides in the flattened SRT.
+  buffer_snapshot.flattened_srt.resize(1);
   buffer_snapshot.buffers[0].dword_count = 4;
   buffer_snapshot.buffers[0].dwords[1] = (16u << 16u) | (1u << 31u);
   buffer_snapshot.buffers[0].dwords[3] =
@@ -1351,8 +1360,9 @@ void TestNativeBindingLayout() {
             samplers->resources == std::vector<uint32_t>{0} &&
             !program.bindings.user_data_registers.empty() &&
             program.bindings.push_constant_size != 0 &&
+            // Buffers always receive a bind-remainder dword through the flattened SRT.
             FindBinding(program.bindings,
-                        DescriptorBindingKind::FlattenedSrt) == nullptr &&
+                        DescriptorBindingKind::FlattenedSrt) != nullptr &&
             program.binding_layout_complete,
         "native binding allocator did not preserve dense typed resource groups");
 }
@@ -1611,10 +1621,12 @@ void TestNativeBindingLayoutDynamicSrtDoesNotUseFlatBinding() {
             CollectShaderInfo(&program, {.compute = &compute}, &error) &&
             AllocateBindings(&program, {}, &error),
         error.c_str());
+  // The flattened binding now exists for the buffer's bind-remainder dword, but the dynamic
+  // reads themselves must stay unflattened (srt.reads empty, checked above).
   Check(program.bindings.user_data_registers ==
                 std::vector<uint32_t>({16, 17, 20}) &&
             FindBinding(program.bindings,
-                        DescriptorBindingKind::FlattenedSrt) == nullptr,
+                        DescriptorBindingKind::FlattenedSrt) != nullptr,
         "dynamic-only SRT reads were flattened or lost reaching user data");
 }
 

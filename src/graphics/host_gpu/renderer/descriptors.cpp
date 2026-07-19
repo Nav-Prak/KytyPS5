@@ -148,63 +148,76 @@ NativeSamplerDescriptor(const ShaderRecompiler::IR::DescriptorValue& descriptor)
 	return result;
 }
 
+StorageBufferDescriptorInfo
+ResolveStorageBufferDescriptor(const ShaderBufferResource&                 descriptor,
+                               const ShaderRecompiler::IR::BufferResource& resource) {
+	// The same descriptor provenance can be consumed by both image and buffer instructions.
+	// A live image sharp is not a valid Vulkan storage-buffer range, so keep the buffer binding
+	// inert and let the separately tracked image binding carry the access.
+	if (resource.image_alias != ShaderRecompiler::IR::BufferResource::NoImageAlias &&
+	    (descriptor.Type() & 2u) != 0) {
+		return {StorageBufferDescriptorKind::ActiveImageAlias, 0, 0};
+	}
+
+	// Some GTA kernels deliberately issue formatted buffer stores through the first four dwords
+	// of an image sharp. Retain the exact captured write-only RGBA8_UINT path without treating
+	// every nonzero buffer TYPE as an image; the latter caused the upstream regression that
+	// disabled this support wholesale.
+	if (descriptor.Type() == 0 || !resource.formatted || !resource.written || resource.read ||
+	    resource.atomic) {
+		return {};
+	}
+	ShaderTextureResource texture {};
+	std::copy_n(descriptor.fields, 4, texture.fields);
+	const auto width   = static_cast<uint32_t>(texture.Width5()) + 1u;
+	const auto height  = static_cast<uint32_t>(texture.Height5()) + 1u;
+	const auto format  = texture.Format();
+	const auto tile    = texture.TileMode();
+	const auto type    = texture.Type();
+	const auto address = texture.Base40();
+	if (format != Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UInt) ||
+	    tile != Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) ||
+	    type != Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) ||
+	    texture.DstSelXYZW() != DstSel(4, 5, 6, 7) || address == 0) {
+		return {};
+	}
+	const auto    pitch = TileGetTexturePitch(format, width, 1, tile);
+	TileSizeAlign footprint {};
+	TileGetTextureTotalSize(format, width, height, 1, pitch, 1, tile, false, &footprint);
+	if (footprint.size == 0 || footprint.align != 65536) {
+		return {};
+	}
+	return {StorageBufferDescriptorKind::TextureBackedImage, address, footprint.size};
+}
+
 static BufferView NativeStorageBuffer(uint64_t submit_id, CommandBuffer* command_buffer,
                                       const ShaderBufferResource&                 descriptor,
                                       const ShaderRecompiler::IR::BufferResource& resource) {
 	BufferView result;
-
-	// Regression
-	//  Bind a null buffer when these four dwords are
-	//  the tracked prefix of an active image sharp. Image validity is encoded by dword 3 bit 31.
-	/*if (resource.image_alias != ShaderRecompiler::IR::BufferResource::NoImageAlias &&
-	    (descriptor.Type() & 2u) != 0) {
-	    BindNullStorageBuffer(command_buffer, &result);
-	    return result;
+	const auto resolved = ResolveStorageBufferDescriptor(descriptor, resource);
+	if (resolved.kind == StorageBufferDescriptorKind::ActiveImageAlias) {
+		BindNullStorageBuffer(command_buffer, &result);
+		return result;
 	}
-	// Buffer TYPE is zero. A nonzero value means a buffer instruction received the first four
-	// dwords of an image sharp without a tracked image alias; support the known write-only path.
-	if (descriptor.Type() != 0) {
-	    ShaderTextureResource texture {};
-	    std::copy_n(descriptor.fields, 4, texture.fields);
-	    const auto    width   = static_cast<uint32_t>(texture.Width5()) + 1u;
-	    const auto    height  = static_cast<uint32_t>(texture.Height5()) + 1u;
-	    const auto    format  = texture.Format();
-	    const auto    tile    = texture.TileMode();
-	    const auto    type    = texture.Type();
-	    const auto    address = texture.Base40();
-	    const auto    pitch   = TileGetTexturePitch(format, width, 1, tile);
-	    TileSizeAlign footprint {};
-	    TileGetTextureTotalSize(format, width, height, 1, pitch, 1, tile, false, &footprint);
-	    const bool supported =
-	        resource.formatted && resource.written && !resource.read && !resource.atomic &&
-	        format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UInt) &&
-	        tile == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) &&
-	        type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) &&
-	        texture.DstSelXYZW() == DstSel(4, 5, 6, 7) && address != 0 && footprint.size != 0 &&
-	        footprint.align == 65536;
-	    if (!supported) {
-	        EXIT("unsupported texture descriptor used as storage buffer: type=%u format=%u"
-	             " tile=%u swizzle=0x%03x extent=%ux%u read=%d written=%d formatted=%d atomic=%d\n",
-	             type, format, tile, texture.DstSelXYZW(), width, height, resource.read,
-	             resource.written, resource.formatted, resource.atomic);
-	    }
-	    auto* ctx = g_render_ctx->GetGraphicCtx();
-	    g_render_ctx->GetBufferCache()->ValidateGpuAccess(address, footprint.size, false, true);
-	    auto binding = g_render_ctx->GetBufferCache()->ObtainBuffer(
-	        command_buffer, ctx, address, footprint.size, true, false, true);
-	    const auto alignment = ctx->StorageMinAlignment();
-	    if (alignment == 0 || binding.second % alignment != 0 ||
-	        footprint.size > ctx->GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
-	        EXIT("texture-backed storage buffer binding is unsupported: addr=0x%016" PRIx64
-	             " size=0x%016" PRIx64 " offset=0x%016" PRIx64 " alignment=0x%016" PRIx64 "\n",
-	             address, footprint.size, static_cast<uint64_t>(binding.second),
-	             static_cast<uint64_t>(alignment));
-	    }
-	    result.buffer = binding.first;
-	    result.offset = binding.second;
-	    result.range  = footprint.size;
-	    return result;
-	}*/
+	if (resolved.kind == StorageBufferDescriptorKind::TextureBackedImage) {
+		auto* ctx = g_render_ctx->GetGraphicCtx();
+		g_render_ctx->GetBufferCache()->ValidateGpuAccess(resolved.address, resolved.size, false,
+		                                                  true);
+		auto binding = g_render_ctx->GetBufferCache()->ObtainBuffer(
+		    command_buffer, ctx, resolved.address, resolved.size, true, false, true);
+		const auto alignment = ctx->StorageMinAlignment();
+		if (alignment == 0 || binding.second % alignment != 0 ||
+		    resolved.size > ctx->GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
+			EXIT("texture-backed storage buffer binding is unsupported: addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 " offset=0x%016" PRIx64 " alignment=0x%016" PRIx64 "\n",
+			     resolved.address, resolved.size, static_cast<uint64_t>(binding.second),
+			     static_cast<uint64_t>(alignment));
+		}
+		result.buffer = binding.first;
+		result.offset = binding.second;
+		result.range  = resolved.size;
+		return result;
+	}
 	const auto address = descriptor.Base48();
 	const auto stride  = descriptor.Stride();
 	const auto records = descriptor.NumRecords();
@@ -218,19 +231,62 @@ static BufferView NativeStorageBuffer(uint64_t submit_id, CommandBuffer* command
 	}
 	auto* const ctx       = g_render_ctx->GetGraphicCtx();
 	const auto  alignment = ctx->StorageMinAlignment();
-	if (alignment == 0 || size > ctx->GetPhysicalDeviceProperties().limits.maxStorageBufferRange ||
+	// Guest V# bases are only dword-aligned, so bind from the aligned-down base; the shader
+	// re-adds the remainder it receives through the flattened SRT.
+	const auto bind_base = address & ~(ShaderRecompiler::IR::StorageBufferBindAlignment - 1u);
+	const auto padding   = address - bind_base;
+	if (size > UINT64_MAX - padding) {
+		EXIT("storage buffer aligned footprint overflow\n");
+	}
+	auto bind_size = size + padding;
+	if (alignment == 0 || alignment > ShaderRecompiler::IR::StorageBufferBindAlignment ||
+	    bind_size > ctx->GetPhysicalDeviceProperties().limits.maxStorageBufferRange ||
 	    BufferCache::CACHING_PAGE_SIZE % alignment != 0) {
 		EXIT("storage buffer range or device alignment is unsupported\n");
 	}
+	if (bind_base != address && !HostMemoryRangeIsMapped(bind_base, address - bind_base)) {
+		EXIT("storage buffer alignment padding is unmapped: addr=0x%016" PRIx64
+		     " bind_base=0x%016" PRIx64 "\n",
+		     address, bind_base);
+	}
+	if (resource.read && !resource.written) {
+		const auto requested_size = bind_size;
+		bind_size = g_render_ctx->GetBufferCache()->ReadOnlyBufferCompatiblePrefixSize(bind_base,
+		                                                                               bind_size);
+		if (bind_size <= padding) {
+			static std::atomic_uint null_alias_logs {0};
+			if (null_alias_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
+				LOGF("read-only storage buffer begins in an incoherent image or metadata range; "
+				     "binding null: base=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+				     bind_base, requested_size);
+			}
+			BindNullStorageBuffer(command_buffer, &result);
+			return result;
+		}
+		if (bind_size != requested_size) {
+			static std::atomic_uint clipped_alias_logs {0};
+			if (clipped_alias_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
+				LOGF("read-only storage buffer clipped before an incoherent image or metadata "
+				     "range: base=0x%016" PRIx64 " size=0x%016" PRIx64 " bound=0x%016" PRIx64 "\n",
+				     bind_base, requested_size, bind_size);
+			}
+		}
+	}
 	(void)submit_id;
-	auto binding = g_render_ctx->GetBufferCache()->ObtainBuffer(
-	    command_buffer, ctx, address, size, resource.written, resource.read, resource.formatted);
+	auto binding = g_render_ctx->GetBufferCache()->ObtainBuffer(command_buffer, ctx, bind_base,
+	                                                            bind_size, resource.written,
+	                                                            resource.read, resource.formatted);
 	if (binding.second % alignment != 0) {
-		EXIT("storage buffer binding is not device-aligned\n");
+		EXIT("storage buffer binding is not device-aligned: addr=0x%016" PRIx64
+		     " bind_base=0x%016" PRIx64 " size=0x%016" PRIx64 " offset=0x%016" PRIx64
+		     " alignment=0x%016" PRIx64 " read=%d written=%d formatted=%d atomic=%d\n",
+		     address, bind_base, bind_size, static_cast<uint64_t>(binding.second),
+		     static_cast<uint64_t>(alignment), resource.read, resource.written, resource.formatted,
+		     resource.atomic);
 	}
 	result.buffer = binding.first;
 	result.offset = binding.second;
-	result.range  = static_cast<VkDeviceSize>(size);
+	result.range  = static_cast<VkDeviceSize>(bind_size);
 	return result;
 }
 
@@ -243,14 +299,20 @@ NativeAddressBuffer(uint64_t submit_id, CommandBuffer* command_buffer,
 		BindNullStorageBuffer(command_buffer, &result);
 		return result;
 	}
-	if (resource.written) {
+	// Unbased windows (runtime pointer chases over the dispatch's tracked-buffer union) may be
+	// written; their coherence rides on ObtainBuffer like any storage buffer. Based address
+	// resources remain read-only.
+	if (resource.written && resource.source != ShaderRecompiler::IR::ScalarProvenance::Unknown) {
 		EXIT("writable address resources are unsupported\n");
 	}
-	const auto limit  = resource.kind == ShaderRecompiler::IR::ResourceKind::Flat
-	                        ? ShaderRecompiler::IR::FlatAddressWindowSize
-	                        : static_cast<uint64_t>(g_render_ctx->GetGraphicCtx()
-	                                                    ->GetPhysicalDeviceProperties()
-	                                                    .limits.maxStorageBufferRange);
+	auto limit = resource.kind == ShaderRecompiler::IR::ResourceKind::Flat
+	                 ? ShaderRecompiler::IR::FlatAddressWindowSize
+	                 : static_cast<uint64_t>(g_render_ctx->GetGraphicCtx()
+	                                             ->GetPhysicalDeviceProperties()
+	                                             .limits.maxStorageBufferRange);
+	if (address.binding_size != 0) {
+		limit = std::min(limit, address.binding_size);
+	}
 	uint64_t   size   = 0;
 	const auto access = HostMemoryAccess::Mapped;
 	if (!HostMemoryQueryRange(address.binding_base, limit, access, &size)) {
@@ -259,7 +321,7 @@ NativeAddressBuffer(uint64_t submit_id, CommandBuffer* command_buffer,
 	}
 	const auto mapped_size = size;
 	size = g_render_ctx->GetTextureCache()->BufferCompatiblePrefixSize(address.binding_base,
-	                                                                  mapped_size);
+	                                                                   mapped_size);
 	if (size == 0) {
 		LOGF("address resource begins in an image or metadata range, binding a null read view: "
 		     "base=0x%016" PRIx64 " mapped_size=0x%016" PRIx64 " kind=%u\n",
@@ -269,8 +331,8 @@ NativeAddressBuffer(uint64_t submit_id, CommandBuffer* command_buffer,
 	}
 	if (size != mapped_size) {
 		LOGF("address resource range clipped before an image or metadata range: "
-		     "base=0x%016" PRIx64 " mapped_size=0x%016" PRIx64
-		     " bound_size=0x%016" PRIx64 " kind=%u\n",
+		     "base=0x%016" PRIx64 " mapped_size=0x%016" PRIx64 " bound_size=0x%016" PRIx64
+		     " kind=%u\n",
 		     address.binding_base, mapped_size, size, static_cast<uint32_t>(resource.kind));
 	}
 	auto* const ctx       = g_render_ctx->GetGraphicCtx();
@@ -280,8 +342,8 @@ NativeAddressBuffer(uint64_t submit_id, CommandBuffer* command_buffer,
 		EXIT("address resource range or alignment is unsupported\n");
 	}
 	(void)submit_id;
-	auto binding  = g_render_ctx->GetBufferCache()->ObtainBuffer(command_buffer, ctx,
-	                                                             address.binding_base, size);
+	auto binding = g_render_ctx->GetBufferCache()->ObtainBuffer(
+	    command_buffer, ctx, address.binding_base, size, resource.written, resource.read);
 	result.buffer = binding.first;
 	result.offset = binding.second;
 	result.range  = static_cast<VkDeviceSize>(size);
@@ -447,11 +509,8 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	    tile == Prospero::GpuEnumValue(Prospero::TileMode::kDepth) && !resource.read &&
 	    resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint &&
 	    IsSupportedStorageDepthTile(descriptor.Format(), descriptor.Type(), width, height, depth);
-	const bool supported_tile = tile == Prospero::GpuEnumValue(Prospero::TileMode::kLinear) ||
-	                            tile == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) ||
-	                            (tile == Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB) &&
-	                             TileIsStandard4KBTextureSupported(descriptor.Format())) ||
-	                            supported_depth_tile;
+	const bool supported_tile =
+	    IsSupportedStorageTile(descriptor.Format(), tile, supported_depth_tile);
 	const bool supported_swizzle =
 	    IsSupportedStorageSwizzle(descriptor.Format(), descriptor.DstSelXYZW()) &&
 	    (descriptor.DstSelXYZW() == DstSel(4, 5, 6, 7) || !resource.read);
@@ -574,13 +633,13 @@ NativeTexture(uint64_t submit_id, CommandBuffer* command_buffer,
 		EXIT("sampled image numeric class mismatch: kind=%u format=%u addr=0x%016" PRIx64 "\n",
 		     static_cast<uint32_t>(resource.kind), format, address);
 	}
-	const auto view_format = TextureGetFormat(format, storage ? TextureFormatUsage::Storage
-	                                                          : TextureFormatUsage::Sampled);
-	const auto type        = static_cast<Prospero::ImageType>(descriptor.Type());
-	const auto target_view = ResolveTargetTextureViewForBinding(
-	    resource, type, storage, height, descriptor.BaseArray5(), depth);
-	const auto    pitch   = TileGetTexturePitch(format, width, levels, tile);
-	const auto    swizzle = descriptor.DstSelXYZW();
+	const auto    view_format = TextureGetFormat(format, storage ? TextureFormatUsage::Storage
+	                                                             : TextureFormatUsage::Sampled);
+	const auto    type        = static_cast<Prospero::ImageType>(descriptor.Type());
+	const auto    target_view = ResolveTargetTextureViewForBinding(resource, type, storage, height,
+	                                                               descriptor.BaseArray5(), depth);
+	const auto    pitch       = TileGetTexturePitch(format, width, levels, tile);
+	const auto    swizzle     = descriptor.DstSelXYZW();
 	TileSizeAlign size;
 	TileGetTextureTotalSize(format, width, height, depth, pitch, levels, tile,
 	                        type == Prospero::ImageType::kColor3D, &size);
@@ -844,6 +903,10 @@ static void LogNativeShaderRuntime(const ShaderRecompiler::IR::Program&         
 	     snapshot.flattened_srt.size(), snapshot.user_data.size(),
 	     program.bindings.user_data_registers.size());
 	for (uint32_t i = 0; i < snapshot.flattened_srt.size(); i++) {
+		if (i >= program.srt.reads.size()) {
+			LOGF("  srt[%u]: bindless_window_base=0x%08x\n", i, snapshot.flattened_srt[i]);
+			continue;
+		}
 		const auto& read = program.srt.reads[i];
 		LOGF("  srt[%u]: flat_offset_dw=%u use_pc=0x%08x value=0x%08x\n", i, read.flat_offset,
 		     read.use_pc, snapshot.flattened_srt[i]);

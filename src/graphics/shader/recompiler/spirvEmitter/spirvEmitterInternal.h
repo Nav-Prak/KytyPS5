@@ -34,6 +34,8 @@ enum : uint32_t {
 	AddressingModelLogical                   = 0,
 	MemoryModelGLSL450                       = 1,
 	CapabilityShader                         = 1,
+	CapabilityInt64                          = 11,
+	CapabilityInt64Atomics                   = 12,
 	CapabilityImageGatherExtended            = 25,
 	CapabilityImageQuery                     = 50,
 	CapabilityStorageImageReadWithoutFormat  = 55,
@@ -60,6 +62,8 @@ enum : uint32_t {
 	DecorationBuiltIn       = 11,
 	DecorationNoPerspective = 13,
 	DecorationFlat          = 14,
+	DecorationAliased       = 20,
+	DecorationCoherent      = 23,
 	DecorationLocation      = 30,
 	DecorationArrayStride   = 6,
 	DecorationBinding       = 33,
@@ -103,9 +107,11 @@ enum : uint32_t {
 	ScopeWorkgroup                 = 2,
 	ScopeSubgroup                  = 3,
 	MemorySemanticsNone            = 0,
+	MemorySemanticsAcquire         = 0x00000002u,
 	MemorySemanticsAcquireRelease  = 0x00000008u,
 	MemorySemanticsUniformMemory   = 0x00000040u,
 	MemorySemanticsWorkgroupMemory = 0x00000100u,
+	MemoryAccessVolatileMask        = 0x00000001u,
 };
 
 enum : uint32_t {
@@ -308,9 +314,11 @@ struct EmitterState {
 	uint32_t                               wave_size                      = 64;
 	bool                                   exact_subgroup_operations      = false;
 	bool                                   per_invocation_masks           = false;
+	bool                                   workgroup_wave64               = false;
 	uint32_t                               void_type                      = 0;
 	uint32_t                               bool_type                      = 0;
 	uint32_t                               uint_type                      = 0;
+	uint32_t                               uint64_type                    = 0;
 	uint32_t                               uint_pair_type                 = 0;
 	uint32_t                               int_pair_type                  = 0;
 	uint32_t                               int_type                       = 0;
@@ -352,6 +360,13 @@ struct EmitterState {
 	uint32_t                               storage_buffer_array_type      = 0;
 	uint32_t                               ptr_storage_buffer_array       = 0;
 	uint32_t                               storage_buffer_variable        = 0;
+	uint32_t                               storage_runtime_array_uint64_type = 0;
+	uint32_t                               storage_buffer_uint64_type        = 0;
+	uint32_t                               ptr_storage_buffer_uint64_block   = 0;
+	uint32_t                               ptr_storage_buffer_uint64         = 0;
+	uint32_t                               storage_buffer_uint64_array_type  = 0;
+	uint32_t                               ptr_storage_buffer_uint64_array   = 0;
+	uint32_t                               storage_buffer_uint64_variable    = 0;
 	uint32_t                               address_memory_array_type      = 0;
 	uint32_t                               ptr_address_memory_array       = 0;
 	uint32_t                               address_memory_variable        = 0;
@@ -368,6 +383,9 @@ struct EmitterState {
 	uint32_t                               ptr_workgroup_array            = 0;
 	uint32_t                               ptr_workgroup_uint             = 0;
 	uint32_t                               lds_variable                   = 0;
+	uint32_t                               wave_scratch_array_type        = 0;
+	uint32_t                               ptr_workgroup_wave_scratch     = 0;
+	uint32_t                               wave_scratch_variable          = 0;
 	std::array<SampledImageDescriptors, 6> sampled_images;
 	uint32_t                               sampler_type                                  = 0;
 	uint32_t                               sampler_array_type                            = 0;
@@ -429,6 +447,8 @@ struct EmitterState {
 	bool                                   needs_image_gather_extended                   = false;
 	bool                                   needs_function_lds                            = false;
 	bool                                   needs_pixel_valid_mask                        = false;
+	bool                                   needs_coherent_storage_buffer                 = false;
+	bool                                   needs_int64_atomics                           = false;
 	bool                                   debug_printf_enabled                          = false;
 	uint32_t                               debug_printf_import                           = 0;
 	uint32_t                               debug_printf_position_format                  = 0;
@@ -595,6 +615,10 @@ bool ProgramNeedsFunctionLds(const IR::Program& program);
 
 bool ProgramNeedsPixelValidMask(const IR::Program& program);
 
+bool ProgramNeedsCoherentStorageBuffer(const IR::Program& program);
+
+bool ProgramNeedsInt64Atomics(const IR::Program& program);
+
 bool InstructionHasDppSource(const IR::Instruction& inst);
 
 bool ProgramNeedsSubgroupBallot(const IR::Program& program);
@@ -694,6 +718,10 @@ bool SdwaSelectorOffsetWidth(uint32_t sel, uint32_t& offset, uint32_t& width);
 uint32_t EmitSdwaExtractU32(EmitterState* state, const IR::Operand& operand, uint32_t value);
 
 uint32_t EmitTrueBool(EmitterState* state);
+
+uint32_t EmitWaveShuffleU32(EmitterState* state, uint32_t value, uint32_t lane);
+
+uint32_t EmitWaveBallot(EmitterState* state, uint32_t predicate);
 
 DppTargetLane EmitDppQuadPermTargetLane(EmitterState* state, uint32_t subid, uint32_t control);
 
@@ -967,6 +995,9 @@ uint32_t EmitAtomicPointer(EmitterState* state, const IR::Instruction& inst);
 void EmitDeviceAtomicMemoryBarrier(EmitterState* state);
 
 void EmitAtomicU32(EmitterState* state, const IR::Instruction& inst, uint32_t opcode);
+void EmitAtomicSwapU64(EmitterState* state, const IR::Instruction& inst);
+void EmitAtomicFMinF32(EmitterState* state, const IR::Instruction& inst);
+void EmitAtomicFMaxF32(EmitterState* state, const IR::Instruction& inst);
 
 void EmitSLoadDword(EmitterState* state, const IR::Instruction& inst);
 
@@ -1219,6 +1250,8 @@ void EmitBitFieldExtract3U32(EmitterState* state, const IR::Instruction& inst, b
 void EmitBitFieldInsertSelectU32(EmitterState* state, const IR::Instruction& inst);
 
 void EmitAlignBitU32(EmitterState* state, const IR::Instruction& inst);
+
+void EmitAlignByteU32(EmitterState* state, const IR::Instruction& inst);
 
 void EmitSelectU32(EmitterState* state, const IR::Instruction& inst);
 
@@ -1525,7 +1558,8 @@ void EmitIfCondition(EmitterState* state, uint32_t condition, Fn&& fn) {
 }
 
 template <typename Fn>
-uint32_t EmitValueOrZeroIfCondition(EmitterState* state, uint32_t condition, Fn&& fn) {
+uint32_t EmitValueOrDefaultIfCondition(EmitterState* state, uint32_t condition,
+                                       uint32_t result_type, uint32_t default_value, Fn&& fn) {
 	if (condition == 0) {
 		return fn();
 	}
@@ -1542,9 +1576,15 @@ uint32_t EmitValueOrZeroIfCondition(EmitterState* state, uint32_t condition, Fn&
 	state->builder.AddFunction({OpBranch, merge_label});
 	state->builder.AddFunction({OpLabel, merge_label});
 	const auto value = state->builder.AllocateId();
-	state->builder.AddFunction({OpPhi, state->uint_type, value, then_value, then_label,
-	                            ConstantU32(state, 0), else_label});
+	state->builder.AddFunction(
+	    {OpPhi, result_type, value, then_value, then_label, default_value, else_label});
 	return value;
+}
+
+template <typename Fn>
+uint32_t EmitValueOrZeroIfCondition(EmitterState* state, uint32_t condition, Fn&& fn) {
+	return EmitValueOrDefaultIfCondition(state, condition, state->uint_type,
+	                                     ConstantU32(state, 0), std::forward<Fn>(fn));
 }
 
 template <typename Fn>

@@ -119,6 +119,54 @@ bool SpirvContainsOpcode(const std::vector<uint32_t>& binary, uint32_t opcode) {
 	return false;
 }
 
+bool SpirvHasVolatileLoad(const std::vector<uint32_t>& binary) {
+	for (size_t i = 5; i < binary.size();) {
+		const uint32_t word       = binary[i];
+		const uint32_t opcode     = word & 0xffffu;
+		const uint32_t word_count = word >> 16u;
+		if (word_count == 0 || i + word_count > binary.size()) {
+			return false;
+		}
+		if (opcode == 61u && word_count >= 5u && (binary[i + 4] & 1u) != 0u) {
+			return true;
+		}
+		i += word_count;
+	}
+	return false;
+}
+
+bool SpirvHasMemberDecoration(const std::vector<uint32_t>& binary, uint32_t decoration) {
+	for (size_t i = 5; i < binary.size();) {
+		const uint32_t word       = binary[i];
+		const uint32_t opcode     = word & 0xffffu;
+		const uint32_t word_count = word >> 16u;
+		if (word_count == 0 || i + word_count > binary.size()) {
+			return false;
+		}
+		if (opcode == 72u && word_count >= 4u && binary[i + 3] == decoration) {
+			return true;
+		}
+		i += word_count;
+	}
+	return false;
+}
+
+bool SpirvHasDecoration(const std::vector<uint32_t>& binary, uint32_t decoration) {
+	for (size_t i = 5; i < binary.size();) {
+		const uint32_t word       = binary[i];
+		const uint32_t opcode     = word & 0xffffu;
+		const uint32_t word_count = word >> 16u;
+		if (word_count == 0 || i + word_count > binary.size()) {
+			return false;
+		}
+		if (opcode == 71u && word_count >= 3u && binary[i + 2] == decoration) {
+			return true;
+		}
+		i += word_count;
+	}
+	return false;
+}
+
 uint32_t SpirvInstructionOpcodeCount(const std::vector<uint32_t>& binary, uint32_t opcode) {
 	uint32_t count = 0;
 	for (size_t i = 5; i < binary.size();) {
@@ -134,6 +182,61 @@ uint32_t SpirvInstructionOpcodeCount(const std::vector<uint32_t>& binary, uint32
 		i += word_count;
 	}
 	return count;
+}
+
+bool SpirvAtomicUsesMemorySemantics(const std::vector<uint32_t>& binary, uint32_t opcode,
+                                    uint32_t result_bit_width, uint32_t semantics_literal) {
+	std::vector<uint32_t> result_types;
+	std::vector<uint32_t> uint32_types;
+	std::vector<uint32_t> matching_constants;
+	for (size_t i = 5; i < binary.size();) {
+		const uint32_t word       = binary[i];
+		const uint32_t op         = word & 0xffffu;
+		const uint32_t word_count = word >> 16u;
+		if (word_count == 0 || i + word_count > binary.size()) {
+			return false;
+		}
+		if (op == 21u && word_count == 4u && binary[i + 3] == 0u) {
+			if (binary[i + 2] == result_bit_width) {
+				result_types.push_back(binary[i + 1]);
+			}
+			if (binary[i + 2] == 32u) {
+				uint32_types.push_back(binary[i + 1]);
+			}
+		}
+		i += word_count;
+	}
+	for (size_t i = 5; i < binary.size();) {
+		const uint32_t word       = binary[i];
+		const uint32_t op         = word & 0xffffu;
+		const uint32_t word_count = word >> 16u;
+		if (word_count == 0 || i + word_count > binary.size()) {
+			return false;
+		}
+		if (op == 43u && word_count == 4u && binary[i + 3] == semantics_literal &&
+		    std::find(uint32_types.begin(), uint32_types.end(), binary[i + 1]) !=
+		        uint32_types.end()) {
+			matching_constants.push_back(binary[i + 2]);
+		}
+		i += word_count;
+	}
+	for (size_t i = 5; i < binary.size();) {
+		const uint32_t word       = binary[i];
+		const uint32_t op         = word & 0xffffu;
+		const uint32_t word_count = word >> 16u;
+		if (word_count == 0 || i + word_count > binary.size()) {
+			return false;
+		}
+		if (op == opcode && word_count > 5u &&
+		    std::find(result_types.begin(), result_types.end(), binary[i + 1]) !=
+		        result_types.end() &&
+		    std::find(matching_constants.begin(), matching_constants.end(),
+		              binary[i + 5]) != matching_constants.end()) {
+			return true;
+		}
+		i += word_count;
+	}
+	return false;
 }
 
 bool SpirvContainsVectorShuffle(const std::vector<uint32_t>&   binary,
@@ -359,7 +462,8 @@ void TestResourceDescriptorClassification() {
 	raw_texture[3]          = 9u << 28u;
 	raw_texture[5]          = 2u << 27u;
 	Check(ShaderClassifyResourceDescriptor(raw_texture) == ResourceDescriptorType::Texture,
-	      "raw texture descriptor must not be classified by ResourceDescriptor byte 23 fields");
+	      "raw texture descriptor must not be classified by ResourceDescriptor "
+	      "byte 23 fields");
 
 	uint32_t tagged_buffer[8] = {};
 	tagged_buffer[5]          = 1u << 27u;
@@ -442,7 +546,8 @@ void TestNativeShaderResourceDependencies() {
 	set_buffer(2, 0x2000, 0, 64);
 	const auto writes = CollectShaderBufferWrites(program, resources);
 	Check(writes == std::vector<ShaderBufferWriteRange>({{0x1000, 48}, {0x2000, 64}}),
-	      "graphics/compute write collector lost or invented a storage-buffer range");
+	      "graphics/compute write collector lost or invented a storage-buffer "
+	      "range");
 
 	VulkanImage image {VulkanImageType::StorageTexture};
 	image.image              = reinterpret_cast<VkImage>(uintptr_t {1});
@@ -506,6 +611,11 @@ void TestNativeSubgroupPolicy() {
 	Check(ConfigureShaderSubgroup(context, VK_SHADER_STAGE_COMPUTE_BIT, cross_lane_compute).mode ==
 	          ShaderSubgroupMode::Unsupported,
 	      "cross-lane compute mismatch bypassed the exact subgroup requirement");
+	auto workgroup_wave64              = cross_lane_compute;
+	workgroup_wave64.workgroup_wave64 = true;
+	Check(ConfigureShaderSubgroup(context, VK_SHADER_STAGE_COMPUTE_BIT, workgroup_wave64).mode ==
+	          ShaderSubgroupMode::WorkgroupWave64,
+	      "single-wave workgroup emulation was rejected on a subgroup32 host");
 
 	ShaderRecompiler::IR::Program zero_exec = safe;
 	zero_exec.lane_mask_mode                = ShaderLaneMaskMode::NativeWave;
@@ -521,7 +631,8 @@ void TestNativeSubgroupPolicy() {
 	Check(!ShaderRecompiler::Spirv::ProgramRequiresExactSubgroupSize(zero_exec) &&
 	          ConfigureShaderSubgroup(context, VK_SHADER_STAGE_COMPUTE_BIT, zero_exec).mode ==
 	              ShaderSubgroupMode::FlattenedMasks,
-	      "compile-time uniform-zero EXEC write did not stay on the mask-free path");
+	      "compile-time uniform-zero EXEC write did not stay on the mask-free "
+	      "path");
 
 	ShaderRecompiler::IR::Program selective_exec = safe;
 	auto& move_exec    = selective_exec.blocks.emplace_back().instructions.emplace_back();
@@ -571,7 +682,8 @@ void TestNativeSubgroupPolicy() {
 	      "inverse cross-lane compute mismatch was accepted");
 }
 
-std::array<uint32_t, 64> ImageTestUserData(Prospero::ImageType type = Prospero::ImageType::kColor2D) {
+std::array<uint32_t, 64>
+ImageTestUserData(Prospero::ImageType type = Prospero::ImageType::kColor2D) {
 	std::array<uint32_t, 64> data {};
 	for (uint32_t start = 0; start + 3u < data.size(); start += 4u) {
 		data[start]      = 0x1000u + start * 0x100u;
@@ -881,10 +993,12 @@ void TestNewShaderRecompilerRdna2ScalarOpcodes() {
 	    EncodeSMovB32(106, 144),       // vcc_lo = 16
 	    EncodeSop1(0x1d, 106, 128),    // s_bitset1_b32 vcc_lo, 0
 	    EncodeSopk(0x13, 106, 0x1019), // s_setreg_b32 vcc_lo, 0x1019
-	    EncodeSop2(0x02, 106, 2, 239), // s_add_i32 vcc_lo, s2, pops_exiting_wave_id
-	    EncodeSopp(0x0e, 0),           // s_sleep 0
-	    EncodeSop2(0x02, 106, 239, 2), // s_add_i32 vcc_lo, pops_exiting_wave_id, s2
-	    EncodeSopp(0x01, 0),           // s_endpgm
+	    EncodeSop2(0x02, 106, 2,
+	               239),     // s_add_i32 vcc_lo, s2, pops_exiting_wave_id
+	    EncodeSopp(0x0e, 0), // s_sleep 0
+	    EncodeSop2(0x02, 106, 239,
+	               2),       // s_add_i32 vcc_lo, pops_exiting_wave_id, s2
+	    EncodeSopp(0x01, 0), // s_endpgm
 	};
 
 	ShaderRecompiler::CompileOptions options;
@@ -905,7 +1019,8 @@ void TestNewShaderRecompilerRdna2ScalarOpcodes() {
 	Check(Common::ContainsStr(result.decoded_dump, "s_sleep 0x00000000"),
 	      "new decoder did not decode S_SLEEP");
 	Check(Common::ContainsStr(result.ir_dump, "BitSetU32 vcc_lo, vcc_lo, 0x00000000"),
-	      "S_BITSET1_B32 did not lower to bit-set IR using the destination as input");
+	      "S_BITSET1_B32 did not lower to bit-set IR using the destination as "
+	      "input");
 	Check(Common::ContainsStr(result.ir_dump, "ScalarSignedAddOverflowI32 vcc_lo, s2, 0x00000000"),
 	      "pops_exiting_wave_id RHS did not lower to a deterministic zero value");
 	Check(Common::ContainsStr(result.ir_dump, "ScalarSignedAddOverflowI32 vcc_lo, 0x00000000, s2"),
@@ -1024,8 +1139,8 @@ void TestNewShaderRecompilerScalarVectorAlu() {
 }
 
 void TestNewShaderRecompilerVop3LaneReadDestinationEncoding() {
-	// Lane-read instructions have scalar results, but their VOP3A destination is encoded in
-	// VDST [7:0], not the VOP3B SDST field [14:8].
+	// Lane-read instructions have scalar results, but their VOP3A destination is
+	// encoded in VDST [7:0], not the VOP3B SDST field [14:8].
 	const uint32_t shader[] = {
 	    EncodeVop3Word0(0x182, 25), EncodeVop3Word1(5 + 256, 0, 0),   // v_readfirstlane_b32 s25, v5
 	    EncodeVop3Word0(0x360, 26), EncodeVop3Word1(5 + 256, 130, 0), // v_readlane_b32 s26, v5, 2
@@ -1046,951 +1161,1154 @@ void TestNewShaderRecompilerVop3LaneReadDestinationEncoding() {
 	CheckSpirvBinaryValidates(result.spirv);
 }
 
-void TestNewShaderRecompilerMoreAluFamilies() {
+void TestNewShaderRecompilerLaneIndexUsesGuestWaveSize() {
 	const uint32_t shader[] = {
-	    EncodeSopk(0x00, 9, 7), // s_movk_i32 s9, 7
-	    EncodeSopk(0x0b, 9, 3), // s_cmp_gt_u32 s9, 3
-	    EncodeVop1(0x00, 0, 0), // v_nop
-	    EncodeVop1(0x01, 5, 9), // v_mov_b32 v5, s9
-	    EncodeVop1(0x01, 103, 249),
-	    EncodeVop1Sdwa(5, 6, 0, 4), // v_mov_b32 v103, v5 word0
-	    EncodeVop1(0x06, 104, 249),
-	    EncodeVop1Sdwa(103, 6, 0, 4), // v_cvt_f32_u32 v104, v103 word0
-	    EncodeVop1(0x0a, 105, 249),
-	    EncodeVop1Sdwa(6, 5, 2, 6), // v_cvt_f16_f32 v105.hi, v6
-	    EncodeVop1(0x01, 106, 250),
-	    EncodeVop1Dpp(5),                // v_mov_b32 v106, v5 dpp
-	    EncodeVop1(0x02, 24, 5 + 256),   // v_readfirstlane_b32 s24, v5
-	    EncodeVop1(0x06, 6, 5 + 256),    // v_cvt_f32_u32 v6, v5
-	    EncodeVop1(0x07, 7, 6 + 256),    // v_cvt_u32_f32 v7, v6
-	    EncodeVop1(0x05, 9, 5 + 256),    // v_cvt_f32_i32 v9, v5
-	    EncodeVop1(0x08, 10, 6 + 256),   // v_cvt_i32_f32 v10, v6
-	    EncodeVop1(0x0a, 99, 6 + 256),   // v_cvt_f16_f32 v99, v6
-	    EncodeVop1(0x0b, 100, 99 + 256), // v_cvt_f32_f16 v100, v99
-	    0x7e1016f9u,
-	    0x00250602u,                      // v_cvt_f32_f16 v8, abs(v2.hi)
-	    EncodeVop1(0x0d, 64, 6 + 256),    // v_cvt_flr_i32_f32 v64, v6
-	    EncodeVop1(0x0e, 81, 5 + 256),    // v_cvt_off_f32_i4 v81, v5
-	    EncodeVop1(0x11, 65, 5 + 256),    // v_cvt_f32_ubyte0 v65, v5
-	    EncodeVop1(0x12, 66, 5 + 256),    // v_cvt_f32_ubyte1 v66, v5
-	    EncodeVop1(0x13, 67, 5 + 256),    // v_cvt_f32_ubyte2 v67, v5
-	    EncodeVop1(0x14, 68, 5 + 256),    // v_cvt_f32_ubyte3 v68, v5
-	    EncodeVop1(0x2a, 11, 6 + 256),    // v_rcp_f32 v11, v6
-	    EncodeVop1(0x20, 12, 6 + 256),    // v_fract_f32 v12, v6
-	    EncodeVop1(0x21, 13, 6 + 256),    // v_trunc_f32 v13, v6
-	    EncodeVop1(0x22, 14, 6 + 256),    // v_ceil_f32 v14, v6
-	    EncodeVop1(0x23, 15, 6 + 256),    // v_rndne_f32 v15, v6
-	    EncodeVop1(0x24, 16, 6 + 256),    // v_floor_f32 v16, v6
-	    EncodeVop1(0x25, 17, 6 + 256),    // v_exp_f32 v17, v6
-	    EncodeVop1(0x27, 18, 6 + 256),    // v_log_f32 v18, v6
-	    EncodeVop1(0x2e, 19, 6 + 256),    // v_rsq_f32 v19, v6
-	    EncodeVop1(0x33, 20, 6 + 256),    // v_sqrt_f32 v20, v6
-	    EncodeVop1(0x35, 21, 6 + 256),    // v_sin_f32 v21, v6
-	    EncodeVop1(0x36, 22, 6 + 256),    // v_cos_f32 v22, v6
-	    EncodeVop1(0x37, 27, 5 + 256),    // v_not_b32 v27, v5
-	    EncodeVop1(0x38, 28, 5 + 256),    // v_bfrev_b32 v28, v5
-	    EncodeVop1(0x39, 31, 5 + 256),    // v_ffbh_u32 v31, v5
-	    EncodeVop1(0x3a, 32, 5 + 256),    // v_ffbl_b32 v32, v5
-	    0x7e6e870cu,                      // v_movrels_b32 v55, v12
-	    EncodeVop2(0x1e, 83, 5 + 256, 6), // v_xnor_b32 v83, v5, v6
-	    EncodeVop2(0x23, 84, 5 + 256, 6), // v_mbcnt_lo_u32_b32 v84, v5, v6
-	    EncodeVop2(0x24, 85, 5 + 256, 6), // v_mbcnt_hi_u32_b32 v85, v5, v6
-	    EncodeVop2(0x1f, 89, 6 + 256, 6), // v_mac_f32 v89, v6, v6
-	    EncodeVop2(0x20, 90, 6 + 256, 5),
-	    0x3f800000u, // v_madmk_f32 v90, v6, 1.0, v5
-	    EncodeVop2(0x21, 91, 6 + 256, 5),
-	    0x40000000u,                      // v_madak_f32 v91, v6, v5, 2.0
-	    EncodeVop2(0x2b, 92, 6 + 256, 6), // v_mac_f32 v92, v6, v6
-	    EncodeVop2(0x2c, 93, 6 + 256, 5),
-	    0x3f000000u, // v_madmk_f32 v93, v6, 0.5, v5
-	    EncodeVop2(0x2d, 94, 6 + 256, 5),
-	    0x40400000u,                         // v_madak_f32 v94, v6, v5, 3.0
-	    EncodeVop2(0x2f, 95, 6 + 256, 6),    // v_cvt_pkrtz_f16_f32 v95, v6, v6
-	    EncodeVop2(0x02, 102, 95 + 256, 95), // v_dot2c_f32_f16 v102, v95, v95
-	    EncodeVop2(0x28, 97, 5 + 256, 6),    // v_addc_u32 v97, vcc, v5, v6, vcc
-	    EncodeVop2(0x25, 123, 249, 6),
-	    EncodeVop2Sdwa(5, 6, 0, 4, 6),
-	    EncodeVop2(0x1b, 124, 249, 6),
-	    EncodeVop2Sdwa(5, 6, 0, 4, 5),
-	    0x025e6af9u,
-	    0x16060635u, // v_cndmask_b32 v47, v53, -v53
-	    0x100490f9u,
-	    0x86860600u, // v_mul_f32 v2, s0, s72 (SDWA full)
-	    EncodeVop2(0x35, 9, 249, 1),
-	    EncodeVop2Sdwa(0, 4, 2, 4, 4),
-	    0x660000f9u,
-	    EncodeVop2Sdwa(0, 4, 2, 4, 4),
-	    EncodeVop2(0x03, 125, 250, 6),
-	    EncodeVop2Dpp(5),
-	    EncodeVop3Word0(0x103, 35),
-	    EncodeVop3Word1(6 + 256, 6 + 256, 0),
-	    EncodeVop3Word0(0x10b, 36),
-	    EncodeVop3Word1(5 + 256, 5 + 256, 0),
-	    EncodeVop3Word0(0x11e, 86),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 0),
-	    EncodeVop3Word0(0x11f, 96),
-	    EncodeVop3Word1(6 + 256, 6 + 256, 0),
-	    EncodeVop3Word0Sdst(0x128, 98, 30),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 106),
-	    EncodeVop3Word0(0x123, 87),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 0),
-	    EncodeVop3Word0(0x124, 88),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 0),
-	    EncodeVop3Word0(0x180, 0),
-	    EncodeVop3Word1(0, 0, 0),
-	    EncodeVop3Word0(0x181, 23),
-	    EncodeVop3Word1(5 + 256, 0, 0),
-	    EncodeVop3Word0(0x182, 25),
-	    EncodeVop3Word1(5 + 256, 0, 0),
-	    EncodeVop3Word0(0x185, 24),
-	    EncodeVop3Word1(5 + 256, 0, 0),
-	    EncodeVop3Word0(0x18a, 101),
-	    EncodeVop3Word1(6 + 256, 0, 0),
-	    EncodeVop3Word0(0x18d, 74),
-	    EncodeVop3Word1(6 + 256, 0, 0),
-	    EncodeVop3Word0(0x18e, 82),
-	    EncodeVop3Word1(5 + 256, 0, 0),
-	    EncodeVop3Word0(0x1a0, 25),
-	    EncodeVop3Word1(6 + 256, 0, 0),
-	    EncodeVop3Word0(0x1aa, 26),
-	    EncodeVop3Word1(6 + 256, 0, 0),
-	    EncodeVop3Word0(0x1b7, 29),
-	    EncodeVop3Word1(5 + 256, 0, 0),
-	    EncodeVop3Word0(0x1b8, 30),
-	    EncodeVop3Word1(5 + 256, 0, 0),
-	    EncodeVop3Word0(0x1b9, 33),
-	    EncodeVop3Word1(5 + 256, 0, 0),
-	    EncodeVop3Word0(0x1ba, 34),
-	    EncodeVop3Word1(5 + 256, 0, 0),
-	    EncodeVopc(0x04, 6 + 256, 6), // v_cmp_gt_f32 v6, v6
-	    EncodeVopc(0xc4, 7 + 256, 5), // v_cmp_gt_u32 v7, v5
-	    EncodeVopc(0x14, 6 + 256, 6), // v_cmpx_gt_f32 v6, v6
-	    EncodeVopc(0xd4, 7 + 256, 5), // v_cmpx_gt_u32 v7, v5
-	    EncodeVopc(0x00, 6 + 256, 6), // v_cmp_f_f32 v6, v6
-	    EncodeVopc(0x0f, 6 + 256, 6), // v_cmp_tru_f32 v6, v6
-	    EncodeVopc(0x07, 6 + 256, 6), // v_cmp_o_f32 v6, v6
-	    EncodeVopc(0x08, 6 + 256, 6), // v_cmp_u_f32 v6, v6
-	    EncodeVopc(0x09, 6 + 256, 6), // v_cmp_nge_f32 v6, v6
-	    EncodeVopc(0x0a, 6 + 256, 6), // v_cmp_nlg_f32 v6, v6
-	    EncodeVopc(0x0b, 6 + 256, 6), // v_cmp_ngt_f32 v6, v6
-	    EncodeVopc(0x0c, 6 + 256, 6), // v_cmp_nle_f32 v6, v6
-	    EncodeVopc(0x0d, 6 + 256, 6), // v_cmp_neq_f32 v6, v6
-	    0x7c1a02f9u,
-	    0x068680f0u, // v_cmp_neq_f32 s0, 0.5, v1 (SDWA)
-	    EncodeVopc(0xd1, 249, 6),
-	    EncodeVopcSdwa(5, 0, 0, 4),   // v_cmpx_lt_u32 exec, v5, v6 (SDWA)
-	    EncodeVopc(0x0e, 6 + 256, 6), // v_cmp_nlt_f32 v6, v6
-	    EncodeVopc(0x19, 6 + 256, 6), // v_cmpx_nge_f32 v6, v6
-	    EncodeVopc(0x1a, 6 + 256, 6), // v_cmpx_nlg_f32 v6, v6
-	    EncodeVopc(0x1b, 6 + 256, 6), // v_cmpx_ngt_f32 v6, v6
-	    EncodeVopc(0x1c, 6 + 256, 6), // v_cmpx_nle_f32 v6, v6
-	    EncodeVopc(0x1d, 6 + 256, 6), // v_cmpx_neq_f32 v6, v6
-	    EncodeVopc(0x1e, 6 + 256, 6), // v_cmpx_nlt_f32 v6, v6
-	    EncodeVopc(0x80, 5 + 256, 5), // v_cmp_f_i32 v5, v5
-	    EncodeVopc(0x87, 5 + 256, 5), // v_cmp_t_i32 v5, v5
-	    EncodeVopc(0xc0, 5 + 256, 5), // v_cmp_f_u32 v5, v5
-	    EncodeVopc(0xc7, 5 + 256, 5), // v_cmp_t_u32 v5, v5
-	    0xd4e5006au,
-	    0x0000d47eu, // v_cmp_ne_u64 vcc, exec, vcc
-	    EncodeVop3Word0(0x141, 8),
-	    EncodeVop3Word1(6 + 256, 6 + 256, 6 + 256),
-	    0xd5410004u,
-	    0x20121301u, // v_mad_f32 v4, -v1, v9, s4
-	    EncodeVop3Word0(0x144, 110),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
-	    EncodeVop3Word0(0x145, 111),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
-	    EncodeVop3Word0(0x146, 112),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
-	    EncodeVop3Word0(0x147, 113),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
-	    0xd5470005u,
-	    0x841a0102u, // v_cubema_f32 v5, v2, v0, -v6
-	    EncodeVop3Word0(0x14b, 37),
-	    EncodeVop3Word1(6 + 256, 6 + 256, 6 + 256),
-	    EncodeVop3Word0(0x151, 38),
-	    EncodeVop3Word1(6 + 256, 6 + 256, 6 + 256),
-	    EncodeVop3Word0(0x154, 39),
-	    EncodeVop3Word1(6 + 256, 6 + 256, 6 + 256),
-	    EncodeVop3Word0(0x157, 40),
-	    EncodeVop3Word1(6 + 256, 6 + 256, 6 + 256),
-	    EncodeVop3Word0(0x152, 41),
-	    EncodeVop3Word1(5 + 256, 5 + 256, 5 + 256),
-	    EncodeVop3Word0(0x153, 42),
-	    EncodeVop3Word1(5 + 256, 5 + 256, 5 + 256),
-	    EncodeVop3Word0(0x155, 43),
-	    EncodeVop3Word1(5 + 256, 5 + 256, 5 + 256),
-	    EncodeVop3Word0(0x156, 44),
-	    EncodeVop3Word1(5 + 256, 5 + 256, 5 + 256),
-	    EncodeVop3Word0(0x158, 45),
-	    EncodeVop3Word1(5 + 256, 5 + 256, 5 + 256),
-	    EncodeVop3Word0(0x159, 46),
-	    EncodeVop3Word1(5 + 256, 5 + 256, 5 + 256),
-	    EncodeVop3Word0(0x148, 47),
-	    EncodeVop3Word1(5 + 256, 129, 132),
-	    EncodeVop3Word0(0x149, 48),
-	    EncodeVop3Word1(5 + 256, 129, 132),
-	    EncodeVop3Word0(0x14a, 49),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
-	    EncodeVop3Word0(0x14e, 50),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 129),
-	    EncodeVop3Word0(0x36d, 51),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
-	    EncodeVop3Word0(0x169, 52),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 0),
-	    EncodeVop3Word0(0x16a, 53),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 0),
-	    EncodeVop3Word0(0x16c, 114),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 0),
-	    EncodeVop3Word0(0x371, 54),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
-	    EncodeVop3Word0(0x372, 55),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
-	    EncodeVop3Word0(0x178, 56),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
-	    EncodeVop3Word0(0x346, 57),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
-	    EncodeVop3Word0(0x347, 58),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
-	    EncodeVop3Word0(0x345, 59),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
-	    EncodeVop3Word0(0x36f, 60),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
-	    EncodeVop3Word0(0x15d, 61),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
-	    EncodeVop3Word0(0x142, 62),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
-	    EncodeVop3Word0(0x143, 63),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
-	    EncodeVop3Word0(0x16b, 69),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 0),
-	    EncodeVop3Word0(0x30f, 70),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 0),
-	    EncodeVop3Word0(0x310, 71),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 0),
-	    EncodeVop3Word0(0x319, 72),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 0),
-	    0xd70a1007u,
-	    0x00020affu,
-	    0x0000ffffu, // v_max_i16 v7, 0xffff, v5.hi
-	    0xd70c5007u,
-	    0x00020882u, // v_min_i16 v7, 2, v4.hi
-	    EncodeVop3Word0(0x363, 73),
-	    EncodeVop3Word1(129, 132, 0),
-	    EncodeVop3Word0(0x360, 26),
-	    EncodeVop3Word1(5 + 256, 130, 0),
-	    EncodeVop3Word0(0x361, 107),
-	    EncodeVop3Word1(5 + 256, 130, 0),
-	    EncodeVop3Word0(0x377, 108),
-	    EncodeVop3Word1(5 + 256, 128, 128),
-	    EncodeVop3Word0(0x378, 109),
-	    EncodeVop3Word1(5 + 256, 128, 128),
-	    EncodeVop3Word0(0x12f, 75),
-	    EncodeVop3Word1(6 + 256, 6 + 256, 0),
-	    0xd52f0000u,
-	    0x60020300u, // v_cvt_pkrtz_f16_f32 v0, -v0, -v1
-	    EncodeVop3Word0(0x362, 76),
-	    EncodeVop3Word1(6 + 256, 129, 0),
-	    0xd7620107u,
-	    0x00018509u, // v_ldexp_f32 v7, abs(v9), -2
-	    0xd762800du,
-	    0x00018906u, // v_ldexp_f32 clamp v13, v6, -4
-	    EncodeVop3Word0(0x364, 77),
-	    EncodeVop3Word1(5 + 256, 6 + 256, 0),
-	    EncodeVop3Word0(0x368, 78),
-	    EncodeVop3Word1(6 + 256, 6 + 256, 0),
-	    EncodeVop3Word0(0x369, 79),
-	    EncodeVop3Word1(6 + 256, 6 + 256, 0),
-	    EncodeVop3Word0(0x36a, 80),
-	    EncodeVop3Word1(5 + 256, 7 + 256, 0),
-	    0xbf810000u,
+	    EncodeVop3Word0(0x360, 26), EncodeVop3Word1(5 + 256, 1, 0),
+	    EncodeSopp(0x01, 0),
 	};
 
+	auto compile = [&](uint32_t wave_size) {
+		ShaderRecompiler::CompileOptions options;
+		options.stage     = ShaderType::Compute;
+		options.wave_size = wave_size;
+
+		ShaderRecompiler::CompileResult result;
+		std::string                     error;
+		Check(ShaderRecompiler::TryRecompile(shader, options, &result, &error), error.c_str());
+		CheckSpirvBinaryValidates(result.spirv);
+		return DisassembleSpirvBinary(result.spirv);
+	};
+
+	const auto wave32 = compile(32);
+	Check(SpirvSourceHasInstructionUsing(wave32, "OpBitwiseAnd", "%uint_31"),
+	      "wave32 V_READLANE did not reduce the lane selector modulo 32");
+	Check(!SpirvSourceHasInstructionUsing(wave32, "OpBitwiseAnd", "%uint_63"),
+	      "wave32 V_READLANE still used the wave64 lane mask");
+
+	const auto wave64 = compile(64);
+	Check(SpirvSourceHasInstructionUsing(wave64, "OpBitwiseAnd", "%uint_63"),
+	      "wave64 V_READLANE did not preserve the 64-lane selector");
+}
+
+void TestNewShaderRecompilerWorkgroupWave64() {
+	const uint32_t shader[] = {
+	    EncodeVop3Word0(0x182, 25), EncodeVop3Word1(5 + 256, 0, 0),   // readfirstlane s25, v5
+	    EncodeVop3Word0(0x360, 26), EncodeVop3Word1(5 + 256, 131, 0), // readlane s26, v5, 3
+	    EncodeSopp(0x01, 0),
+	};
+
+	ShaderComputeInputInfo compute;
+	compute.threads_num[0] = 64;
+	compute.threads_num[1] = 1;
+	compute.threads_num[2] = 1;
+	compute.wave_size      = 64;
+
 	ShaderRecompiler::CompileOptions options;
-	options.stage   = ShaderType::Compute;
-	options.dump_ir = true;
+	options.stage              = ShaderType::Compute;
+	options.wave_size          = 64;
+	options.compute_input_info = &compute;
 
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
 	Check(ShaderRecompiler::TryRecompile(shader, options, &result, &error), error.c_str());
-	Check(Common::ContainsStr(result.decoded_dump, "s_movk_i32 s9"),
-	      "new decoder did not decode SOPK mov");
-	Check(Common::ContainsStr(result.decoded_dump, "s_cmp_gt_u32"),
-	      "new decoder did not decode SOPK compare");
-	Check(Common::ContainsStr(result.decoded_dump, "v_nop"),
-	      "new decoder did not decode old-backed VOP1 no-op");
-	Check(Common::ContainsStr(result.decoded_dump, "v_mov_b32 v5"),
-	      "new decoder did not decode VOP1 mov");
-	Check(Common::ContainsStr(result.decoded_dump, "v_movrels_b32 v55, v12"),
-	      "new decoder did not decode VOP1 V_MOVRELS_B32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_mov_b32 v103, v5.sdwa(sel=4"),
-	      "new decoder did not decode VOP1 SDWA source selector");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_f16_f32 v105.sdwa(sel=5"),
-	      "new decoder did not decode VOP1 SDWA destination selector");
-	Check(Common::ContainsStr(result.decoded_dump, "v_mov_b32 v106, v5.dpp"),
-	      "new decoder did not decode VOP1 DPP source metadata");
-	Check(!Common::ContainsStr(result.decoded_dump, "VOP1 SDWA/DPP modifiers are not implemented"),
-	      "new decoder still reports blanket VOP1 SDWA/DPP unsupported reason");
-	Check(Common::ContainsStr(result.decoded_dump, "v_add_nc_u32 v123, v5.sdwa(sel=4"),
-	      "new decoder did not decode VOP2 SDWA source selector");
-	Check(Common::ContainsStr(result.decoded_dump, "v_and_b32 v124, v5.sdwa(sel=4"),
-	      "new decoder did not decode VOP2 SDWA first source selector");
-	Check(Common::ContainsStr(result.decoded_dump, "v6.sdwa(sel=5"),
-	      "new decoder did not decode VOP2 SDWA second source selector");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cndmask_b32 v47, v53,") &&
-	          Common::ContainsStr(result.decoded_dump, "v53.neg"),
-	      "new decoder did not decode V_CNDMASK_B32 SDWA source modifier");
-	Check(Common::ContainsStr(result.decoded_dump, "v_add_f32 v125, v5.dpp"),
-	      "new decoder did not decode VOP2 DPP source metadata");
-	Check(!Common::ContainsStr(result.decoded_dump, "VOP2 SDWA/DPP modifiers are not implemented"),
-	      "new decoder still reports blanket VOP2 SDWA/DPP unsupported reason");
-	Check(Common::ContainsStr(result.decoded_dump, "v_readfirstlane_b32 s24, v5"),
-	      "new decoder did not decode old-backed V_READFIRSTLANE_B32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_f32_u32 v6"),
-	      "new decoder did not decode VOP1 conversion");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_f32_i32 v9"),
-	      "new decoder did not decode VOP1 signed int-to-float conversion");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_i32_f32 v10"),
-	      "new decoder did not decode VOP1 float-to-signed-int conversion");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_f16_f32 v99"),
-	      "new decoder did not decode old-backed V_CVT_F16_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_f32_f16 v100"),
-	      "new decoder did not decode old-backed native V_CVT_F32_F16");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_f32_f16 v8, v2.sdwa(sel=5") &&
-	          Common::ContainsStr(result.decoded_dump, "v2.sdwa(sel=5,sext=0).abs"),
-	      "new decoder did not decode V_CVT_F32_F16 SDWA source selector modifier");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_flr_i32_f32 v64"),
-	      "new decoder did not decode old-backed V_CVT_FLR_I32_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_off_f32_i4 v81"),
-	      "new decoder did not decode old-backed V_CVT_OFF_F32_I4");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_f32_ubyte0 v65"),
-	      "new decoder did not decode old-backed V_CVT_F32_UBYTE0");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_f32_ubyte1 v66"),
-	      "new decoder did not decode old-backed V_CVT_F32_UBYTE1");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_f32_ubyte2 v67"),
-	      "new decoder did not decode old-backed V_CVT_F32_UBYTE2");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_f32_ubyte3 v68"),
-	      "new decoder did not decode old-backed V_CVT_F32_UBYTE3");
-	Check(Common::ContainsStr(result.decoded_dump, "v_rcp_f32 v11"),
-	      "new decoder did not decode VOP1 reciprocal");
-	Check(Common::ContainsStr(result.decoded_dump, "v_fract_f32 v12"),
-	      "new decoder did not decode VOP1 fract");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cos_f32 v22"),
-	      "new decoder did not decode VOP1 cosine");
-	Check(Common::ContainsStr(result.decoded_dump, "v_not_b32 v27"),
-	      "new decoder did not decode VOP1 not");
-	Check(Common::ContainsStr(result.decoded_dump, "v_bfrev_b32 v28"),
-	      "new decoder did not decode VOP1 bit reverse");
-	Check(Common::ContainsStr(result.decoded_dump, "v_ffbh_u32 v31"),
-	      "new decoder did not decode VOP1 find-first-bit-high");
-	Check(Common::ContainsStr(result.decoded_dump, "v_ffbl_b32 v32"),
-	      "new decoder did not decode VOP1 find-first-bit-low");
-	Check(Common::ContainsStr(result.decoded_dump, "v_xnor_b32 v83, v5, v6"),
-	      "new decoder did not decode old-backed V_XNOR_B32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_mbcnt_lo_u32_b32 v84, v5, v6"),
-	      "new decoder did not decode old-backed V_MBCNT_LO_U32_B32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_mbcnt_hi_u32_b32 v85, v5, v6"),
-	      "new decoder did not decode old-backed V_MBCNT_HI_U32_B32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_mac_f32 v89, v6, v6"),
-	      "new decoder did not decode old-backed V_MAC_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_madmk_f32 v90, v6, 0x3f800000, v5"),
-	      "new decoder did not decode old-backed V_MADMK_F32 literal form");
-	Check(Common::ContainsStr(result.decoded_dump, "v_madak_f32 v91, v6, v5, 0x40000000"),
-	      "new decoder did not decode old-backed V_MADAK_F32 literal form");
-	Check(Common::ContainsStr(result.decoded_dump, "v_mac_f32 v92, v6, v6"),
-	      "new decoder did not decode old-backed alternate V_MAC_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_madmk_f32 v93, v6, 0x3f000000, v5"),
-	      "new decoder did not decode old-backed alternate V_MADMK_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_madak_f32 v94, v6, v5, 0x40400000"),
-	      "new decoder did not decode old-backed alternate V_MADAK_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_pkrtz_f16_f32 v95, v6, v6"),
-	      "new decoder did not decode old-backed native V_CVT_PKRTZ_F16_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_dot2c_f32_f16 v102, v95, v95"),
-	      "new decoder did not decode old-backed V_DOT2C_F32_F16");
-	Check(Common::ContainsStr(result.decoded_dump, "v_addc_u32 v97, vcc_lo, v5, v6, vcc_lo"),
-	      "new decoder did not decode old-backed V_ADD_CO_U32 carry form");
-	Check(Common::ContainsStr(result.decoded_dump, "v_add_f32 v35"),
-	      "new decoder did not decode VOP3-encoded VOP2 float add");
-	Check(Common::ContainsStr(result.decoded_dump, "v_mul_u32_u24 v36"),
-	      "new decoder did not decode VOP3-encoded VOP2 24-bit multiply");
-	Check(Common::ContainsStr(result.decoded_dump, "v_xnor_b32 v86, v5, v6"),
-	      "new decoder did not decode old-backed VOP3-encoded V_XNOR_B32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_mac_f32 v96, v6, v6"),
-	      "new decoder did not decode old-backed VOP3-encoded V_MAC_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_addc_u32 v98, s30, v5, v6, vcc_lo"),
-	      "new decoder did not decode old-backed VOP3 V_ADD_CO_U32 carry form");
-	Check(Common::ContainsStr(result.decoded_dump, "v_mbcnt_lo_u32_b32 v87, v5, v6"),
-	      "new decoder did not decode old-backed VOP3-encoded V_MBCNT_LO_U32_B32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_mbcnt_hi_u32_b32 v88, v5, v6"),
-	      "new decoder did not decode old-backed VOP3-encoded V_MBCNT_HI_U32_B32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_mov_b32 v23"),
-	      "new decoder did not decode VOP3-encoded VOP1 move");
-	Check(Common::ContainsStr(result.decoded_dump, "v_readfirstlane_b32 s25, v5"),
-	      "new decoder did not decode old-backed VOP3-encoded V_READFIRSTLANE_B32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_f32_i32 v24"),
-	      "new decoder did not decode VOP3-encoded VOP1 signed conversion");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_f16_f32 v101"),
-	      "new decoder did not decode old-backed VOP3-encoded V_CVT_F16_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_flr_i32_f32 v74"),
-	      "new decoder did not decode old-backed VOP3-encoded V_CVT_FLR_I32_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_off_f32_i4 v82"),
-	      "new decoder did not decode old-backed VOP3-encoded V_CVT_OFF_F32_I4");
-	Check(Common::ContainsStr(result.decoded_dump, "v_fract_f32 v25"),
-	      "new decoder did not decode VOP3-encoded VOP1 fract");
-	Check(Common::ContainsStr(result.decoded_dump, "v_rcp_f32 v26"),
-	      "new decoder did not decode VOP3-encoded VOP1 reciprocal");
-	Check(Common::ContainsStr(result.decoded_dump, "v_not_b32 v29"),
-	      "new decoder did not decode VOP3-encoded VOP1 not");
-	Check(Common::ContainsStr(result.decoded_dump, "v_bfrev_b32 v30"),
-	      "new decoder did not decode VOP3-encoded VOP1 bit reverse");
-	Check(Common::ContainsStr(result.decoded_dump, "v_ffbh_u32 v33"),
-	      "new decoder did not decode VOP3-encoded VOP1 find-first-bit-high");
-	Check(Common::ContainsStr(result.decoded_dump, "v_ffbl_b32 v34"),
-	      "new decoder did not decode VOP3-encoded VOP1 find-first-bit-low");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmp_gt_f32"),
-	      "new decoder did not decode VOPC float compare");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmpx_gt_f32"),
-	      "new decoder did not decode VOPC float compare-and-mask");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmpx_gt_u32"),
-	      "new decoder did not decode VOPC uint compare-and-mask");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmp_f_f32"),
-	      "new decoder did not decode old-backed V_CMP_F_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmp_tru_f32"),
-	      "new decoder did not decode old-backed V_CMP_TRU_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmp_o_f32"),
-	      "new decoder did not decode old-backed V_CMP_O_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmp_u_f32"),
-	      "new decoder did not decode old-backed V_CMP_U_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmp_nge_f32"),
-	      "new decoder did not decode old-backed V_CMP_NGE_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmp_nlg_f32"),
-	      "new decoder did not decode old-backed V_CMP_NLG_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmp_ngt_f32"),
-	      "new decoder did not decode old-backed V_CMP_NGT_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmp_nle_f32"),
-	      "new decoder did not decode old-backed V_CMP_NLE_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmp_neq_f32"),
-	      "new decoder did not decode old-backed V_CMP_NEQ_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmp_neq_f32 s0, 0.500000, v1"),
-	      "new decoder did not decode old-backed V_CMP_NEQ_F32 SDWA scalar destination");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmpx_lt_u32 exec_lo, v5.sdwa(sel=4") &&
-	          Common::ContainsStr(result.ir_dump, "CompareMaskLtU32 exec_lo"),
-	      "new decoder did not route V_CMPX SDWA destination to exec");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmp_nlt_f32"),
-	      "new decoder did not decode old-backed V_CMP_NLT_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmpx_nge_f32"),
-	      "new decoder did not decode old-backed V_CMPX_NGE_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmpx_nlg_f32"),
-	      "new decoder did not decode old-backed V_CMPX_NLG_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmpx_ngt_f32"),
-	      "new decoder did not decode old-backed V_CMPX_NGT_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmpx_nle_f32"),
-	      "new decoder did not decode old-backed V_CMPX_NLE_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmpx_neq_f32"),
-	      "new decoder did not decode old-backed V_CMPX_NEQ_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmpx_nlt_f32"),
-	      "new decoder did not decode old-backed V_CMPX_NLT_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmp_f_i32"),
-	      "new decoder did not decode old-backed V_CMP_F_I32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmp_t_i32"),
-	      "new decoder did not decode old-backed V_CMP_T_I32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmp_f_u32"),
-	      "new decoder did not decode old-backed V_CMP_F_U32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmp_t_u32"),
-	      "new decoder did not decode old-backed V_CMP_T_U32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cmp_ne_u64 vcc_lo, exec_lo, vcc_lo"),
-	      "new decoder did not decode VOP3-encoded V_CMP_NE_U64");
-	Check(Common::ContainsStr(result.ir_dump, "CompareNeU64 vcc_lo, exec_lo, vcc_lo"),
-	      "V_CMP_NE_U64 did not lower to 64-bit compare IR");
-	Check(Common::ContainsStr(result.decoded_dump, "v_mad_f32 v8"),
-	      "new decoder did not decode VOP3 mad");
-	Check(Common::ContainsStr(result.decoded_dump, "v_mad_f32 v4, v1.neg, v9, s4"),
-	      "new decoder did not decode VOP3 mad source modifiers");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cubeid_f32 v110, v5, v6, v7"),
-	      "new decoder did not decode old-backed V_CUBEID_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cubesc_f32 v111, v5, v6, v7"),
-	      "new decoder did not decode old-backed V_CUBESC_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cubetc_f32 v112, v5, v6, v7"),
-	      "new decoder did not decode old-backed V_CUBETC_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cubema_f32 v113, v5, v6, v7"),
-	      "new decoder did not decode old-backed V_CUBEMA_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cubema_f32 v5, v2, v0, v6.neg"),
-	      "new decoder did not decode V_CUBEMA_F32 source modifier");
-	Check(Common::ContainsStr(result.decoded_dump, "v_fma_f32 v37"),
-	      "new decoder did not decode VOP3 fma");
-	Check(Common::ContainsStr(result.decoded_dump, "v_min3_f32 v38"),
-	      "new decoder did not decode VOP3 min3");
-	Check(Common::ContainsStr(result.decoded_dump, "v_max3_f32 v39"),
-	      "new decoder did not decode VOP3 max3");
-	Check(Common::ContainsStr(result.decoded_dump, "v_med3_f32 v40"),
-	      "new decoder did not decode VOP3 med3");
-	Check(Common::ContainsStr(result.decoded_dump, "v_min3_i32 v41"),
-	      "new decoder did not decode VOP3 signed min3");
-	Check(Common::ContainsStr(result.decoded_dump, "v_min3_u32 v42"),
-	      "new decoder did not decode VOP3 unsigned min3");
-	Check(Common::ContainsStr(result.decoded_dump, "v_max3_i32 v43"),
-	      "new decoder did not decode VOP3 signed max3");
-	Check(Common::ContainsStr(result.decoded_dump, "v_max3_u32 v44"),
-	      "new decoder did not decode VOP3 unsigned max3");
-	Check(Common::ContainsStr(result.decoded_dump, "v_med3_i32 v45"),
-	      "new decoder did not decode VOP3 signed med3");
-	Check(Common::ContainsStr(result.decoded_dump, "v_med3_u32 v46"),
-	      "new decoder did not decode VOP3 unsigned med3");
-	Check(Common::ContainsStr(result.decoded_dump, "v_bfe_u32 v47"),
-	      "new decoder did not decode VOP3 unsigned bitfield extract");
-	Check(Common::ContainsStr(result.decoded_dump, "v_bfe_i32 v48"),
-	      "new decoder did not decode VOP3 signed bitfield extract");
-	Check(Common::ContainsStr(result.decoded_dump, "v_bfi_b32 v49"),
-	      "new decoder did not decode VOP3 bitfield insert-select");
-	Check(Common::ContainsStr(result.decoded_dump, "v_alignbit_b32 v50"),
-	      "new decoder did not decode VOP3 alignbit");
-	Check(Common::ContainsStr(result.decoded_dump, "v_add3_u32 v51"),
-	      "new decoder did not decode VOP3 add3");
-	Check(Common::ContainsStr(result.decoded_dump, "v_mul_lo_u32 v52, v5, v6"),
-	      "new decoder did not decode old-backed V_MUL_LO_U32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_mul_hi_u32 v53, v5, v6"),
-	      "new decoder did not decode old-backed V_MUL_HI_U32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_mul_hi_i32 v114, v5, v6"),
-	      "new decoder did not decode RDNA2 V_MUL_HI_I32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_and_or_b32 v54, v5, v6, v7"),
-	      "new decoder did not decode old-backed V_AND_OR_B32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_or3_b32 v55, v5, v6, v7"),
-	      "new decoder did not decode old-backed V_OR3_B32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_xor3_b32 v56, v5, v6, v7"),
-	      "new decoder did not decode old-backed V_XOR3_B32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_lshl_add_u32 v57, v5, v6, v7"),
-	      "new decoder did not decode old-backed V_LSHL_ADD_U32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_add_lshl_u32 v58, v5, v6, v7"),
-	      "new decoder did not decode old-backed V_ADD_LSHL_U32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_xad_u32 v59, v5, v6, v7"),
-	      "new decoder did not decode old-backed V_XAD_U32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_lshl_or_b32 v60, v5, v6, v7"),
-	      "new decoder did not decode old-backed V_LSHL_OR_B32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_sad_u32 v61, v5, v6, v7"),
-	      "new decoder did not decode old-backed V_SAD_U32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_mad_i32_i24 v62, v5, v6, v7"),
-	      "new decoder did not decode old-backed V_MAD_I32_I24");
-	Check(Common::ContainsStr(result.decoded_dump, "v_mad_u32_u24 v63, v5, v6, v7"),
-	      "new decoder did not decode old-backed V_MAD_U32_U24");
-	Check(Common::ContainsStr(result.decoded_dump, "v_mul_lo_i32 v69, v5, v6"),
-	      "new decoder did not decode old-backed V_MUL_LO_I32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_add_i32 v70, s0, v5, v6"),
-	      "new decoder did not decode old-backed V_ADD_I32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_sub_i32 v71, s0, v5, v6"),
-	      "new decoder did not decode RDNA2 V_SUB_CO_U32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_subrev_i32 v72, s0, v5, v6"),
-	      "new decoder did not decode old-backed V_SUBREV_I32");
-	Check(Common::ContainsStr(
-	          result.decoded_dump,
-	          "v_max_i16 v7.sdwa(sel=4,sext=0), 0x0000ffff, v5.opsel(lo=1,hi=0,neghi=0)"),
-	      "new decoder did not decode RDNA2 V_MAX_I16 literal/op_sel form");
-	Check(Common::ContainsStr(result.decoded_dump,
-	                          "v_min_i16 v7.sdwa(sel=5,sext=0), 2, v4.opsel(lo=1,hi=0,neghi=0)"),
-	      "new decoder did not decode RDNA2 V_MIN_I16 op_sel form");
-	Check(Common::ContainsStr(result.decoded_dump, "v_bfm_b32 v73, 1, 4"),
-	      "new decoder did not decode old-backed V_BFM_B32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_readlane_b32 s26, v5, 2"),
-	      "new decoder did not decode old-backed V_READLANE_B32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_writelane_b32 v107, v5, 2"),
-	      "new decoder did not decode old-backed V_WRITELANE_B32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_permlane16_b32 v108, v5, 0, 0"),
-	      "new decoder did not decode old-backed V_PERMLANE16_B32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_permlanex16_b32 v109, v5, 0, 0"),
-	      "new decoder did not decode old-backed V_PERMLANEX16_B32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_pkrtz_f16_f32 v75, v6, v6"),
-	      "new decoder did not decode old-backed V_CVT_PKRTZ_F16_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_pkrtz_f16_f32 v0, v0.neg, v1.neg"),
-	      "new decoder did not decode V_CVT_PKRTZ_F16_F32 source modifiers");
-	Check(Common::ContainsStr(result.decoded_dump, "v_ldexp_f32 v76, v6, 1"),
-	      "new decoder did not decode old-backed V_LDEXP_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_ldexp_f32 v7, v9.abs, -2"),
-	      "new decoder did not decode V_LDEXP_F32 source modifier");
-	Check(Common::ContainsStr(result.decoded_dump, "v_ldexp_f32 v13.clamp, v6, -4"),
-	      "new decoder did not decode V_LDEXP_F32 clamp modifier");
-	Check(Common::ContainsStr(result.decoded_dump, "v_bcnt_u32_b32 v77, v5, v6"),
-	      "new decoder did not decode old-backed VOP3 V_BCNT_U32_B32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_pknorm_i16_f32 v78, v6, v6"),
-	      "new decoder did not decode old-backed V_CVT_PKNORM_I16_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_pknorm_u16_f32 v79, v6, v6"),
-	      "new decoder did not decode old-backed V_CVT_PKNORM_U16_F32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_pk_u16_u32 v80, v5, v7"),
-	      "new decoder did not decode old-backed V_CVT_PK_U16_U32");
-	Check(Common::ContainsStr(result.decoded_dump, "v_mul_f32 v2, s0, s72"),
-	      "new decoder did not decode old-backed V_MUL_F32 SDWA full-width form");
-	Check(Common::ContainsStr(result.decoded_dump, "v_mul_f16 v9.sdwa(sel=4") &&
-	          Common::ContainsStr(result.decoded_dump, "v0.sdwa(sel=4") &&
-	          Common::ContainsStr(result.decoded_dump, "v1.sdwa(sel=4"),
-	      "new decoder did not decode V_MUL_F16 SDWA low-half form");
-	Check(Common::ContainsStr(result.decoded_dump, "v_sub_f16 v0.sdwa(sel=4") &&
-	          Common::ContainsStr(result.decoded_dump, "v0.sdwa(sel=4"),
-	      "new decoder did not decode V_SUB_F16 SDWA low-half form");
-	Check(Common::ContainsStr(result.ir_dump, "ConvertU32ToF32 v6"),
-	      "VOP1 uint-to-float conversion did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "MoveU32 v103, v5.sdwa(sel=4"),
-	      "VOP1 SDWA source selector did not lower to IR metadata");
-	Check(Common::ContainsStr(result.ir_dump, "ConvertF32ToF16 v105.sdwa(sel=5"),
-	      "VOP1 SDWA destination selector did not lower to IR metadata");
-	Check(Common::ContainsStr(result.ir_dump, "MoveU32 v106.dpp") &&
-	          Common::ContainsStr(result.ir_dump, "v5.dpp"),
-	      "VOP1 DPP source/destination did not lower to IR metadata");
-	Check(Common::ContainsStr(result.ir_dump, "MoveRelSourceU32 v55, v12, m0"),
-	      "V_MOVRELS_B32 did not lower to indexed VGPR-source IR");
-	Check(Common::ContainsStr(result.ir_dump, "IAddU32 v123, v5.sdwa(sel=4"),
-	      "VOP2 SDWA did not lower first source metadata to IR");
-	Check(Common::ContainsStr(result.ir_dump, "BitwiseAndU32 v124, v5.sdwa(sel=4"),
-	      "VOP2 SDWA bitwise op did not lower first source metadata to IR");
-	Check(Common::ContainsStr(result.ir_dump, "v6.sdwa(sel=5"),
-	      "VOP2 SDWA bitwise op did not lower second source metadata to IR");
-	Check(Common::ContainsStr(result.ir_dump, "SelectMaskF32Bits v47, vcc_lo, v53.neg, v53") &&
-	          Common::ContainsStr(result.ir_dump, "v53.neg"),
-	      "V_CNDMASK_B32 SDWA source modifier did not lower to float-bit select IR");
-	Check(Common::ContainsStr(result.ir_dump, "FAddF32 v125.dpp") &&
-	          Common::ContainsStr(result.ir_dump, "v5.dpp"),
-	      "VOP2 DPP source/destination did not lower to IR metadata");
-	Check(Common::ContainsStr(result.ir_dump, "FMulF32 v2, s0, s72"),
-	      "V_MUL_F32 SDWA full-width form did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "MulF16 v9.sdwa(sel=4") &&
-	          Common::ContainsStr(result.ir_dump, "v0.sdwa(sel=4") &&
-	          Common::ContainsStr(result.ir_dump, "v1.sdwa(sel=4"),
-	      "V_MUL_F16 SDWA low-half form did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "SubF16 v0.sdwa(sel=4") &&
-	          Common::ContainsStr(result.ir_dump, "v0.sdwa(sel=4"),
-	      "V_SUB_F16 SDWA low-half form did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "ConvertF32ToU32 v7"),
-	      "VOP1 float-to-uint conversion did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "ConvertI32ToF32 v9"),
-	      "VOP1 signed int-to-float conversion did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "ConvertF32ToI32 v10"),
-	      "VOP1 float-to-signed-int conversion did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "ConvertF32ToF16 v99, v6"),
-	      "V_CVT_F16_F32 did not lower to shared half-pack IR");
-	Check(Common::ContainsStr(result.ir_dump, "ConvertF16ToF32 v100, v99"),
-	      "V_CVT_F32_F16 did not lower to shared half-unpack IR");
-	Check(Common::ContainsStr(result.ir_dump, "ConvertF16ToF32 v8, v2.sdwa(sel=5") &&
-	          Common::ContainsStr(result.ir_dump, "v2.sdwa(sel=5,sext=0).abs"),
-	      "V_CVT_F32_F16 SDWA source selector modifier did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "ReadFirstLaneU32 s24, v5"),
-	      "V_READFIRSTLANE_B32 did not lower to subgroup IR");
-	Check(Common::ContainsStr(result.ir_dump, "ConvertFloorF32ToI32 v64, v6"),
-	      "V_CVT_FLR_I32_F32 did not lower to shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "ConvertI4ToOffsetF32 v81, v5"),
-	      "V_CVT_OFF_F32_I4 did not lower to shared offset-convert IR");
-	Check(Common::ContainsStr(result.ir_dump, "ConvertByteU32ToF32 v65, v5, 0x00000000"),
-	      "V_CVT_F32_UBYTE0 did not lower to shared byte-convert IR");
-	Check(Common::ContainsStr(result.ir_dump, "ConvertByteU32ToF32 v66, v5, 0x00000001"),
-	      "V_CVT_F32_UBYTE1 did not lower to shared byte-convert IR");
-	Check(Common::ContainsStr(result.ir_dump, "ConvertByteU32ToF32 v67, v5, 0x00000002"),
-	      "V_CVT_F32_UBYTE2 did not lower to shared byte-convert IR");
-	Check(Common::ContainsStr(result.ir_dump, "ConvertByteU32ToF32 v68, v5, 0x00000003"),
-	      "V_CVT_F32_UBYTE3 did not lower to shared byte-convert IR");
-	Check(Common::ContainsStr(result.ir_dump, "RcpF32 v11"), "VOP1 reciprocal did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "FractF32 v12"), "VOP1 fract did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "TruncF32 v13"), "VOP1 trunc did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "CeilF32 v14"), "VOP1 ceil did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "RoundEvenF32 v15"),
-	      "VOP1 round-even did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "FloorF32 v16"), "VOP1 floor did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "Exp2F32 v17"), "VOP1 exp2 did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "Log2F32 v18"), "VOP1 log2 did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "InverseSqrtF32 v19"),
-	      "VOP1 inverse-sqrt did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "SqrtF32 v20"), "VOP1 sqrt did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "SinF32 v21"), "VOP1 sin did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "CosF32 v22"), "VOP1 cos did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "BitwiseNotU32 v27"), "VOP1 not did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "BitReverseU32 v28"),
-	      "VOP1 bit reverse did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "FindMsbFromHighU32 v31"),
-	      "VOP1 find-first-bit-high did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "FindLsbU32 v32"),
-	      "VOP1 find-first-bit-low did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "BitwiseXnorU32 v83, v5, v6"),
-	      "V_XNOR_B32 did not lower to shared xnor IR");
-	Check(Common::ContainsStr(result.ir_dump, "MaskedBitCountLowU32 v84, v5, v6"),
-	      "V_MBCNT_LO_U32_B32 did not lower to shared masked bit-count IR");
-	Check(Common::ContainsStr(result.ir_dump, "MaskedBitCountHighU32 v85, v5, v6"),
-	      "V_MBCNT_HI_U32_B32 did not lower to shared masked bit-count IR");
-	Check(Common::ContainsStr(result.ir_dump, "FMadF32 v89, v6, v6, v89"),
-	      "V_MAC_F32 did not lower with the destination register as addend");
-	Check(Common::ContainsStr(result.ir_dump, "FMadF32 v90, v6, 0x3f800000, v5"),
-	      "V_MADMK_F32 did not lower with the literal in source 1");
-	Check(Common::ContainsStr(result.ir_dump, "FMadF32 v91, v6, v5, 0x40000000"),
-	      "V_MADAK_F32 did not lower with the literal in source 2");
-	Check(Common::ContainsStr(result.ir_dump, "FMadF32 v92, v6, v6, v92"),
-	      "alternate V_MAC_F32 did not lower with the destination register as addend");
-	Check(Common::ContainsStr(result.ir_dump, "FMadF32 v93, v6, 0x3f000000, v5"),
-	      "alternate V_MADMK_F32 did not lower with the literal in source 1");
-	Check(Common::ContainsStr(result.ir_dump, "FMadF32 v94, v6, v5, 0x40400000"),
-	      "alternate V_MADAK_F32 did not lower with the literal in source 2");
-	Check(Common::ContainsStr(result.ir_dump, "PackF32ToF16Rtz v95, v6, v6"),
-	      "native V_CVT_PKRTZ_F16_F32 did not lower to shared pack IR");
-	Check(Common::ContainsStr(result.ir_dump, "Dot2AccF32F16 v102, v95, v95, v102"),
-	      "V_DOT2C_F32_F16 did not lower to explicit dot-accumulate IR");
-	Check(Common::ContainsStr(result.ir_dump, "IAddCarryU32 v97, vcc_lo, v5, v6, vcc_lo"),
-	      "V_ADD_CO_U32 did not lower to carry-add IR");
-	Check(Common::ContainsStr(result.ir_dump, "FAddF32 v35"),
-	      "VOP3-encoded VOP2 float add did not lower through shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "UMulU24U32 v36"),
-	      "VOP3-encoded VOP2 24-bit multiply did not lower through shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "BitwiseXnorU32 v86, v5, v6"),
-	      "VOP3-encoded V_XNOR_B32 did not lower through shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "FMadF32 v96, v6, v6, v96"),
-	      "VOP3-encoded V_MAC_F32 did not lower with the destination register as addend");
-	Check(Common::ContainsStr(result.ir_dump, "IAddCarryU32 v98, s30, v5, v6, vcc_lo"),
-	      "VOP3-encoded V_ADD_CO_U32 did not lower to carry-add IR");
-	Check(Common::ContainsStr(result.ir_dump, "MaskedBitCountLowU32 v87, v5, v6"),
-	      "VOP3-encoded V_MBCNT_LO_U32_B32 did not lower through shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "MaskedBitCountHighU32 v88, v5, v6"),
-	      "VOP3-encoded V_MBCNT_HI_U32_B32 did not lower through shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "MoveU32 v23"),
-	      "VOP3-encoded VOP1 move did not lower through shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "ReadFirstLaneU32 s25, v5"),
-	      "VOP3-encoded V_READFIRSTLANE_B32 did not lower through shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "ReadLaneU32 s26, v5, 0x00000002"),
-	      "V_READLANE_B32 did not lower to subgroup lane IR");
-	Check(Common::ContainsStr(result.ir_dump, "WriteLaneU32 v107, v5, 0x00000002"),
-	      "V_WRITELANE_B32 did not lower to subgroup lane IR");
-	Check(Common::ContainsStr(result.ir_dump, "Permlane16B32 v108, v5, 0x00000000, 0x00000000"),
-	      "V_PERMLANE16_B32 did not lower to subgroup perm-lane IR");
-	Check(Common::ContainsStr(result.ir_dump, "Permlanex16B32 v109, v5, 0x00000000, 0x00000000"),
-	      "V_PERMLANEX16_B32 did not lower to subgroup perm-lane IR");
-	Check(Common::ContainsStr(result.ir_dump, "ConvertI32ToF32 v24"),
-	      "VOP3-encoded VOP1 signed conversion did not lower through shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "ConvertFloorF32ToI32 v74, v6"),
-	      "VOP3-encoded V_CVT_FLR_I32_F32 did not lower through shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "ConvertI4ToOffsetF32 v82, v5"),
-	      "VOP3-encoded V_CVT_OFF_F32_I4 did not lower through shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "FractF32 v25"),
-	      "VOP3-encoded VOP1 fract did not lower through shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "RcpF32 v26"),
-	      "VOP3-encoded VOP1 reciprocal did not lower through shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "BitwiseNotU32 v29"),
-	      "VOP3-encoded VOP1 not did not lower through shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "BitReverseU32 v30"),
-	      "VOP3-encoded VOP1 bit reverse did not lower through shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "FindMsbFromHighU32 v33"),
-	      "VOP3-encoded VOP1 find-first-bit-high did not lower through shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "FindLsbU32 v34"),
-	      "VOP3-encoded VOP1 find-first-bit-low did not lower through shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "CompareGtF32"),
-	      "VOPC float compare did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "CompareMaskGtF32 exec_lo"),
-	      "VOPC float compare-and-mask did not lower to exec mask IR");
-	Check(Common::ContainsStr(result.ir_dump, "CompareMaskGtU32 exec_lo"),
-	      "VOPC uint compare-and-mask did not lower to exec mask IR");
-	Check(Common::ContainsStr(result.ir_dump, "CompareFalse vcc_lo, v6, v6"),
-	      "VOPC false compare did not lower to shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "CompareTrue vcc_lo, v6, v6"),
-	      "VOPC true compare did not lower to shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "CompareOrderedF32 vcc_lo, v6, v6"),
-	      "VOPC ordered compare did not lower to shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "CompareUnorderedF32 vcc_lo, v6, v6"),
-	      "VOPC unordered compare did not lower to shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "CompareUnordLtF32 vcc_lo, v6, v6"),
-	      "VOPC unordered-less compare did not lower to shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "CompareUnordEqF32 vcc_lo, v6, v6"),
-	      "VOPC unordered-equal compare did not lower to shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "CompareUnordLeF32 vcc_lo, v6, v6"),
-	      "VOPC unordered-less-equal compare did not lower to shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "CompareUnordGtF32 vcc_lo, v6, v6"),
-	      "VOPC unordered-greater compare did not lower to shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "CompareUnordNeF32 vcc_lo, v6, v6"),
-	      "VOPC unordered-not-equal compare did not lower to shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "CompareUnordNeF32 s0, 0x3f000000, v1"),
-	      "VOPC SDWA unordered-not-equal compare did not lower to scalar-destination IR");
-	Check(Common::ContainsStr(result.ir_dump, "CompareUnordGeF32 vcc_lo, v6, v6"),
-	      "VOPC unordered-greater-equal compare did not lower to shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "CompareMaskUnordLtF32 exec_lo, v6, v6"),
-	      "VOPC unordered-less compare-and-mask did not lower to shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "CompareMaskUnordEqF32 exec_lo, v6, v6"),
-	      "VOPC unordered-equal compare-and-mask did not lower to shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "CompareMaskUnordLeF32 exec_lo, v6, v6"),
-	      "VOPC unordered-less-equal compare-and-mask did not lower to shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "CompareMaskUnordGtF32 exec_lo, v6, v6"),
-	      "VOPC unordered-greater compare-and-mask did not lower to shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "CompareMaskUnordNeF32 exec_lo, v6, v6"),
-	      "VOPC unordered-not-equal compare-and-mask did not lower to shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "CompareMaskUnordGeF32 exec_lo, v6, v6"),
-	      "VOPC unordered-greater-equal compare-and-mask did not lower to shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "CompareFalse vcc_lo, v5, v5"),
-	      "VOPC integer false compare did not lower to shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "CompareTrue vcc_lo, v5, v5"),
-	      "VOPC integer true compare did not lower to shared IR");
-	Check(Common::ContainsStr(result.ir_dump, "FMadF32 v8"), "VOP3 mad did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "FMadF32 v4, v1.neg, v9, s4"),
-	      "VOP3 mad source modifiers did not lower to IR metadata");
-	Check(Common::ContainsStr(result.ir_dump, "CubeIdF32 v110, v5, v6, v7"),
-	      "V_CUBEID_F32 did not lower to cube IR");
-	Check(Common::ContainsStr(result.ir_dump, "CubeScF32 v111, v5, v6, v7"),
-	      "V_CUBESC_F32 did not lower to cube IR");
-	Check(Common::ContainsStr(result.ir_dump, "CubeTcF32 v112, v5, v6, v7"),
-	      "V_CUBETC_F32 did not lower to cube IR");
-	Check(Common::ContainsStr(result.ir_dump, "CubeMaF32 v113, v5, v6, v7"),
-	      "V_CUBEMA_F32 did not lower to cube IR");
-	Check(Common::ContainsStr(result.ir_dump, "CubeMaF32 v5, v2, v0, v6.neg"),
-	      "V_CUBEMA_F32 source modifier did not lower to cube IR");
-	Check(Common::ContainsStr(result.ir_dump, "FMadF32 v37"), "VOP3 fma did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "FMin3F32 v38"), "VOP3 min3 did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "FMax3F32 v39"), "VOP3 max3 did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "FMed3F32 v40"), "VOP3 med3 did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "IMin3I32 v41"),
-	      "VOP3 signed min3 did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "UMin3U32 v42"),
-	      "VOP3 unsigned min3 did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "IMax3I32 v43"),
-	      "VOP3 signed max3 did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "UMax3U32 v44"),
-	      "VOP3 unsigned max3 did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "IMed3I32 v45"),
-	      "VOP3 signed med3 did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "UMed3U32 v46"),
-	      "VOP3 unsigned med3 did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "BitFieldExtract3U32 v47"),
-	      "VOP3 unsigned bitfield extract did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "BitFieldExtract3I32 v48"),
-	      "VOP3 signed bitfield extract did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "BitFieldInsertSelectU32 v49"),
-	      "VOP3 bitfield insert-select did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "AlignBitU32 v50"),
-	      "VOP3 alignbit did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "IAdd3U32 v51"), "VOP3 add3 did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "IMulU32 v52, v5, v6"),
-	      "V_MUL_LO_U32 did not lower to multiply IR");
-	Check(Common::ContainsStr(result.ir_dump, "UMulHighU32 v53, v5, v6"),
-	      "V_MUL_HI_U32 did not lower to high-multiply IR");
-	Check(Common::ContainsStr(result.ir_dump, "SMulHighI32 v114, v5, v6"),
-	      "V_MUL_HI_I32 did not lower to signed high-multiply IR");
-	Check(Common::ContainsStr(result.ir_dump, "BitwiseAndOrU32 v54, v5, v6, v7"),
-	      "V_AND_OR_B32 did not lower to ternary bitwise IR");
-	Check(Common::ContainsStr(result.ir_dump, "BitwiseOr3U32 v55, v5, v6, v7"),
-	      "V_OR3_B32 did not lower to ternary bitwise IR");
-	Check(Common::ContainsStr(result.ir_dump, "BitwiseXor3U32 v56, v5, v6, v7"),
-	      "V_XOR3_B32 did not lower to ternary bitwise IR");
-	Check(Common::ContainsStr(result.ir_dump, "ShiftLeftAddU32 v57, v5, v6, v7"),
-	      "V_LSHL_ADD_U32 did not lower to shared shift-left-add IR");
-	Check(Common::ContainsStr(result.ir_dump, "AddShiftLeftU32 v58, v5, v6, v7"),
-	      "V_ADD_LSHL_U32 did not lower to add-shift-left IR");
-	Check(Common::ContainsStr(result.ir_dump, "XorAddU32 v59, v5, v6, v7"),
-	      "V_XAD_U32 did not lower to xor-add IR");
-	Check(Common::ContainsStr(result.ir_dump, "ShiftLeftOrU32 v60, v5, v6, v7"),
-	      "V_LSHL_OR_B32 did not lower to shift-left-or IR");
-	Check(Common::ContainsStr(result.ir_dump, "SadU32 v61, v5, v6, v7"),
-	      "V_SAD_U32 did not lower to sad IR");
-	Check(Common::ContainsStr(result.ir_dump, "IMadI24U32 v62, v5, v6, v7"),
-	      "V_MAD_I32_I24 did not lower to signed 24-bit mad IR");
-	Check(Common::ContainsStr(result.ir_dump, "UMadU24U32 v63, v5, v6, v7"),
-	      "V_MAD_U32_U24 did not lower to unsigned 24-bit mad IR");
-	Check(Common::ContainsStr(result.ir_dump, "IMulU32 v69, v5, v6"),
-	      "V_MUL_LO_I32 did not lower to multiply IR");
-	Check(Common::ContainsStr(result.ir_dump, "IAddCarryU32 v70, s0, v5, v6, 0x00000000"),
-	      "V_ADD_I32 did not lower to carry-out add IR");
-	Check(Common::ContainsStr(result.ir_dump, "ISubBorrowU32 v71, s0, v5, v6"),
-	      "V_SUB_I32 did not lower to borrow-out subtract IR");
-	Check(Common::ContainsStr(result.ir_dump, "ISubBorrowU32 v72, s0, v6, v5"),
-	      "V_SUBREV_I32 did not reverse source order in borrow-out IR");
-	Check(Common::ContainsStr(
-	          result.ir_dump,
-	          "IMaxI16 v7.sdwa(sel=4,sext=0), 0x0000ffff, v5.opsel(lo=1,hi=0,neghi=0)"),
-	      "V_MAX_I16 did not lower to signed halfword max IR");
-	Check(Common::ContainsStr(
-	          result.ir_dump,
-	          "IMinI16 v7.sdwa(sel=5,sext=0), 0x00000002, v4.opsel(lo=1,hi=0,neghi=0)"),
-	      "V_MIN_I16 did not lower to signed halfword min IR");
-	Check(Common::ContainsStr(result.ir_dump, "BitFieldMaskU32 v73, 0x00000001, 0x00000004"),
-	      "V_BFM_B32 did not lower to shared bitfield-mask IR");
-	Check(Common::ContainsStr(result.ir_dump, "PackF32ToF16Rtz v75, v6, v6"),
-	      "V_CVT_PKRTZ_F16_F32 did not lower to shared pack IR");
-	Check(Common::ContainsStr(result.ir_dump, "PackF32ToF16Rtz v0, v0.neg, v1.neg"),
-	      "V_CVT_PKRTZ_F16_F32 source modifiers did not lower to shared pack IR");
-	Check(Common::ContainsStr(result.ir_dump, "LdexpF32 v76, v6, 0x00000001"),
-	      "V_LDEXP_F32 did not lower to ldexp IR");
-	Check(Common::ContainsStr(result.ir_dump, "LdexpF32 v7, v9.abs, 0xfffffffe"),
-	      "V_LDEXP_F32 source modifier did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "LdexpF32 v13.clamp, v6, 0xfffffffc"),
-	      "V_LDEXP_F32 clamp modifier did not lower to IR");
-	Check(Common::ContainsStr(result.ir_dump, "BitCountAddU32 v77, v5, v6"),
-	      "VOP3 V_BCNT_U32_B32 did not lower to bit-count-add IR");
-	Check(Common::ContainsStr(result.ir_dump, "PackSnorm2x16F32 v78, v6, v6"),
-	      "V_CVT_PKNORM_I16_F32 did not lower to shared pack IR");
-	Check(Common::ContainsStr(result.ir_dump, "PackUnorm2x16F32 v79, v6, v6"),
-	      "V_CVT_PKNORM_U16_F32 did not lower to shared pack IR");
-	Check(Common::ContainsStr(result.ir_dump, "PackU16U32 v80, v5, v7"),
-	      "V_CVT_PK_U16_U32 did not lower to shared pack IR");
-	Check(SpirvContainsOpcode(result.spirv, 112), "SPIR-V binary does not contain OpConvertUToF");
-	Check(SpirvContainsOpcode(result.spirv, 109), "SPIR-V binary does not contain OpConvertFToU");
-	Check(SpirvContainsOpcode(result.spirv, 111), "SPIR-V binary does not contain OpConvertSToF");
-	Check(SpirvContainsOpcode(result.spirv, 110), "SPIR-V binary does not contain OpConvertFToS");
-	Check(SpirvContainsOpcode(result.spirv, 136), "SPIR-V binary does not contain OpFDiv");
-	Check(SpirvContainsOpcode(result.spirv, 127), "SPIR-V binary does not contain OpFNegate");
-	Check(SpirvContainsOpcode(result.spirv, 12), "SPIR-V binary does not contain OpExtInst");
-	Check(SpirvContainsExtInst(result.spirv, 58),
-	      "SPIR-V binary does not contain GLSL.std.450 PackHalf2x16");
-	Check(SpirvContainsExtInst(result.spirv, 62),
-	      "SPIR-V binary does not contain GLSL.std.450 UnpackHalf2x16");
-	Check(SpirvContainsExtInst(result.spirv, 50),
-	      "SPIR-V binary does not contain GLSL.std.450 Fma");
-	Check(SpirvContainsExtInst(result.spirv, 43),
-	      "SPIR-V binary does not contain GLSL.std.450 FClamp");
-	Check(SpirvContainsExtInst(result.spirv, 53),
-	      "SPIR-V binary does not contain GLSL.std.450 Ldexp");
-	Check(SpirvContainsOpcode(result.spirv, 128), "SPIR-V binary does not contain OpIAdd");
-	Check(SpirvContainsOpcode(result.spirv, 149), "SPIR-V binary does not contain OpIAddCarry");
-	Check(SpirvContainsOpcode(result.spirv, 130), "SPIR-V binary does not contain OpISub");
-	Check(SpirvContainsOpcode(result.spirv, 132), "SPIR-V binary does not contain OpIMul");
-	Check(SpirvContainsOpcode(result.spirv, 171), "SPIR-V binary does not contain OpINotEqual");
-	Check(SpirvContainsOpcode(result.spirv, 200), "SPIR-V binary does not contain OpNot");
-	Check(SpirvContainsOpcode(result.spirv, 204), "SPIR-V binary does not contain OpBitReverse");
-	Check(SpirvContainsOpcode(result.spirv, 205), "SPIR-V binary does not contain OpBitCount");
-	Check(SpirvContainsOpcode(result.spirv, 166), "SPIR-V binary does not contain OpLogicalOr");
-	Check(SpirvContainsOpcode(result.spirv, 167), "SPIR-V binary does not contain OpLogicalAnd");
-	Check(SpirvContainsOpcode(result.spirv, 186),
-	      "SPIR-V binary does not contain OpFOrdGreaterThan");
-	Check(SpirvContainsOpcode(result.spirv, 181), "SPIR-V binary does not contain OpFUnordEqual");
-	Check(SpirvContainsOpcode(result.spirv, 183),
-	      "SPIR-V binary does not contain OpFUnordNotEqual");
-	Check(SpirvContainsOpcode(result.spirv, 185),
-	      "SPIR-V binary does not contain OpFUnordLessThan");
-	Check(SpirvContainsOpcode(result.spirv, 187),
-	      "SPIR-V binary does not contain OpFUnordGreaterThan");
-	Check(SpirvContainsOpcode(result.spirv, 189),
-	      "SPIR-V binary does not contain OpFUnordLessThanEqual");
-	Check(SpirvContainsOpcode(result.spirv, 191),
-	      "SPIR-V binary does not contain OpFUnordGreaterThanEqual");
-	Check(SpirvContainsOpcode(result.spirv, 190),
-	      "SPIR-V binary does not contain OpFOrdGreaterThanEqual");
-	Check(SpirvContainsOpcode(result.spirv, 184), "SPIR-V binary does not contain OpFOrdLessThan");
-	Check(SpirvContainsOpcode(result.spirv, 173), "SPIR-V binary does not contain OpSGreaterThan");
-	Check(SpirvContainsOpcode(result.spirv, 174),
-	      "SPIR-V binary does not contain OpUGreaterThanEqual");
-	Check(SpirvContainsOpcode(result.spirv, 177), "SPIR-V binary does not contain OpSLessThan");
-	Check(SpirvContainsOpcode(result.spirv, 202),
-	      "SPIR-V binary does not contain OpBitFieldSExtract");
-	Check(SpirvContainsOpcode(result.spirv, 203),
-	      "SPIR-V binary does not contain OpBitFieldUExtract");
-	Check(SpirvContainsOpcode(result.spirv, 194),
-	      "SPIR-V binary does not contain OpShiftRightLogical");
-	Check(SpirvContainsOpcode(result.spirv, 61),
-	      "SPIR-V binary does not contain OpLoad for cmpx old exec mask");
-	Check(SpirvContainsOpcode(result.spirv, 133), "SPIR-V binary does not contain OpFMul");
-	Check(SpirvContainsOpcode(result.spirv, 129), "SPIR-V binary does not contain OpFAdd");
-	Check(SpirvContainsOpcode(result.spirv, 151), "SPIR-V binary does not contain OpUMulExtended");
-	Check(SpirvContainsOpcode(result.spirv, 152), "SPIR-V binary does not contain OpSMulExtended");
-	Check(SpirvContainsOpcode(result.spirv, 196),
-	      "SPIR-V binary does not contain OpShiftLeftLogical");
-	Check(SpirvContainsOpcode(result.spirv, 197), "SPIR-V binary does not contain OpBitwiseOr");
-	Check(SpirvContainsOpcode(result.spirv, 198), "SPIR-V binary does not contain OpBitwiseXor");
-	Check(SpirvContainsOpcode(result.spirv, 199), "SPIR-V binary does not contain OpBitwiseAnd");
-	Check(SpirvContainsOpcode(result.spirv, 80),
-	      "SPIR-V binary does not contain OpCompositeConstruct");
-	Check(SpirvContainsOpcode(result.spirv, 81),
-	      "SPIR-V binary does not contain OpCompositeExtract");
-	Check(SpirvContainsOpcode(result.spirv, 339),
-	      "SPIR-V binary does not contain OpGroupNonUniformBallot");
-	Check(SpirvContainsOpcode(result.spirv, 343),
-	      "SPIR-V binary does not contain OpGroupNonUniformBallotFindLSB");
-	Check(SpirvContainsOpcode(result.spirv, 345),
-	      "SPIR-V binary does not contain OpGroupNonUniformShuffle");
+	Check(result.program.workgroup_wave64,
+	      "64-thread wave64 compute shader did not select workgroup wave emulation");
+	Check(ProgramHasInput(result.program,
+	                      ShaderRecompiler::IR::StageInputKind::LocalInvocationIndex),
+	      "workgroup wave64 emulation did not request LocalInvocationIndex");
+	const auto source = DisassembleSpirvBinary(result.spirv);
+	Check(Common::ContainsStr(source, "guest_wave64_scratch") &&
+	          Common::ContainsStr(source, "OpControlBarrier") &&
+	          Common::ContainsStr(source, "OpAtomicOr"),
+	      "workgroup wave64 SPIR-V lacks scratch, barriers, or combined ballot");
+	Check(!Common::ContainsStr(source, "OpGroupNonUniformBallot ") &&
+	          !Common::ContainsStr(source, "OpGroupNonUniformBallotFindLSB") &&
+	          !Common::ContainsStr(source, "OpGroupNonUniformShuffle"),
+	      "workgroup wave64 SPIR-V still relies on one native subgroup");
 	CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerMoreAluFamilies() {
+  const uint32_t shader[] = {
+      EncodeSopk(0x00, 9, 7), // s_movk_i32 s9, 7
+      EncodeSopk(0x0b, 9, 3), // s_cmp_gt_u32 s9, 3
+      EncodeVop1(0x00, 0, 0), // v_nop
+      EncodeVop1(0x01, 5, 9), // v_mov_b32 v5, s9
+      EncodeVop1(0x01, 103, 249),
+      EncodeVop1Sdwa(5, 6, 0, 4), // v_mov_b32 v103, v5 word0
+      EncodeVop1(0x06, 104, 249),
+      EncodeVop1Sdwa(103, 6, 0, 4), // v_cvt_f32_u32 v104, v103 word0
+      EncodeVop1(0x0a, 105, 249),
+      EncodeVop1Sdwa(6, 5, 2, 6), // v_cvt_f16_f32 v105.hi, v6
+      EncodeVop1(0x01, 106, 250),
+      EncodeVop1Dpp(5),                // v_mov_b32 v106, v5 dpp
+      EncodeVop1(0x02, 24, 5 + 256),   // v_readfirstlane_b32 s24, v5
+      EncodeVop1(0x06, 6, 5 + 256),    // v_cvt_f32_u32 v6, v5
+      EncodeVop1(0x07, 7, 6 + 256),    // v_cvt_u32_f32 v7, v6
+      EncodeVop1(0x05, 9, 5 + 256),    // v_cvt_f32_i32 v9, v5
+      EncodeVop1(0x08, 10, 6 + 256),   // v_cvt_i32_f32 v10, v6
+      EncodeVop1(0x0a, 99, 6 + 256),   // v_cvt_f16_f32 v99, v6
+      EncodeVop1(0x0b, 100, 99 + 256), // v_cvt_f32_f16 v100, v99
+      0x7e1016f9u,
+      0x00250602u,                      // v_cvt_f32_f16 v8, abs(v2.hi)
+      EncodeVop1(0x0d, 64, 6 + 256),    // v_cvt_flr_i32_f32 v64, v6
+      EncodeVop1(0x0e, 81, 5 + 256),    // v_cvt_off_f32_i4 v81, v5
+      EncodeVop1(0x11, 65, 5 + 256),    // v_cvt_f32_ubyte0 v65, v5
+      EncodeVop1(0x12, 66, 5 + 256),    // v_cvt_f32_ubyte1 v66, v5
+      EncodeVop1(0x13, 67, 5 + 256),    // v_cvt_f32_ubyte2 v67, v5
+      EncodeVop1(0x14, 68, 5 + 256),    // v_cvt_f32_ubyte3 v68, v5
+      EncodeVop1(0x2a, 11, 6 + 256),    // v_rcp_f32 v11, v6
+      EncodeVop1(0x20, 12, 6 + 256),    // v_fract_f32 v12, v6
+      EncodeVop1(0x21, 13, 6 + 256),    // v_trunc_f32 v13, v6
+      EncodeVop1(0x22, 14, 6 + 256),    // v_ceil_f32 v14, v6
+      EncodeVop1(0x23, 15, 6 + 256),    // v_rndne_f32 v15, v6
+      EncodeVop1(0x24, 16, 6 + 256),    // v_floor_f32 v16, v6
+      EncodeVop1(0x25, 17, 6 + 256),    // v_exp_f32 v17, v6
+      EncodeVop1(0x27, 18, 6 + 256),    // v_log_f32 v18, v6
+      EncodeVop1(0x2e, 19, 6 + 256),    // v_rsq_f32 v19, v6
+      EncodeVop1(0x33, 20, 6 + 256),    // v_sqrt_f32 v20, v6
+      EncodeVop1(0x35, 21, 6 + 256),    // v_sin_f32 v21, v6
+      EncodeVop1(0x36, 22, 6 + 256),    // v_cos_f32 v22, v6
+      EncodeVop1(0x37, 27, 5 + 256),    // v_not_b32 v27, v5
+      EncodeVop1(0x38, 28, 5 + 256),    // v_bfrev_b32 v28, v5
+      EncodeVop1(0x39, 31, 5 + 256),    // v_ffbh_u32 v31, v5
+      EncodeVop1(0x3a, 32, 5 + 256),    // v_ffbl_b32 v32, v5
+      0x7e6e870cu,                      // v_movrels_b32 v55, v12
+      EncodeVop2(0x1e, 83, 5 + 256, 6), // v_xnor_b32 v83, v5, v6
+      EncodeVop2(0x23, 84, 5 + 256, 6), // v_mbcnt_lo_u32_b32 v84, v5, v6
+      EncodeVop2(0x24, 85, 5 + 256, 6), // v_mbcnt_hi_u32_b32 v85, v5, v6
+      EncodeVop2(0x1f, 89, 6 + 256, 6), // v_mac_f32 v89, v6, v6
+      EncodeVop2(0x20, 90, 6 + 256, 5),
+      0x3f800000u, // v_madmk_f32 v90, v6, 1.0, v5
+      EncodeVop2(0x21, 91, 6 + 256, 5),
+      0x40000000u,                      // v_madak_f32 v91, v6, v5, 2.0
+      EncodeVop2(0x2b, 92, 6 + 256, 6), // v_mac_f32 v92, v6, v6
+      EncodeVop2(0x2c, 93, 6 + 256, 5),
+      0x3f000000u, // v_madmk_f32 v93, v6, 0.5, v5
+      EncodeVop2(0x2d, 94, 6 + 256, 5),
+      0x40400000u,                         // v_madak_f32 v94, v6, v5, 3.0
+      EncodeVop2(0x2f, 95, 6 + 256, 6),    // v_cvt_pkrtz_f16_f32 v95, v6, v6
+      EncodeVop2(0x02, 102, 95 + 256, 95), // v_dot2c_f32_f16 v102, v95, v95
+      EncodeVop2(0x28, 97, 5 + 256, 6),    // v_addc_u32 v97, vcc, v5, v6, vcc
+      EncodeVop2(0x25, 123, 249, 6),
+      EncodeVop2Sdwa(5, 6, 0, 4, 6),
+      EncodeVop2(0x1b, 124, 249, 6),
+      EncodeVop2Sdwa(5, 6, 0, 4, 5),
+      0x025e6af9u,
+      0x16060635u, // v_cndmask_b32 v47, v53, -v53
+      0x100490f9u,
+      0x86860600u, // v_mul_f32 v2, s0, s72 (SDWA full)
+      EncodeVop2(0x35, 9, 249, 1),
+      EncodeVop2Sdwa(0, 4, 2, 4, 4),
+      0x660000f9u,
+      EncodeVop2Sdwa(0, 4, 2, 4, 4),
+      EncodeVop2(0x03, 125, 250, 6),
+      EncodeVop2Dpp(5),
+      EncodeVop3Word0(0x103, 35),
+      EncodeVop3Word1(6 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x10b, 36),
+      EncodeVop3Word1(5 + 256, 5 + 256, 0),
+      EncodeVop3Word0(0x11e, 86),
+      EncodeVop3Word1(5 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x11f, 96),
+      EncodeVop3Word1(6 + 256, 6 + 256, 0),
+      EncodeVop3Word0Sdst(0x128, 98, 30),
+      EncodeVop3Word1(5 + 256, 6 + 256, 106),
+      EncodeVop3Word0(0x123, 87),
+      EncodeVop3Word1(5 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x124, 88),
+      EncodeVop3Word1(5 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x180, 0),
+      EncodeVop3Word1(0, 0, 0),
+      EncodeVop3Word0(0x181, 23),
+      EncodeVop3Word1(5 + 256, 0, 0),
+      EncodeVop3Word0(0x182, 25),
+      EncodeVop3Word1(5 + 256, 0, 0),
+      EncodeVop3Word0(0x185, 24),
+      EncodeVop3Word1(5 + 256, 0, 0),
+      EncodeVop3Word0(0x18a, 101),
+      EncodeVop3Word1(6 + 256, 0, 0),
+      EncodeVop3Word0(0x18d, 74),
+      EncodeVop3Word1(6 + 256, 0, 0),
+      EncodeVop3Word0(0x18e, 82),
+      EncodeVop3Word1(5 + 256, 0, 0),
+      EncodeVop3Word0(0x1a0, 25),
+      EncodeVop3Word1(6 + 256, 0, 0),
+      EncodeVop3Word0(0x1aa, 26),
+      EncodeVop3Word1(6 + 256, 0, 0),
+      EncodeVop3Word0(0x1b7, 29),
+      EncodeVop3Word1(5 + 256, 0, 0),
+      EncodeVop3Word0(0x1b8, 30),
+      EncodeVop3Word1(5 + 256, 0, 0),
+      EncodeVop3Word0(0x1b9, 33),
+      EncodeVop3Word1(5 + 256, 0, 0),
+      EncodeVop3Word0(0x1ba, 34),
+      EncodeVop3Word1(5 + 256, 0, 0),
+      EncodeVopc(0x04, 6 + 256, 6), // v_cmp_gt_f32 v6, v6
+      EncodeVopc(0xc4, 7 + 256, 5), // v_cmp_gt_u32 v7, v5
+      EncodeVopc(0x14, 6 + 256, 6), // v_cmpx_gt_f32 v6, v6
+      EncodeVopc(0xd4, 7 + 256, 5), // v_cmpx_gt_u32 v7, v5
+      EncodeVopc(0x00, 6 + 256, 6), // v_cmp_f_f32 v6, v6
+      EncodeVopc(0x0f, 6 + 256, 6), // v_cmp_tru_f32 v6, v6
+      EncodeVopc(0x07, 6 + 256, 6), // v_cmp_o_f32 v6, v6
+      EncodeVopc(0x08, 6 + 256, 6), // v_cmp_u_f32 v6, v6
+      EncodeVopc(0x09, 6 + 256, 6), // v_cmp_nge_f32 v6, v6
+      EncodeVopc(0x0a, 6 + 256, 6), // v_cmp_nlg_f32 v6, v6
+      EncodeVopc(0x0b, 6 + 256, 6), // v_cmp_ngt_f32 v6, v6
+      EncodeVopc(0x0c, 6 + 256, 6), // v_cmp_nle_f32 v6, v6
+      EncodeVopc(0x0d, 6 + 256, 6), // v_cmp_neq_f32 v6, v6
+      0x7c1a02f9u,
+      0x068680f0u, // v_cmp_neq_f32 s0, 0.5, v1 (SDWA)
+      EncodeVopc(0xd1, 249, 6),
+      EncodeVopcSdwa(5, 0, 0, 4),   // v_cmpx_lt_u32 exec, v5, v6 (SDWA)
+      EncodeVopc(0x0e, 6 + 256, 6), // v_cmp_nlt_f32 v6, v6
+      EncodeVopc(0x19, 6 + 256, 6), // v_cmpx_nge_f32 v6, v6
+      EncodeVopc(0x1a, 6 + 256, 6), // v_cmpx_nlg_f32 v6, v6
+      EncodeVopc(0x1b, 6 + 256, 6), // v_cmpx_ngt_f32 v6, v6
+      EncodeVopc(0x1c, 6 + 256, 6), // v_cmpx_nle_f32 v6, v6
+      EncodeVopc(0x1d, 6 + 256, 6), // v_cmpx_neq_f32 v6, v6
+      EncodeVopc(0x1e, 6 + 256, 6), // v_cmpx_nlt_f32 v6, v6
+      EncodeVopc(0x80, 5 + 256, 5), // v_cmp_f_i32 v5, v5
+      EncodeVopc(0x87, 5 + 256, 5), // v_cmp_t_i32 v5, v5
+      EncodeVopc(0xc0, 5 + 256, 5), // v_cmp_f_u32 v5, v5
+      EncodeVopc(0xc7, 5 + 256, 5), // v_cmp_t_u32 v5, v5
+      0xd4e5006au,
+      0x0000d47eu, // v_cmp_ne_u64 vcc, exec, vcc
+      EncodeVop3Word0(0x141, 8),
+      EncodeVop3Word1(6 + 256, 6 + 256, 6 + 256),
+      0xd5410004u,
+      0x20121301u, // v_mad_f32 v4, -v1, v9, s4
+      EncodeVop3Word0(0x144, 110),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x145, 111),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x146, 112),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x147, 113),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      0xd5470005u,
+      0x841a0102u, // v_cubema_f32 v5, v2, v0, -v6
+      EncodeVop3Word0(0x14b, 37),
+      EncodeVop3Word1(6 + 256, 6 + 256, 6 + 256),
+      EncodeVop3Word0(0x151, 38),
+      EncodeVop3Word1(6 + 256, 6 + 256, 6 + 256),
+      EncodeVop3Word0(0x154, 39),
+      EncodeVop3Word1(6 + 256, 6 + 256, 6 + 256),
+      EncodeVop3Word0(0x157, 40),
+      EncodeVop3Word1(6 + 256, 6 + 256, 6 + 256),
+      EncodeVop3Word0(0x152, 41),
+      EncodeVop3Word1(5 + 256, 5 + 256, 5 + 256),
+      EncodeVop3Word0(0x153, 42),
+      EncodeVop3Word1(5 + 256, 5 + 256, 5 + 256),
+      EncodeVop3Word0(0x155, 43),
+      EncodeVop3Word1(5 + 256, 5 + 256, 5 + 256),
+      EncodeVop3Word0(0x156, 44),
+      EncodeVop3Word1(5 + 256, 5 + 256, 5 + 256),
+      EncodeVop3Word0(0x158, 45),
+      EncodeVop3Word1(5 + 256, 5 + 256, 5 + 256),
+      EncodeVop3Word0(0x159, 46),
+      EncodeVop3Word1(5 + 256, 5 + 256, 5 + 256),
+      EncodeVop3Word0(0x148, 47),
+      EncodeVop3Word1(5 + 256, 129, 132),
+      EncodeVop3Word0(0x149, 48),
+      EncodeVop3Word1(5 + 256, 129, 132),
+      EncodeVop3Word0(0x14a, 49),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x14e, 50),
+      EncodeVop3Word1(5 + 256, 6 + 256, 129),
+      EncodeVop3Word0(0x14f, 115),
+      EncodeVop3Word1(5 + 256, 6 + 256, 5 + 256),
+      EncodeVop3Word0(0x36d, 51),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x169, 52),
+      EncodeVop3Word1(5 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x16a, 53),
+      EncodeVop3Word1(5 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x16c, 114),
+      EncodeVop3Word1(5 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x371, 54),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x372, 55),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x178, 56),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x346, 57),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x347, 58),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x345, 59),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x36f, 60),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x15d, 61),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x142, 62),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x143, 63),
+      EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
+      EncodeVop3Word0(0x16b, 69),
+      EncodeVop3Word1(5 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x30f, 70),
+      EncodeVop3Word1(5 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x310, 71),
+      EncodeVop3Word1(5 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x319, 72),
+      EncodeVop3Word1(5 + 256, 6 + 256, 0),
+      0xd70a1007u,
+      0x00020affu,
+      0x0000ffffu, // v_max_i16 v7, 0xffff, v5.hi
+      0xd70c5007u,
+      0x00020882u, // v_min_i16 v7, 2, v4.hi
+      EncodeVop3Word0(0x363, 73),
+      EncodeVop3Word1(129, 132, 0),
+      EncodeVop3Word0(0x360, 26),
+      EncodeVop3Word1(5 + 256, 130, 0),
+      EncodeVop3Word0(0x361, 107),
+      EncodeVop3Word1(5 + 256, 130, 0),
+      EncodeVop3Word0(0x377, 108),
+      EncodeVop3Word1(5 + 256, 128, 128),
+      EncodeVop3Word0(0x378, 109),
+      EncodeVop3Word1(5 + 256, 128, 128),
+      EncodeVop3Word0(0x12f, 75),
+      EncodeVop3Word1(6 + 256, 6 + 256, 0),
+      0xd52f0000u,
+      0x60020300u, // v_cvt_pkrtz_f16_f32 v0, -v0, -v1
+      EncodeVop3Word0(0x362, 76),
+      EncodeVop3Word1(6 + 256, 129, 0),
+      0xd7620107u,
+      0x00018509u, // v_ldexp_f32 v7, abs(v9), -2
+      0xd762800du,
+      0x00018906u, // v_ldexp_f32 clamp v13, v6, -4
+      EncodeVop3Word0(0x364, 77),
+      EncodeVop3Word1(5 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x368, 78),
+      EncodeVop3Word1(6 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x369, 79),
+      EncodeVop3Word1(6 + 256, 6 + 256, 0),
+      EncodeVop3Word0(0x36a, 80),
+      EncodeVop3Word1(5 + 256, 7 + 256, 0),
+      0xbf810000u,
+  };
+
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.dump_ir = true;
+
+  ShaderRecompiler::CompileResult result;
+  std::string error;
+  Check(ShaderRecompiler::TryRecompile(shader, options, &result, &error),
+        error.c_str());
+  Check(Common::ContainsStr(result.decoded_dump, "s_movk_i32 s9"),
+        "new decoder did not decode SOPK mov");
+  Check(Common::ContainsStr(result.decoded_dump, "s_cmp_gt_u32"),
+        "new decoder did not decode SOPK compare");
+  Check(Common::ContainsStr(result.decoded_dump, "v_nop"),
+        "new decoder did not decode old-backed VOP1 no-op");
+  Check(Common::ContainsStr(result.decoded_dump, "v_mov_b32 v5"),
+        "new decoder did not decode VOP1 mov");
+  Check(Common::ContainsStr(result.decoded_dump, "v_movrels_b32 v55, v12"),
+        "new decoder did not decode VOP1 V_MOVRELS_B32");
+  Check(
+      Common::ContainsStr(result.decoded_dump, "v_mov_b32 v103, v5.sdwa(sel=4"),
+      "new decoder did not decode VOP1 SDWA source selector");
+  Check(
+      Common::ContainsStr(result.decoded_dump, "v_cvt_f16_f32 v105.sdwa(sel=5"),
+      "new decoder did not decode VOP1 SDWA destination selector");
+  Check(Common::ContainsStr(result.decoded_dump, "v_mov_b32 v106, v5.dpp"),
+        "new decoder did not decode VOP1 DPP source metadata");
+  Check(!Common::ContainsStr(result.decoded_dump,
+                             "VOP1 SDWA/DPP modifiers are not implemented"),
+        "new decoder still reports blanket VOP1 SDWA/DPP unsupported reason");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "v_add_nc_u32 v123, v5.sdwa(sel=4"),
+        "new decoder did not decode VOP2 SDWA source selector");
+  Check(
+      Common::ContainsStr(result.decoded_dump, "v_and_b32 v124, v5.sdwa(sel=4"),
+      "new decoder did not decode VOP2 SDWA first source selector");
+  Check(Common::ContainsStr(result.decoded_dump, "v6.sdwa(sel=5"),
+        "new decoder did not decode VOP2 SDWA second source selector");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cndmask_b32 v47, v53,") &&
+            Common::ContainsStr(result.decoded_dump, "v53.neg"),
+        "new decoder did not decode V_CNDMASK_B32 SDWA source modifier");
+  Check(Common::ContainsStr(result.decoded_dump, "v_add_f32 v125, v5.dpp"),
+        "new decoder did not decode VOP2 DPP source metadata");
+  Check(!Common::ContainsStr(result.decoded_dump,
+                             "VOP2 SDWA/DPP modifiers are not implemented"),
+        "new decoder still reports blanket VOP2 SDWA/DPP unsupported reason");
+  Check(Common::ContainsStr(result.decoded_dump, "v_readfirstlane_b32 s24, v5"),
+        "new decoder did not decode old-backed V_READFIRSTLANE_B32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cvt_f32_u32 v6"),
+        "new decoder did not decode VOP1 conversion");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cvt_f32_i32 v9"),
+        "new decoder did not decode VOP1 signed int-to-float conversion");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cvt_i32_f32 v10"),
+        "new decoder did not decode VOP1 float-to-signed-int conversion");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cvt_f16_f32 v99"),
+        "new decoder did not decode old-backed V_CVT_F16_F32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cvt_f32_f16 v100"),
+        "new decoder did not decode old-backed native V_CVT_F32_F16");
+  Check(
+      Common::ContainsStr(result.decoded_dump,
+                          "v_cvt_f32_f16 v8, v2.sdwa(sel=5") &&
+          Common::ContainsStr(result.decoded_dump, "v2.sdwa(sel=5,sext=0).abs"),
+      "new decoder did not decode V_CVT_F32_F16 SDWA source selector modifier");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cvt_flr_i32_f32 v64"),
+        "new decoder did not decode old-backed V_CVT_FLR_I32_F32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cvt_off_f32_i4 v81"),
+        "new decoder did not decode old-backed V_CVT_OFF_F32_I4");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cvt_f32_ubyte0 v65"),
+        "new decoder did not decode old-backed V_CVT_F32_UBYTE0");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cvt_f32_ubyte1 v66"),
+        "new decoder did not decode old-backed V_CVT_F32_UBYTE1");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cvt_f32_ubyte2 v67"),
+        "new decoder did not decode old-backed V_CVT_F32_UBYTE2");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cvt_f32_ubyte3 v68"),
+        "new decoder did not decode old-backed V_CVT_F32_UBYTE3");
+  Check(Common::ContainsStr(result.decoded_dump, "v_rcp_f32 v11"),
+        "new decoder did not decode VOP1 reciprocal");
+  Check(Common::ContainsStr(result.decoded_dump, "v_fract_f32 v12"),
+        "new decoder did not decode VOP1 fract");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cos_f32 v22"),
+        "new decoder did not decode VOP1 cosine");
+  Check(Common::ContainsStr(result.decoded_dump, "v_not_b32 v27"),
+        "new decoder did not decode VOP1 not");
+  Check(Common::ContainsStr(result.decoded_dump, "v_bfrev_b32 v28"),
+        "new decoder did not decode VOP1 bit reverse");
+  Check(Common::ContainsStr(result.decoded_dump, "v_ffbh_u32 v31"),
+        "new decoder did not decode VOP1 find-first-bit-high");
+  Check(Common::ContainsStr(result.decoded_dump, "v_ffbl_b32 v32"),
+        "new decoder did not decode VOP1 find-first-bit-low");
+  Check(Common::ContainsStr(result.decoded_dump, "v_xnor_b32 v83, v5, v6"),
+        "new decoder did not decode old-backed V_XNOR_B32");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "v_mbcnt_lo_u32_b32 v84, v5, v6"),
+        "new decoder did not decode old-backed V_MBCNT_LO_U32_B32");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "v_mbcnt_hi_u32_b32 v85, v5, v6"),
+        "new decoder did not decode old-backed V_MBCNT_HI_U32_B32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_mac_f32 v89, v6, v6"),
+        "new decoder did not decode old-backed V_MAC_F32");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "v_madmk_f32 v90, v6, 0x3f800000, v5"),
+        "new decoder did not decode old-backed V_MADMK_F32 literal form");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "v_madak_f32 v91, v6, v5, 0x40000000"),
+        "new decoder did not decode old-backed V_MADAK_F32 literal form");
+  Check(Common::ContainsStr(result.decoded_dump, "v_mac_f32 v92, v6, v6"),
+        "new decoder did not decode old-backed alternate V_MAC_F32");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "v_madmk_f32 v93, v6, 0x3f000000, v5"),
+        "new decoder did not decode old-backed alternate V_MADMK_F32");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "v_madak_f32 v94, v6, v5, 0x40400000"),
+        "new decoder did not decode old-backed alternate V_MADAK_F32");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "v_cvt_pkrtz_f16_f32 v95, v6, v6"),
+        "new decoder did not decode old-backed native V_CVT_PKRTZ_F16_F32");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "v_dot2c_f32_f16 v102, v95, v95"),
+        "new decoder did not decode old-backed V_DOT2C_F32_F16");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "v_addc_u32 v97, vcc_lo, v5, v6, vcc_lo"),
+        "new decoder did not decode old-backed V_ADD_CO_U32 carry form");
+  Check(Common::ContainsStr(result.decoded_dump, "v_add_f32 v35"),
+        "new decoder did not decode VOP3-encoded VOP2 float add");
+  Check(Common::ContainsStr(result.decoded_dump, "v_mul_u32_u24 v36"),
+        "new decoder did not decode VOP3-encoded VOP2 24-bit multiply");
+  Check(Common::ContainsStr(result.decoded_dump, "v_xnor_b32 v86, v5, v6"),
+        "new decoder did not decode old-backed VOP3-encoded V_XNOR_B32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_mac_f32 v96, v6, v6"),
+        "new decoder did not decode old-backed VOP3-encoded V_MAC_F32");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "v_addc_u32 v98, s30, v5, v6, vcc_lo"),
+        "new decoder did not decode old-backed VOP3 V_ADD_CO_U32 carry form");
+  Check(
+      Common::ContainsStr(result.decoded_dump,
+                          "v_mbcnt_lo_u32_b32 v87, v5, v6"),
+      "new decoder did not decode old-backed VOP3-encoded V_MBCNT_LO_U32_B32");
+  Check(
+      Common::ContainsStr(result.decoded_dump,
+                          "v_mbcnt_hi_u32_b32 v88, v5, v6"),
+      "new decoder did not decode old-backed VOP3-encoded V_MBCNT_HI_U32_B32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_mov_b32 v23"),
+        "new decoder did not decode VOP3-encoded VOP1 move");
+  Check(
+      Common::ContainsStr(result.decoded_dump, "v_readfirstlane_b32 s25, v5"),
+      "new decoder did not decode old-backed VOP3-encoded V_READFIRSTLANE_B32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cvt_f32_i32 v24"),
+        "new decoder did not decode VOP3-encoded VOP1 signed conversion");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cvt_f16_f32 v101"),
+        "new decoder did not decode old-backed VOP3-encoded V_CVT_F16_F32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cvt_flr_i32_f32 v74"),
+        "new decoder did not decode old-backed VOP3-encoded V_CVT_FLR_I32_F32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cvt_off_f32_i4 v82"),
+        "new decoder did not decode old-backed VOP3-encoded V_CVT_OFF_F32_I4");
+  Check(Common::ContainsStr(result.decoded_dump, "v_fract_f32 v25"),
+        "new decoder did not decode VOP3-encoded VOP1 fract");
+  Check(Common::ContainsStr(result.decoded_dump, "v_rcp_f32 v26"),
+        "new decoder did not decode VOP3-encoded VOP1 reciprocal");
+  Check(Common::ContainsStr(result.decoded_dump, "v_not_b32 v29"),
+        "new decoder did not decode VOP3-encoded VOP1 not");
+  Check(Common::ContainsStr(result.decoded_dump, "v_bfrev_b32 v30"),
+        "new decoder did not decode VOP3-encoded VOP1 bit reverse");
+  Check(Common::ContainsStr(result.decoded_dump, "v_ffbh_u32 v33"),
+        "new decoder did not decode VOP3-encoded VOP1 find-first-bit-high");
+  Check(Common::ContainsStr(result.decoded_dump, "v_ffbl_b32 v34"),
+        "new decoder did not decode VOP3-encoded VOP1 find-first-bit-low");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cmp_gt_f32"),
+        "new decoder did not decode VOPC float compare");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cmpx_gt_f32"),
+        "new decoder did not decode VOPC float compare-and-mask");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cmpx_gt_u32"),
+        "new decoder did not decode VOPC uint compare-and-mask");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cmp_f_f32"),
+        "new decoder did not decode old-backed V_CMP_F_F32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cmp_tru_f32"),
+        "new decoder did not decode old-backed V_CMP_TRU_F32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cmp_o_f32"),
+        "new decoder did not decode old-backed V_CMP_O_F32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cmp_u_f32"),
+        "new decoder did not decode old-backed V_CMP_U_F32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cmp_nge_f32"),
+        "new decoder did not decode old-backed V_CMP_NGE_F32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cmp_nlg_f32"),
+        "new decoder did not decode old-backed V_CMP_NLG_F32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cmp_ngt_f32"),
+        "new decoder did not decode old-backed V_CMP_NGT_F32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cmp_nle_f32"),
+        "new decoder did not decode old-backed V_CMP_NLE_F32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cmp_neq_f32"),
+        "new decoder did not decode old-backed V_CMP_NEQ_F32");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "v_cmp_neq_f32 s0, 0.500000, v1"),
+        "new decoder did not decode old-backed V_CMP_NEQ_F32 SDWA scalar "
+        "destination");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "v_cmpx_lt_u32 exec_lo, v5.sdwa(sel=4") &&
+            Common::ContainsStr(result.ir_dump, "CompareMaskLtU32 exec_lo"),
+        "new decoder did not route V_CMPX SDWA destination to exec");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cmp_nlt_f32"),
+        "new decoder did not decode old-backed V_CMP_NLT_F32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cmpx_nge_f32"),
+        "new decoder did not decode old-backed V_CMPX_NGE_F32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cmpx_nlg_f32"),
+        "new decoder did not decode old-backed V_CMPX_NLG_F32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cmpx_ngt_f32"),
+        "new decoder did not decode old-backed V_CMPX_NGT_F32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cmpx_nle_f32"),
+        "new decoder did not decode old-backed V_CMPX_NLE_F32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cmpx_neq_f32"),
+        "new decoder did not decode old-backed V_CMPX_NEQ_F32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cmpx_nlt_f32"),
+        "new decoder did not decode old-backed V_CMPX_NLT_F32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cmp_f_i32"),
+        "new decoder did not decode old-backed V_CMP_F_I32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cmp_t_i32"),
+        "new decoder did not decode old-backed V_CMP_T_I32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cmp_f_u32"),
+        "new decoder did not decode old-backed V_CMP_F_U32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_cmp_t_u32"),
+        "new decoder did not decode old-backed V_CMP_T_U32");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "v_cmp_ne_u64 vcc_lo, exec_lo, vcc_lo"),
+        "new decoder did not decode VOP3-encoded V_CMP_NE_U64");
+  Check(Common::ContainsStr(result.ir_dump,
+                            "CompareNeU64 vcc_lo, exec_lo, vcc_lo"),
+        "V_CMP_NE_U64 did not lower to 64-bit compare IR");
+  Check(Common::ContainsStr(result.decoded_dump, "v_mad_f32 v8"),
+        "new decoder did not decode VOP3 mad");
+  Check(
+      Common::ContainsStr(result.decoded_dump, "v_mad_f32 v4, v1.neg, v9, s4"),
+      "new decoder did not decode VOP3 mad source modifiers");
+  Check(
+      Common::ContainsStr(result.decoded_dump, "v_cubeid_f32 v110, v5, v6, v7"),
+      "new decoder did not decode old-backed V_CUBEID_F32");
+  Check(
+      Common::ContainsStr(result.decoded_dump, "v_cubesc_f32 v111, v5, v6, v7"),
+      "new decoder did not decode old-backed V_CUBESC_F32");
+  Check(
+      Common::ContainsStr(result.decoded_dump, "v_cubetc_f32 v112, v5, v6, v7"),
+      "new decoder did not decode old-backed V_CUBETC_F32");
+  Check(
+      Common::ContainsStr(result.decoded_dump, "v_cubema_f32 v113, v5, v6, v7"),
+      "new decoder did not decode old-backed V_CUBEMA_F32");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "v_cubema_f32 v5, v2, v0, v6.neg"),
+        "new decoder did not decode V_CUBEMA_F32 source modifier");
+  Check(Common::ContainsStr(result.decoded_dump, "v_fma_f32 v37"),
+        "new decoder did not decode VOP3 fma");
+  Check(Common::ContainsStr(result.decoded_dump, "v_min3_f32 v38"),
+        "new decoder did not decode VOP3 min3");
+  Check(Common::ContainsStr(result.decoded_dump, "v_max3_f32 v39"),
+        "new decoder did not decode VOP3 max3");
+  Check(Common::ContainsStr(result.decoded_dump, "v_med3_f32 v40"),
+        "new decoder did not decode VOP3 med3");
+  Check(Common::ContainsStr(result.decoded_dump, "v_min3_i32 v41"),
+        "new decoder did not decode VOP3 signed min3");
+  Check(Common::ContainsStr(result.decoded_dump, "v_min3_u32 v42"),
+        "new decoder did not decode VOP3 unsigned min3");
+  Check(Common::ContainsStr(result.decoded_dump, "v_max3_i32 v43"),
+        "new decoder did not decode VOP3 signed max3");
+  Check(Common::ContainsStr(result.decoded_dump, "v_max3_u32 v44"),
+        "new decoder did not decode VOP3 unsigned max3");
+  Check(Common::ContainsStr(result.decoded_dump, "v_med3_i32 v45"),
+        "new decoder did not decode VOP3 signed med3");
+  Check(Common::ContainsStr(result.decoded_dump, "v_med3_u32 v46"),
+        "new decoder did not decode VOP3 unsigned med3");
+  Check(Common::ContainsStr(result.decoded_dump, "v_bfe_u32 v47"),
+        "new decoder did not decode VOP3 unsigned bitfield extract");
+  Check(Common::ContainsStr(result.decoded_dump, "v_bfe_i32 v48"),
+        "new decoder did not decode VOP3 signed bitfield extract");
+  Check(Common::ContainsStr(result.decoded_dump, "v_bfi_b32 v49"),
+        "new decoder did not decode VOP3 bitfield insert-select");
+  Check(Common::ContainsStr(result.decoded_dump, "v_alignbit_b32 v50"),
+        "new decoder did not decode VOP3 alignbit");
+  Check(Common::ContainsStr(result.decoded_dump, "v_alignbyte_b32 v115"),
+        "new decoder did not decode VOP3 alignbyte");
+  Check(Common::ContainsStr(result.decoded_dump, "v_add3_u32 v51"),
+        "new decoder did not decode VOP3 add3");
+  Check(Common::ContainsStr(result.decoded_dump, "v_mul_lo_u32 v52, v5, v6"),
+        "new decoder did not decode old-backed V_MUL_LO_U32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_mul_hi_u32 v53, v5, v6"),
+        "new decoder did not decode old-backed V_MUL_HI_U32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_mul_hi_i32 v114, v5, v6"),
+        "new decoder did not decode RDNA2 V_MUL_HI_I32");
+  Check(
+      Common::ContainsStr(result.decoded_dump, "v_and_or_b32 v54, v5, v6, v7"),
+      "new decoder did not decode old-backed V_AND_OR_B32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_or3_b32 v55, v5, v6, v7"),
+        "new decoder did not decode old-backed V_OR3_B32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_xor3_b32 v56, v5, v6, v7"),
+        "new decoder did not decode old-backed V_XOR3_B32");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "v_lshl_add_u32 v57, v5, v6, v7"),
+        "new decoder did not decode old-backed V_LSHL_ADD_U32");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "v_add_lshl_u32 v58, v5, v6, v7"),
+        "new decoder did not decode old-backed V_ADD_LSHL_U32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_xad_u32 v59, v5, v6, v7"),
+        "new decoder did not decode old-backed V_XAD_U32");
+  Check(
+      Common::ContainsStr(result.decoded_dump, "v_lshl_or_b32 v60, v5, v6, v7"),
+      "new decoder did not decode old-backed V_LSHL_OR_B32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_sad_u32 v61, v5, v6, v7"),
+        "new decoder did not decode old-backed V_SAD_U32");
+  Check(
+      Common::ContainsStr(result.decoded_dump, "v_mad_i32_i24 v62, v5, v6, v7"),
+      "new decoder did not decode old-backed V_MAD_I32_I24");
+  Check(
+      Common::ContainsStr(result.decoded_dump, "v_mad_u32_u24 v63, v5, v6, v7"),
+      "new decoder did not decode old-backed V_MAD_U32_U24");
+  Check(Common::ContainsStr(result.decoded_dump, "v_mul_lo_i32 v69, v5, v6"),
+        "new decoder did not decode old-backed V_MUL_LO_I32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_add_i32 v70, s0, v5, v6"),
+        "new decoder did not decode old-backed V_ADD_I32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_sub_i32 v71, s0, v5, v6"),
+        "new decoder did not decode RDNA2 V_SUB_CO_U32");
+  Check(
+      Common::ContainsStr(result.decoded_dump, "v_subrev_i32 v72, s0, v5, v6"),
+      "new decoder did not decode old-backed V_SUBREV_I32");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "v_max_i16 v7.sdwa(sel=4,sext=0), 0x0000ffff, "
+                            "v5.opsel(lo=1,hi=0,neghi=0)"),
+        "new decoder did not decode RDNA2 V_MAX_I16 literal/op_sel form");
+  Check(Common::ContainsStr(
+            result.decoded_dump,
+            "v_min_i16 v7.sdwa(sel=5,sext=0), 2, v4.opsel(lo=1,hi=0,neghi=0)"),
+        "new decoder did not decode RDNA2 V_MIN_I16 op_sel form");
+  Check(Common::ContainsStr(result.decoded_dump, "v_bfm_b32 v73, 1, 4"),
+        "new decoder did not decode old-backed V_BFM_B32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_readlane_b32 s26, v5, 2"),
+        "new decoder did not decode old-backed V_READLANE_B32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_writelane_b32 v107, v5, 2"),
+        "new decoder did not decode old-backed V_WRITELANE_B32");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "v_permlane16_b32 v108, v5, 0, 0"),
+        "new decoder did not decode old-backed V_PERMLANE16_B32");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "v_permlanex16_b32 v109, v5, 0, 0"),
+        "new decoder did not decode old-backed V_PERMLANEX16_B32");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "v_cvt_pkrtz_f16_f32 v75, v6, v6"),
+        "new decoder did not decode old-backed V_CVT_PKRTZ_F16_F32");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "v_cvt_pkrtz_f16_f32 v0, v0.neg, v1.neg"),
+        "new decoder did not decode V_CVT_PKRTZ_F16_F32 source modifiers");
+  Check(Common::ContainsStr(result.decoded_dump, "v_ldexp_f32 v76, v6, 1"),
+        "new decoder did not decode old-backed V_LDEXP_F32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_ldexp_f32 v7, v9.abs, -2"),
+        "new decoder did not decode V_LDEXP_F32 source modifier");
+  Check(
+      Common::ContainsStr(result.decoded_dump, "v_ldexp_f32 v13.clamp, v6, -4"),
+      "new decoder did not decode V_LDEXP_F32 clamp modifier");
+  Check(Common::ContainsStr(result.decoded_dump, "v_bcnt_u32_b32 v77, v5, v6"),
+        "new decoder did not decode old-backed VOP3 V_BCNT_U32_B32");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "v_cvt_pknorm_i16_f32 v78, v6, v6"),
+        "new decoder did not decode old-backed V_CVT_PKNORM_I16_F32");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "v_cvt_pknorm_u16_f32 v79, v6, v6"),
+        "new decoder did not decode old-backed V_CVT_PKNORM_U16_F32");
+  Check(
+      Common::ContainsStr(result.decoded_dump, "v_cvt_pk_u16_u32 v80, v5, v7"),
+      "new decoder did not decode old-backed V_CVT_PK_U16_U32");
+  Check(Common::ContainsStr(result.decoded_dump, "v_mul_f32 v2, s0, s72"),
+        "new decoder did not decode old-backed V_MUL_F32 SDWA full-width form");
+  Check(Common::ContainsStr(result.decoded_dump, "v_mul_f16 v9.sdwa(sel=4") &&
+            Common::ContainsStr(result.decoded_dump, "v0.sdwa(sel=4") &&
+            Common::ContainsStr(result.decoded_dump, "v1.sdwa(sel=4"),
+        "new decoder did not decode V_MUL_F16 SDWA low-half form");
+  Check(Common::ContainsStr(result.decoded_dump, "v_sub_f16 v0.sdwa(sel=4") &&
+            Common::ContainsStr(result.decoded_dump, "v0.sdwa(sel=4"),
+        "new decoder did not decode V_SUB_F16 SDWA low-half form");
+  Check(Common::ContainsStr(result.ir_dump, "ConvertU32ToF32 v6"),
+        "VOP1 uint-to-float conversion did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "MoveU32 v103, v5.sdwa(sel=4"),
+        "VOP1 SDWA source selector did not lower to IR metadata");
+  Check(Common::ContainsStr(result.ir_dump, "ConvertF32ToF16 v105.sdwa(sel=5"),
+        "VOP1 SDWA destination selector did not lower to IR metadata");
+  Check(Common::ContainsStr(result.ir_dump, "MoveU32 v106.dpp") &&
+            Common::ContainsStr(result.ir_dump, "v5.dpp"),
+        "VOP1 DPP source/destination did not lower to IR metadata");
+  Check(Common::ContainsStr(result.ir_dump, "MoveRelSourceU32 v55, v12, m0"),
+        "V_MOVRELS_B32 did not lower to indexed VGPR-source IR");
+  Check(Common::ContainsStr(result.ir_dump, "IAddU32 v123, v5.sdwa(sel=4"),
+        "VOP2 SDWA did not lower first source metadata to IR");
+  Check(
+      Common::ContainsStr(result.ir_dump, "BitwiseAndU32 v124, v5.sdwa(sel=4"),
+      "VOP2 SDWA bitwise op did not lower first source metadata to IR");
+  Check(Common::ContainsStr(result.ir_dump, "v6.sdwa(sel=5"),
+        "VOP2 SDWA bitwise op did not lower second source metadata to IR");
+  Check(Common::ContainsStr(result.ir_dump,
+                            "SelectMaskF32Bits v47, vcc_lo, v53.neg, v53") &&
+            Common::ContainsStr(result.ir_dump, "v53.neg"),
+        "V_CNDMASK_B32 SDWA source modifier did not lower to float-bit select "
+        "IR");
+  Check(Common::ContainsStr(result.ir_dump, "FAddF32 v125.dpp") &&
+            Common::ContainsStr(result.ir_dump, "v5.dpp"),
+        "VOP2 DPP source/destination did not lower to IR metadata");
+  Check(Common::ContainsStr(result.ir_dump, "FMulF32 v2, s0, s72"),
+        "V_MUL_F32 SDWA full-width form did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "MulF16 v9.sdwa(sel=4") &&
+            Common::ContainsStr(result.ir_dump, "v0.sdwa(sel=4") &&
+            Common::ContainsStr(result.ir_dump, "v1.sdwa(sel=4"),
+        "V_MUL_F16 SDWA low-half form did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "SubF16 v0.sdwa(sel=4") &&
+            Common::ContainsStr(result.ir_dump, "v0.sdwa(sel=4"),
+        "V_SUB_F16 SDWA low-half form did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "ConvertF32ToU32 v7"),
+        "VOP1 float-to-uint conversion did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "ConvertI32ToF32 v9"),
+        "VOP1 signed int-to-float conversion did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "ConvertF32ToI32 v10"),
+        "VOP1 float-to-signed-int conversion did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "ConvertF32ToF16 v99, v6"),
+        "V_CVT_F16_F32 did not lower to shared half-pack IR");
+  Check(Common::ContainsStr(result.ir_dump, "ConvertF16ToF32 v100, v99"),
+        "V_CVT_F32_F16 did not lower to shared half-unpack IR");
+  Check(Common::ContainsStr(result.ir_dump,
+                            "ConvertF16ToF32 v8, v2.sdwa(sel=5") &&
+            Common::ContainsStr(result.ir_dump, "v2.sdwa(sel=5,sext=0).abs"),
+        "V_CVT_F32_F16 SDWA source selector modifier did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "ReadFirstLaneU32 s24, v5"),
+        "V_READFIRSTLANE_B32 did not lower to subgroup IR");
+  Check(Common::ContainsStr(result.ir_dump, "ConvertFloorF32ToI32 v64, v6"),
+        "V_CVT_FLR_I32_F32 did not lower to shared IR");
+  Check(Common::ContainsStr(result.ir_dump, "ConvertI4ToOffsetF32 v81, v5"),
+        "V_CVT_OFF_F32_I4 did not lower to shared offset-convert IR");
+  Check(Common::ContainsStr(result.ir_dump,
+                            "ConvertByteU32ToF32 v65, v5, 0x00000000"),
+        "V_CVT_F32_UBYTE0 did not lower to shared byte-convert IR");
+  Check(Common::ContainsStr(result.ir_dump,
+                            "ConvertByteU32ToF32 v66, v5, 0x00000001"),
+        "V_CVT_F32_UBYTE1 did not lower to shared byte-convert IR");
+  Check(Common::ContainsStr(result.ir_dump,
+                            "ConvertByteU32ToF32 v67, v5, 0x00000002"),
+        "V_CVT_F32_UBYTE2 did not lower to shared byte-convert IR");
+  Check(Common::ContainsStr(result.ir_dump,
+                            "ConvertByteU32ToF32 v68, v5, 0x00000003"),
+        "V_CVT_F32_UBYTE3 did not lower to shared byte-convert IR");
+  Check(Common::ContainsStr(result.ir_dump, "RcpF32 v11"),
+        "VOP1 reciprocal did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "FractF32 v12"),
+        "VOP1 fract did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "TruncF32 v13"),
+        "VOP1 trunc did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "CeilF32 v14"),
+        "VOP1 ceil did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "RoundEvenF32 v15"),
+        "VOP1 round-even did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "FloorF32 v16"),
+        "VOP1 floor did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "Exp2F32 v17"),
+        "VOP1 exp2 did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "Log2F32 v18"),
+        "VOP1 log2 did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "InverseSqrtF32 v19"),
+        "VOP1 inverse-sqrt did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "SqrtF32 v20"),
+        "VOP1 sqrt did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "SinF32 v21"),
+        "VOP1 sin did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "CosF32 v22"),
+        "VOP1 cos did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "BitwiseNotU32 v27"),
+        "VOP1 not did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "BitReverseU32 v28"),
+        "VOP1 bit reverse did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "FindMsbFromHighU32 v31"),
+        "VOP1 find-first-bit-high did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "FindLsbU32 v32"),
+        "VOP1 find-first-bit-low did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "BitwiseXnorU32 v83, v5, v6"),
+        "V_XNOR_B32 did not lower to shared xnor IR");
+  Check(Common::ContainsStr(result.ir_dump, "MaskedBitCountLowU32 v84, v5, v6"),
+        "V_MBCNT_LO_U32_B32 did not lower to shared masked bit-count IR");
+  Check(
+      Common::ContainsStr(result.ir_dump, "MaskedBitCountHighU32 v85, v5, v6"),
+      "V_MBCNT_HI_U32_B32 did not lower to shared masked bit-count IR");
+  Check(Common::ContainsStr(result.ir_dump, "FMadF32 v89, v6, v6, v89"),
+        "V_MAC_F32 did not lower with the destination register as addend");
+  Check(Common::ContainsStr(result.ir_dump, "FMadF32 v90, v6, 0x3f800000, v5"),
+        "V_MADMK_F32 did not lower with the literal in source 1");
+  Check(Common::ContainsStr(result.ir_dump, "FMadF32 v91, v6, v5, 0x40000000"),
+        "V_MADAK_F32 did not lower with the literal in source 2");
+  Check(Common::ContainsStr(result.ir_dump, "FMadF32 v92, v6, v6, v92"),
+        "alternate V_MAC_F32 did not lower with the destination register as "
+        "addend");
+  Check(Common::ContainsStr(result.ir_dump, "FMadF32 v93, v6, 0x3f000000, v5"),
+        "alternate V_MADMK_F32 did not lower with the literal in source 1");
+  Check(Common::ContainsStr(result.ir_dump, "FMadF32 v94, v6, v5, 0x40400000"),
+        "alternate V_MADAK_F32 did not lower with the literal in source 2");
+  Check(Common::ContainsStr(result.ir_dump, "PackF32ToF16Rtz v95, v6, v6"),
+        "native V_CVT_PKRTZ_F16_F32 did not lower to shared pack IR");
+  Check(
+      Common::ContainsStr(result.ir_dump, "Dot2AccF32F16 v102, v95, v95, v102"),
+      "V_DOT2C_F32_F16 did not lower to explicit dot-accumulate IR");
+  Check(Common::ContainsStr(result.ir_dump,
+                            "IAddCarryU32 v97, vcc_lo, v5, v6, vcc_lo"),
+        "V_ADD_CO_U32 did not lower to carry-add IR");
+  Check(Common::ContainsStr(result.ir_dump, "FAddF32 v35"),
+        "VOP3-encoded VOP2 float add did not lower through shared IR");
+  Check(Common::ContainsStr(result.ir_dump, "UMulU24U32 v36"),
+        "VOP3-encoded VOP2 24-bit multiply did not lower through shared IR");
+  Check(Common::ContainsStr(result.ir_dump, "BitwiseXnorU32 v86, v5, v6"),
+        "VOP3-encoded V_XNOR_B32 did not lower through shared IR");
+  Check(Common::ContainsStr(result.ir_dump, "FMadF32 v96, v6, v6, v96"),
+        "VOP3-encoded V_MAC_F32 did not lower with the destination register as "
+        "addend");
+  Check(Common::ContainsStr(result.ir_dump,
+                            "IAddCarryU32 v98, s30, v5, v6, vcc_lo"),
+        "VOP3-encoded V_ADD_CO_U32 did not lower to carry-add IR");
+  Check(Common::ContainsStr(result.ir_dump, "MaskedBitCountLowU32 v87, v5, v6"),
+        "VOP3-encoded V_MBCNT_LO_U32_B32 did not lower through shared IR");
+  Check(
+      Common::ContainsStr(result.ir_dump, "MaskedBitCountHighU32 v88, v5, v6"),
+      "VOP3-encoded V_MBCNT_HI_U32_B32 did not lower through shared IR");
+  Check(Common::ContainsStr(result.ir_dump, "MoveU32 v23"),
+        "VOP3-encoded VOP1 move did not lower through shared IR");
+  Check(Common::ContainsStr(result.ir_dump, "ReadFirstLaneU32 s25, v5"),
+        "VOP3-encoded V_READFIRSTLANE_B32 did not lower through shared IR");
+  Check(Common::ContainsStr(result.ir_dump, "ReadLaneU32 s26, v5, 0x00000002"),
+        "V_READLANE_B32 did not lower to subgroup lane IR");
+  Check(
+      Common::ContainsStr(result.ir_dump, "WriteLaneU32 v107, v5, 0x00000002"),
+      "V_WRITELANE_B32 did not lower to subgroup lane IR");
+  Check(Common::ContainsStr(result.ir_dump,
+                            "Permlane16B32 v108, v5, 0x00000000, 0x00000000"),
+        "V_PERMLANE16_B32 did not lower to subgroup perm-lane IR");
+  Check(Common::ContainsStr(result.ir_dump,
+                            "Permlanex16B32 v109, v5, 0x00000000, 0x00000000"),
+        "V_PERMLANEX16_B32 did not lower to subgroup perm-lane IR");
+  Check(Common::ContainsStr(result.ir_dump, "ConvertI32ToF32 v24"),
+        "VOP3-encoded VOP1 signed conversion did not lower through shared IR");
+  Check(Common::ContainsStr(result.ir_dump, "ConvertFloorF32ToI32 v74, v6"),
+        "VOP3-encoded V_CVT_FLR_I32_F32 did not lower through shared IR");
+  Check(Common::ContainsStr(result.ir_dump, "ConvertI4ToOffsetF32 v82, v5"),
+        "VOP3-encoded V_CVT_OFF_F32_I4 did not lower through shared IR");
+  Check(Common::ContainsStr(result.ir_dump, "FractF32 v25"),
+        "VOP3-encoded VOP1 fract did not lower through shared IR");
+  Check(Common::ContainsStr(result.ir_dump, "RcpF32 v26"),
+        "VOP3-encoded VOP1 reciprocal did not lower through shared IR");
+  Check(Common::ContainsStr(result.ir_dump, "BitwiseNotU32 v29"),
+        "VOP3-encoded VOP1 not did not lower through shared IR");
+  Check(Common::ContainsStr(result.ir_dump, "BitReverseU32 v30"),
+        "VOP3-encoded VOP1 bit reverse did not lower through shared IR");
+  Check(
+      Common::ContainsStr(result.ir_dump, "FindMsbFromHighU32 v33"),
+      "VOP3-encoded VOP1 find-first-bit-high did not lower through shared IR");
+  Check(Common::ContainsStr(result.ir_dump, "FindLsbU32 v34"),
+        "VOP3-encoded VOP1 find-first-bit-low did not lower through shared IR");
+  Check(Common::ContainsStr(result.ir_dump, "CompareGtF32"),
+        "VOPC float compare did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "CompareMaskGtF32 exec_lo"),
+        "VOPC float compare-and-mask did not lower to exec mask IR");
+  Check(Common::ContainsStr(result.ir_dump, "CompareMaskGtU32 exec_lo"),
+        "VOPC uint compare-and-mask did not lower to exec mask IR");
+  Check(Common::ContainsStr(result.ir_dump, "CompareFalse vcc_lo, v6, v6"),
+        "VOPC false compare did not lower to shared IR");
+  Check(Common::ContainsStr(result.ir_dump, "CompareTrue vcc_lo, v6, v6"),
+        "VOPC true compare did not lower to shared IR");
+  Check(Common::ContainsStr(result.ir_dump, "CompareOrderedF32 vcc_lo, v6, v6"),
+        "VOPC ordered compare did not lower to shared IR");
+  Check(
+      Common::ContainsStr(result.ir_dump, "CompareUnorderedF32 vcc_lo, v6, v6"),
+      "VOPC unordered compare did not lower to shared IR");
+  Check(Common::ContainsStr(result.ir_dump, "CompareUnordLtF32 vcc_lo, v6, v6"),
+        "VOPC unordered-less compare did not lower to shared IR");
+  Check(Common::ContainsStr(result.ir_dump, "CompareUnordEqF32 vcc_lo, v6, v6"),
+        "VOPC unordered-equal compare did not lower to shared IR");
+  Check(Common::ContainsStr(result.ir_dump, "CompareUnordLeF32 vcc_lo, v6, v6"),
+        "VOPC unordered-less-equal compare did not lower to shared IR");
+  Check(Common::ContainsStr(result.ir_dump, "CompareUnordGtF32 vcc_lo, v6, v6"),
+        "VOPC unordered-greater compare did not lower to shared IR");
+  Check(Common::ContainsStr(result.ir_dump, "CompareUnordNeF32 vcc_lo, v6, v6"),
+        "VOPC unordered-not-equal compare did not lower to shared IR");
+  Check(Common::ContainsStr(result.ir_dump,
+                            "CompareUnordNeF32 s0, 0x3f000000, v1"),
+        "VOPC SDWA unordered-not-equal compare did not lower to "
+        "scalar-destination IR");
+  Check(Common::ContainsStr(result.ir_dump, "CompareUnordGeF32 vcc_lo, v6, v6"),
+        "VOPC unordered-greater-equal compare did not lower to shared IR");
+  Check(Common::ContainsStr(result.ir_dump,
+                            "CompareMaskUnordLtF32 exec_lo, v6, v6"),
+        "VOPC unordered-less compare-and-mask did not lower to shared IR");
+  Check(Common::ContainsStr(result.ir_dump,
+                            "CompareMaskUnordEqF32 exec_lo, v6, v6"),
+        "VOPC unordered-equal compare-and-mask did not lower to shared IR");
+  Check(
+      Common::ContainsStr(result.ir_dump,
+                          "CompareMaskUnordLeF32 exec_lo, v6, v6"),
+      "VOPC unordered-less-equal compare-and-mask did not lower to shared IR");
+  Check(Common::ContainsStr(result.ir_dump,
+                            "CompareMaskUnordGtF32 exec_lo, v6, v6"),
+        "VOPC unordered-greater compare-and-mask did not lower to shared IR");
+  Check(Common::ContainsStr(result.ir_dump,
+                            "CompareMaskUnordNeF32 exec_lo, v6, v6"),
+        "VOPC unordered-not-equal compare-and-mask did not lower to shared IR");
+  Check(Common::ContainsStr(result.ir_dump,
+                            "CompareMaskUnordGeF32 exec_lo, v6, v6"),
+        "VOPC unordered-greater-equal compare-and-mask did not lower to shared "
+        "IR");
+  Check(Common::ContainsStr(result.ir_dump, "CompareFalse vcc_lo, v5, v5"),
+        "VOPC integer false compare did not lower to shared IR");
+  Check(Common::ContainsStr(result.ir_dump, "CompareTrue vcc_lo, v5, v5"),
+        "VOPC integer true compare did not lower to shared IR");
+  Check(Common::ContainsStr(result.ir_dump, "FMadF32 v8"),
+        "VOP3 mad did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "FMadF32 v4, v1.neg, v9, s4"),
+        "VOP3 mad source modifiers did not lower to IR metadata");
+  Check(Common::ContainsStr(result.ir_dump, "CubeIdF32 v110, v5, v6, v7"),
+        "V_CUBEID_F32 did not lower to cube IR");
+  Check(Common::ContainsStr(result.ir_dump, "CubeScF32 v111, v5, v6, v7"),
+        "V_CUBESC_F32 did not lower to cube IR");
+  Check(Common::ContainsStr(result.ir_dump, "CubeTcF32 v112, v5, v6, v7"),
+        "V_CUBETC_F32 did not lower to cube IR");
+  Check(Common::ContainsStr(result.ir_dump, "CubeMaF32 v113, v5, v6, v7"),
+        "V_CUBEMA_F32 did not lower to cube IR");
+  Check(Common::ContainsStr(result.ir_dump, "CubeMaF32 v5, v2, v0, v6.neg"),
+        "V_CUBEMA_F32 source modifier did not lower to cube IR");
+  Check(Common::ContainsStr(result.ir_dump, "FMadF32 v37"),
+        "VOP3 fma did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "FMin3F32 v38"),
+        "VOP3 min3 did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "FMax3F32 v39"),
+        "VOP3 max3 did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "FMed3F32 v40"),
+        "VOP3 med3 did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "IMin3I32 v41"),
+        "VOP3 signed min3 did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "UMin3U32 v42"),
+        "VOP3 unsigned min3 did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "IMax3I32 v43"),
+        "VOP3 signed max3 did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "UMax3U32 v44"),
+        "VOP3 unsigned max3 did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "IMed3I32 v45"),
+        "VOP3 signed med3 did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "UMed3U32 v46"),
+        "VOP3 unsigned med3 did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "BitFieldExtract3U32 v47"),
+        "VOP3 unsigned bitfield extract did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "BitFieldExtract3I32 v48"),
+        "VOP3 signed bitfield extract did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "BitFieldInsertSelectU32 v49"),
+        "VOP3 bitfield insert-select did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "AlignBitU32 v50"),
+        "VOP3 alignbit did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "AlignByteU32 v115"),
+        "VOP3 alignbyte did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "IAdd3U32 v51"),
+        "VOP3 add3 did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "IMulU32 v52, v5, v6"),
+        "V_MUL_LO_U32 did not lower to multiply IR");
+  Check(Common::ContainsStr(result.ir_dump, "UMulHighU32 v53, v5, v6"),
+        "V_MUL_HI_U32 did not lower to high-multiply IR");
+  Check(Common::ContainsStr(result.ir_dump, "SMulHighI32 v114, v5, v6"),
+        "V_MUL_HI_I32 did not lower to signed high-multiply IR");
+  Check(Common::ContainsStr(result.ir_dump, "BitwiseAndOrU32 v54, v5, v6, v7"),
+        "V_AND_OR_B32 did not lower to ternary bitwise IR");
+  Check(Common::ContainsStr(result.ir_dump, "BitwiseOr3U32 v55, v5, v6, v7"),
+        "V_OR3_B32 did not lower to ternary bitwise IR");
+  Check(Common::ContainsStr(result.ir_dump, "BitwiseXor3U32 v56, v5, v6, v7"),
+        "V_XOR3_B32 did not lower to ternary bitwise IR");
+  Check(Common::ContainsStr(result.ir_dump, "ShiftLeftAddU32 v57, v5, v6, v7"),
+        "V_LSHL_ADD_U32 did not lower to shared shift-left-add IR");
+  Check(Common::ContainsStr(result.ir_dump, "AddShiftLeftU32 v58, v5, v6, v7"),
+        "V_ADD_LSHL_U32 did not lower to add-shift-left IR");
+  Check(Common::ContainsStr(result.ir_dump, "XorAddU32 v59, v5, v6, v7"),
+        "V_XAD_U32 did not lower to xor-add IR");
+  Check(Common::ContainsStr(result.ir_dump, "ShiftLeftOrU32 v60, v5, v6, v7"),
+        "V_LSHL_OR_B32 did not lower to shift-left-or IR");
+  Check(Common::ContainsStr(result.ir_dump, "SadU32 v61, v5, v6, v7"),
+        "V_SAD_U32 did not lower to sad IR");
+  Check(Common::ContainsStr(result.ir_dump, "IMadI24U32 v62, v5, v6, v7"),
+        "V_MAD_I32_I24 did not lower to signed 24-bit mad IR");
+  Check(Common::ContainsStr(result.ir_dump, "UMadU24U32 v63, v5, v6, v7"),
+        "V_MAD_U32_U24 did not lower to unsigned 24-bit mad IR");
+  Check(Common::ContainsStr(result.ir_dump, "IMulU32 v69, v5, v6"),
+        "V_MUL_LO_I32 did not lower to multiply IR");
+  Check(Common::ContainsStr(result.ir_dump,
+                            "IAddCarryU32 v70, s0, v5, v6, 0x00000000"),
+        "V_ADD_I32 did not lower to carry-out add IR");
+  Check(Common::ContainsStr(result.ir_dump, "ISubBorrowU32 v71, s0, v5, v6"),
+        "V_SUB_I32 did not lower to borrow-out subtract IR");
+  Check(Common::ContainsStr(result.ir_dump, "ISubBorrowU32 v72, s0, v6, v5"),
+        "V_SUBREV_I32 did not reverse source order in borrow-out IR");
+  Check(Common::ContainsStr(result.ir_dump,
+                            "IMaxI16 v7.sdwa(sel=4,sext=0), 0x0000ffff, "
+                            "v5.opsel(lo=1,hi=0,neghi=0)"),
+        "V_MAX_I16 did not lower to signed halfword max IR");
+  Check(Common::ContainsStr(result.ir_dump,
+                            "IMinI16 v7.sdwa(sel=5,sext=0), 0x00000002, "
+                            "v4.opsel(lo=1,hi=0,neghi=0)"),
+        "V_MIN_I16 did not lower to signed halfword min IR");
+  Check(Common::ContainsStr(result.ir_dump,
+                            "BitFieldMaskU32 v73, 0x00000001, 0x00000004"),
+        "V_BFM_B32 did not lower to shared bitfield-mask IR");
+  Check(Common::ContainsStr(result.ir_dump, "PackF32ToF16Rtz v75, v6, v6"),
+        "V_CVT_PKRTZ_F16_F32 did not lower to shared pack IR");
+  Check(
+      Common::ContainsStr(result.ir_dump, "PackF32ToF16Rtz v0, v0.neg, v1.neg"),
+      "V_CVT_PKRTZ_F16_F32 source modifiers did not lower to shared pack IR");
+  Check(Common::ContainsStr(result.ir_dump, "LdexpF32 v76, v6, 0x00000001"),
+        "V_LDEXP_F32 did not lower to ldexp IR");
+  Check(Common::ContainsStr(result.ir_dump, "LdexpF32 v7, v9.abs, 0xfffffffe"),
+        "V_LDEXP_F32 source modifier did not lower to IR");
+  Check(
+      Common::ContainsStr(result.ir_dump, "LdexpF32 v13.clamp, v6, 0xfffffffc"),
+      "V_LDEXP_F32 clamp modifier did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "BitCountAddU32 v77, v5, v6"),
+        "VOP3 V_BCNT_U32_B32 did not lower to bit-count-add IR");
+  Check(Common::ContainsStr(result.ir_dump, "PackSnorm2x16F32 v78, v6, v6"),
+        "V_CVT_PKNORM_I16_F32 did not lower to shared pack IR");
+  Check(Common::ContainsStr(result.ir_dump, "PackUnorm2x16F32 v79, v6, v6"),
+        "V_CVT_PKNORM_U16_F32 did not lower to shared pack IR");
+  Check(Common::ContainsStr(result.ir_dump, "PackU16U32 v80, v5, v7"),
+        "V_CVT_PK_U16_U32 did not lower to shared pack IR");
+  Check(SpirvContainsOpcode(result.spirv, 112),
+        "SPIR-V binary does not contain OpConvertUToF");
+  Check(SpirvContainsOpcode(result.spirv, 109),
+        "SPIR-V binary does not contain OpConvertFToU");
+  Check(SpirvContainsOpcode(result.spirv, 111),
+        "SPIR-V binary does not contain OpConvertSToF");
+  Check(SpirvContainsOpcode(result.spirv, 110),
+        "SPIR-V binary does not contain OpConvertFToS");
+  Check(SpirvContainsOpcode(result.spirv, 136),
+        "SPIR-V binary does not contain OpFDiv");
+  Check(SpirvContainsOpcode(result.spirv, 127),
+        "SPIR-V binary does not contain OpFNegate");
+  Check(SpirvContainsOpcode(result.spirv, 12),
+        "SPIR-V binary does not contain OpExtInst");
+  Check(SpirvContainsExtInst(result.spirv, 58),
+        "SPIR-V binary does not contain GLSL.std.450 PackHalf2x16");
+  Check(SpirvContainsExtInst(result.spirv, 62),
+        "SPIR-V binary does not contain GLSL.std.450 UnpackHalf2x16");
+  Check(SpirvContainsExtInst(result.spirv, 50),
+        "SPIR-V binary does not contain GLSL.std.450 Fma");
+  Check(SpirvContainsExtInst(result.spirv, 43),
+        "SPIR-V binary does not contain GLSL.std.450 FClamp");
+  Check(SpirvContainsExtInst(result.spirv, 53),
+        "SPIR-V binary does not contain GLSL.std.450 Ldexp");
+  Check(SpirvContainsOpcode(result.spirv, 128),
+        "SPIR-V binary does not contain OpIAdd");
+  Check(SpirvContainsOpcode(result.spirv, 149),
+        "SPIR-V binary does not contain OpIAddCarry");
+  Check(SpirvContainsOpcode(result.spirv, 130),
+        "SPIR-V binary does not contain OpISub");
+  Check(SpirvContainsOpcode(result.spirv, 132),
+        "SPIR-V binary does not contain OpIMul");
+  Check(SpirvContainsOpcode(result.spirv, 171),
+        "SPIR-V binary does not contain OpINotEqual");
+  Check(SpirvContainsOpcode(result.spirv, 200),
+        "SPIR-V binary does not contain OpNot");
+  Check(SpirvContainsOpcode(result.spirv, 204),
+        "SPIR-V binary does not contain OpBitReverse");
+  Check(SpirvContainsOpcode(result.spirv, 205),
+        "SPIR-V binary does not contain OpBitCount");
+  Check(SpirvContainsOpcode(result.spirv, 166),
+        "SPIR-V binary does not contain OpLogicalOr");
+  Check(SpirvContainsOpcode(result.spirv, 167),
+        "SPIR-V binary does not contain OpLogicalAnd");
+  Check(SpirvContainsOpcode(result.spirv, 186),
+        "SPIR-V binary does not contain OpFOrdGreaterThan");
+  Check(SpirvContainsOpcode(result.spirv, 181),
+        "SPIR-V binary does not contain OpFUnordEqual");
+  Check(SpirvContainsOpcode(result.spirv, 183),
+        "SPIR-V binary does not contain OpFUnordNotEqual");
+  Check(SpirvContainsOpcode(result.spirv, 185),
+        "SPIR-V binary does not contain OpFUnordLessThan");
+  Check(SpirvContainsOpcode(result.spirv, 187),
+        "SPIR-V binary does not contain OpFUnordGreaterThan");
+  Check(SpirvContainsOpcode(result.spirv, 189),
+        "SPIR-V binary does not contain OpFUnordLessThanEqual");
+  Check(SpirvContainsOpcode(result.spirv, 191),
+        "SPIR-V binary does not contain OpFUnordGreaterThanEqual");
+  Check(SpirvContainsOpcode(result.spirv, 190),
+        "SPIR-V binary does not contain OpFOrdGreaterThanEqual");
+  Check(SpirvContainsOpcode(result.spirv, 184),
+        "SPIR-V binary does not contain OpFOrdLessThan");
+  Check(SpirvContainsOpcode(result.spirv, 173),
+        "SPIR-V binary does not contain OpSGreaterThan");
+  Check(SpirvContainsOpcode(result.spirv, 174),
+        "SPIR-V binary does not contain OpUGreaterThanEqual");
+  Check(SpirvContainsOpcode(result.spirv, 177),
+        "SPIR-V binary does not contain OpSLessThan");
+  Check(SpirvContainsOpcode(result.spirv, 202),
+        "SPIR-V binary does not contain OpBitFieldSExtract");
+  Check(SpirvContainsOpcode(result.spirv, 203),
+        "SPIR-V binary does not contain OpBitFieldUExtract");
+  Check(SpirvContainsOpcode(result.spirv, 194),
+        "SPIR-V binary does not contain OpShiftRightLogical");
+  Check(SpirvContainsOpcode(result.spirv, 61),
+        "SPIR-V binary does not contain OpLoad for cmpx old exec mask");
+  Check(SpirvContainsOpcode(result.spirv, 133),
+        "SPIR-V binary does not contain OpFMul");
+  Check(SpirvContainsOpcode(result.spirv, 129),
+        "SPIR-V binary does not contain OpFAdd");
+  Check(SpirvContainsOpcode(result.spirv, 151),
+        "SPIR-V binary does not contain OpUMulExtended");
+  Check(SpirvContainsOpcode(result.spirv, 152),
+        "SPIR-V binary does not contain OpSMulExtended");
+  Check(SpirvContainsOpcode(result.spirv, 196),
+        "SPIR-V binary does not contain OpShiftLeftLogical");
+  Check(SpirvContainsOpcode(result.spirv, 197),
+        "SPIR-V binary does not contain OpBitwiseOr");
+  Check(SpirvContainsOpcode(result.spirv, 198),
+        "SPIR-V binary does not contain OpBitwiseXor");
+  Check(SpirvContainsOpcode(result.spirv, 199),
+        "SPIR-V binary does not contain OpBitwiseAnd");
+  Check(SpirvContainsOpcode(result.spirv, 80),
+        "SPIR-V binary does not contain OpCompositeConstruct");
+  Check(SpirvContainsOpcode(result.spirv, 81),
+        "SPIR-V binary does not contain OpCompositeExtract");
+  Check(SpirvContainsOpcode(result.spirv, 339),
+        "SPIR-V binary does not contain OpGroupNonUniformBallot");
+  Check(SpirvContainsOpcode(result.spirv, 343),
+        "SPIR-V binary does not contain OpGroupNonUniformBallotFindLSB");
+  Check(SpirvContainsOpcode(result.spirv, 345),
+        "SPIR-V binary does not contain OpGroupNonUniformShuffle");
+  CheckSpirvBinaryValidates(result.spirv);
 }
 
 void TestNewShaderRecompilerExpandedAluBatch() {
@@ -2113,7 +2431,8 @@ void TestNewShaderRecompilerVop3pPackedF16() {
 	Check(Common::ContainsStr(result.decoded_dump, "v_fma_f16 v122"),
 	      "new decoder did not decode native VOP3 V_FMA_F16");
 	Check(Common::ContainsStr(result.decoded_dump, "v_mad_mixhi_f16 v126.sdwa(sel=5"),
-	      "new decoder did not decode clamped V_MAD_MIXHI_F16 high-half destination");
+	      "new decoder did not decode clamped V_MAD_MIXHI_F16 high-half "
+	      "destination");
 	Check(Common::ContainsStr(result.decoded_dump, "v_fma_f16 v127.sdwa(sel=5"),
 	      "new decoder did not decode clamped native high-half V_FMA_F16");
 	Check(Common::ContainsStr(result.decoded_dump, "v_pack_b32_f16 v26"),
@@ -2159,7 +2478,8 @@ void TestNewShaderRecompilerVop3pPackedF16() {
 	          Common::ContainsStr(result.ir_dump, "v10.opsel(lo=1"),
 	      "V_PACK_B32_F16 source selectors did not lower to IR");
 	Check(Common::ContainsStr(result.ir_dump, "PackedFmaF16 v59, v20, v43, v59"),
-	      "V_PK_FMAC_F16 did not lower using destination as packed FMA accumulator");
+	      "V_PK_FMAC_F16 did not lower using destination as packed FMA "
+	      "accumulator");
 	Check(SpirvContainsExtInst(result.spirv, 62),
 	      "SPIR-V binary does not contain GLSL.std.450 UnpackHalf2x16 for VOP3P");
 	Check(SpirvContainsExtInst(result.spirv, 58),
@@ -2177,7 +2497,8 @@ void TestNewShaderRecompilerVop3pPackedF16() {
 	Check(SpirvContainsOpcode(result.spirv, 184),
 	      "SPIR-V binary does not contain OpFOrdLessThan for VOP3P packed min");
 	Check(SpirvContainsOpcode(result.spirv, 190),
-	      "SPIR-V binary does not contain OpFOrdGreaterThanEqual for VOP3P packed max");
+	      "SPIR-V binary does not contain OpFOrdGreaterThanEqual for VOP3P "
+	      "packed max");
 	Check(SpirvContainsOpcode(result.spirv, 197),
 	      "SPIR-V binary does not contain OpBitwiseOr for VOP3P packed min/max");
 	Check(SpirvContainsOpcode(result.spirv, 199),
@@ -2225,7 +2546,8 @@ void TestNewShaderRecompilerStagedShaderOps() {
 	Check(Common::ContainsStr(result.ir_dump, "ScalarSubBorrowCarryU32 s2, s0, s1, scc"),
 	      "S_SUBB_U32 did not lower to scalar subtract-with-borrow IR");
 	Check(Common::ContainsStr(result.ir_dump, "BitClearU32 s3, s3, s1"),
-	      "S_BITSET0_B32 did not lower to bit-clear IR using the destination as input");
+	      "S_BITSET0_B32 did not lower to bit-clear IR using the destination as "
+	      "input");
 	Check(Common::ContainsStr(result.ir_dump,
 	                          "FmaF16 v70.sdwa(sel=4,sext=0), v5, v6, v70.sdwa(sel=4,sext=0)"),
 	      "V_FMAC_F16 did not lower using the destination as the FMA accumulator");
@@ -2238,7 +2560,8 @@ void TestNewShaderRecompilerStagedShaderOps() {
 	Check(SpirvContainsOpcode(result.spirv, 166),
 	      "SPIR-V binary does not contain OpLogicalOr for S_SUBB_U32 borrow-out");
 	Check(SpirvContainsOpcode(result.spirv, 172),
-	      "SPIR-V binary does not contain OpUGreaterThan for S_SUBB_U32 borrow-out");
+	      "SPIR-V binary does not contain OpUGreaterThan for S_SUBB_U32 "
+	      "borrow-out");
 	Check(SpirvContainsOpcode(result.spirv, 196),
 	      "SPIR-V binary does not contain OpShiftLeftLogical for S_BITSET0_B32");
 	Check(SpirvContainsOpcode(result.spirv, 199),
@@ -2248,9 +2571,11 @@ void TestNewShaderRecompilerStagedShaderOps() {
 	Check(SpirvContainsExtInst(result.spirv, 50),
 	      "SPIR-V binary does not contain GLSL.std.450 Fma for VOP2 F16 FMA ops");
 	Check(SpirvContainsExtInst(result.spirv, 58),
-	      "SPIR-V binary does not contain GLSL.std.450 PackHalf2x16 for VOP2 F16 FMA ops");
+	      "SPIR-V binary does not contain GLSL.std.450 PackHalf2x16 for VOP2 F16 "
+	      "FMA ops");
 	Check(SpirvContainsExtInst(result.spirv, 62),
-	      "SPIR-V binary does not contain GLSL.std.450 UnpackHalf2x16 for VOP2 F16 FMA ops");
+	      "SPIR-V binary does not contain GLSL.std.450 UnpackHalf2x16 for VOP2 "
+	      "F16 FMA ops");
 	CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -2292,7 +2617,8 @@ void TestNewShaderRecompilerBootF16UnaryOpcodes() {
 	      "new decoder did not decode V_TRUNC_F16");
 	Check(Common::ContainsStr(result.decoded_dump, "v_mov_b32 v7, -1") &&
 	          Common::ContainsStr(result.decoded_dump, "v_mov_b32 v8, -1"),
-	      "new decoder did not accept full-width V_MOV_B32 SDWA with DST_U=PRESERVE");
+	      "new decoder did not accept full-width V_MOV_B32 SDWA with "
+	      "DST_U=PRESERVE");
 	Check(!Common::ContainsStr(result.decoded_dump,
 	                           "VOP1 SDWA destination selector is not supported"),
 	      "full-width V_MOV_B32 SDWA with DST_U=PRESERVE was rejected");
@@ -2361,6 +2687,10 @@ void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {
 	    0x0c860688u, // v_add_nc_u32 v5, 8, sign-extended v4.lo
 	    0x4a0c0cf9u,
 	    0x0d860688u, // v_add_nc_u32 v6, 8, sign-extended v6.hi
+	    0x500434f9u,
+	    0x0c860680u, // v_addc_u32 v2, s128, sign-extended v26.lo, vcc_lo
+	    0x7e0470f9u,
+	    0x00040602u, // v_bfrev_b32 v2, zero-extended v2.lo (GTA V)
 	    0xbf810000u,
 	};
 
@@ -2409,6 +2739,15 @@ void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {
 	Check(Common::ContainsStr(result.decoded_dump, "v_add_nc_u32 v6") &&
 	          Common::ContainsStr(result.decoded_dump, "v6.sdwa(sel=5,sext=1"),
 	      "new decoder did not decode V_ADD_NC_U32 SDWA sign-extended high word");
+	Check(Common::ContainsStr(result.decoded_dump, "v_addc_u32 v2") &&
+	          Common::ContainsStr(result.decoded_dump, "v26.sdwa(sel=4,sext=1"),
+	      "new decoder did not decode V_ADDC_U32 SDWA sign-extended low word");
+	Check(Common::ContainsStr(result.decoded_dump, "v_bfrev_b32 v2") &&
+	          Common::ContainsStr(result.decoded_dump, "v2.sdwa(sel=4,sext=0"),
+	      "new decoder did not decode GTA V V_BFREV_B32 SDWA low word");
+	Check(Common::ContainsStr(result.ir_dump, "BitReverseU32 v2") &&
+	          Common::ContainsStr(result.ir_dump, "v2.sdwa(sel=4,sext=0"),
+	      "GTA V V_BFREV_B32 SDWA low word did not lower to IR");
 	Check(!Common::ContainsStr(result.decoded_dump, "unsupported family=VOP2 opcode=0x00"),
 	      "literal/SDWA extension words were decoded as phantom VOP2 instructions");
 	Check(!Common::ContainsStr(result.decoded_dump,
@@ -2431,7 +2770,8 @@ void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {
 	Check(Common::ContainsStr(result.ir_dump, "ConvertU16ToF16 v4.sdwa(sel=5"),
 	      "V_CVT_F16_U16 SDWA did not lower to unsigned U16-to-F16 conversion IR");
 	Check(Common::ContainsStr(result.ir_dump, "ConvertU16ToF16 v16"),
-	      "V_CVT_F16_U16 plain form did not lower to unsigned U16-to-F16 conversion IR");
+	      "V_CVT_F16_U16 plain form did not lower to unsigned U16-to-F16 "
+	      "conversion IR");
 	Check(Common::ContainsStr(result.ir_dump, "ConvertF16ToI16 v4"),
 	      "V_CVT_I16_F16 did not lower to signed F16-to-I16 conversion IR");
 	Check(Common::ContainsStr(result.ir_dump, "ConvertF16ToU16 v15"),
@@ -2442,10 +2782,14 @@ void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {
 	Check(Common::ContainsStr(result.ir_dump, "IAddU32 v6") &&
 	          Common::ContainsStr(result.ir_dump, "v6.sdwa(sel=5,sext=1"),
 	      "V_ADD_NC_U32 SDWA sign-extended high word did not lower to IR");
+	Check(Common::ContainsStr(result.ir_dump, "IAddCarryU32 v2") &&
+	          Common::ContainsStr(result.ir_dump, "v26.sdwa(sel=4,sext=1"),
+	      "V_ADDC_U32 SDWA sign-extended low word did not lower to carry IR");
 	Check(SpirvContainsOpcode(result.spirv, 128),
 	      "SPIR-V binary does not contain OpIAdd for U16 operations");
 	Check(SpirvContainsOpcode(result.spirv, 202),
-	      "SPIR-V binary does not contain OpBitFieldSExtract for SDWA sign extension");
+	      "SPIR-V binary does not contain OpBitFieldSExtract for SDWA sign "
+	      "extension");
 	Check(SpirvContainsOpcode(result.spirv, 130),
 	      "SPIR-V binary does not contain OpISub for I16 operations");
 	Check(SpirvContainsOpcode(result.spirv, 194),
@@ -2463,7 +2807,8 @@ void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {
 	Check(SpirvContainsOpcode(result.spirv, 112),
 	      "SPIR-V binary does not contain OpConvertUToF for V_CVT_F16_U16");
 	Check(SpirvContainsExtInst(result.spirv, 43),
-	      "SPIR-V binary does not contain GLSL.std.450 FClamp for clamped V_PK_MUL_F16");
+	      "SPIR-V binary does not contain GLSL.std.450 FClamp for clamped "
+	      "V_PK_MUL_F16");
 	CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -2623,15 +2968,19 @@ void TestNewShaderRecompilerScalarB64Alu() {
 	Check(SpirvContainsOpcode(result.spirv, 169),
 	      "SPIR-V binary does not contain OpSelect for scalar B64 select");
 	Check(SpirvContainsOpcode(result.spirv, 171),
-	      "SPIR-V binary does not contain OpINotEqual for scalar B64 whole-quad mask");
+	      "SPIR-V binary does not contain OpINotEqual for scalar B64 whole-quad "
+	      "mask");
 	Check(SpirvContainsOpcode(result.spirv, 196),
-	      "SPIR-V binary does not contain OpShiftLeftLogical for scalar B64 shifts");
+	      "SPIR-V binary does not contain OpShiftLeftLogical for scalar B64 "
+	      "shifts");
 	Check(SpirvContainsOpcode(result.spirv, 194),
-	      "SPIR-V binary does not contain OpShiftRightLogical for scalar B64 shifts");
+	      "SPIR-V binary does not contain OpShiftRightLogical for scalar B64 "
+	      "shifts");
 	Check(SpirvContainsOpcode(result.spirv, 201),
 	      "SPIR-V binary does not contain OpBitFieldInsert for scalar B64 mask");
 	Check(SpirvContainsOpcode(result.spirv, 203),
-	      "SPIR-V binary does not contain OpBitFieldUExtract for scalar B64 extract");
+	      "SPIR-V binary does not contain OpBitFieldUExtract for scalar B64 "
+	      "extract");
 	Check(SpirvContainsOpcode(result.spirv, 205),
 	      "SPIR-V binary does not contain OpBitCount for scalar B64 bit count");
 	CheckSpirvBinaryValidates(result.spirv);
@@ -2672,7 +3021,8 @@ void TestNewShaderRecompilerSignedCompareAlu() {
 	Check(Common::ContainsStr(result.decoded_dump, "v_cmp_lt_i16"),
 	      "new decoder did not decode VOPC signed halfword less-than compare");
 	Check(Common::ContainsStr(result.decoded_dump, "v_cmp_ge_i16"),
-	      "new decoder did not decode VOPC signed halfword greater-or-equal compare");
+	      "new decoder did not decode VOPC signed halfword greater-or-equal "
+	      "compare");
 	Check(Common::ContainsStr(result.decoded_dump, "v_cmp_lt_u16"),
 	      "new decoder did not decode VOPC unsigned halfword less-than compare");
 	Check(Common::ContainsStr(result.decoded_dump, "v_cmpx_gt_i32"),
@@ -2920,6 +3270,34 @@ void TestNewShaderRecompilerMemoryFamilyLowering() {
 	CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerGlcBufferLoadVisibility() {
+	const uint32_t shader[] = {
+	    EncodeMubuf0(0x0c, 0, true, true),
+	    EncodeMubuf1(0, 0, 1), // buffer_load_dword v0 glc
+	    EncodeSopp(0x01, 0),
+	};
+
+	ShaderRecompiler::CompileOptions options;
+	options.stage   = ShaderType::Compute;
+	options.dump_ir = true;
+
+	ShaderRecompiler::CompileResult result;
+	std::string                     error;
+	Check(ShaderRecompiler::TryRecompile(shader, options, &result, &error), error.c_str());
+	Check(Common::ContainsStr(result.ir_dump, "BufferLoadDword v0") &&
+	          Common::ContainsStr(result.ir_dump, "glc=1"),
+	      "GLC buffer load metadata did not reach native IR");
+	Check(SpirvHasVolatileLoad(result.spirv),
+	      "GLC buffer load did not emit a volatile SPIR-V load");
+	Check(SpirvHasMemberDecoration(result.spirv, 23u),
+	      "GLC buffer load did not make storage-buffer memory coherent");
+	Check(SpirvContainsOpcode(result.spirv, 225u),
+	      "GLC buffer load did not acquire device-visible buffer memory");
+	Check(!SpirvContainsOpcode(result.spirv, 227u),
+	      "ordinary GLC dword load was incorrectly strengthened to an atomic qword load");
+	CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerImageQueryLowering() {
 	const uint32_t shader[] = {
 	    EncodeMimg0(0x60, 0x3),
@@ -3040,19 +3418,24 @@ void TestNewShaderRecompilerImageSampleVariants() {
 	Check(Common::ContainsStr(result.ir_dump, "image_flags=0x4"),
 	      "derivative sample flag did not survive into IR memory metadata");
 	Check(Common::ContainsStr(result.ir_dump, "image_addr=6"),
-	      "derivative sample address width did not survive into IR memory metadata");
+	      "derivative sample address width did not survive into IR memory "
+	      "metadata");
 	Check(Common::ContainsStr(result.ir_dump, "image_addr=7"),
-	      "compare+derivative sample address width did not survive into IR memory metadata");
+	      "compare+derivative sample address width did not survive into IR "
+	      "memory metadata");
 	Check(Common::ContainsStr(result.ir_dump, "image_flags=0x80"),
 	      "MIMG A16 bit did not survive into IR memory metadata");
 	Check(SpirvContainsOpcode(result.spirv, 88),
-	      "SPIR-V binary does not contain shared OpImageSampleExplicitLod emission");
+	      "SPIR-V binary does not contain shared OpImageSampleExplicitLod "
+	      "emission");
 	Check(SpirvContainsOpcode(result.spirv, 90),
-	      "SPIR-V binary does not contain shared OpImageSampleDrefExplicitLod emission");
+	      "SPIR-V binary does not contain shared OpImageSampleDrefExplicitLod "
+	      "emission");
 	Check(SpirvContainsOpcode(result.spirv, 202),
 	      "SPIR-V binary does not contain packed offset extraction");
 	Check(SpirvContainsOpcode(result.spirv, 80),
-	      "SPIR-V binary does not contain coordinate/gradient composite construction");
+	      "SPIR-V binary does not contain coordinate/gradient composite "
+	      "construction");
 	Check(SpirvContainsExtInst(result.spirv, 62),
 	      "SPIR-V binary does not unpack A16 image address halves");
 	CheckSpirvBinaryValidates(result.spirv);
@@ -3079,7 +3462,8 @@ void TestNewShaderRecompilerImageSampleA16SamplerCoords() {
 	Check(compiled, error.c_str());
 	Check(
 	    Common::ContainsStr(result.decoded_dump, "image_dim=3d sample_flags=a16 addr_components=3"),
-	    "3D IMAGE_SAMPLE with MIMG A16 bit did not decode as three A16 sampler coords");
+	    "3D IMAGE_SAMPLE with MIMG A16 bit did not decode as three A16 sampler "
+	    "coords");
 	Check(Common::ContainsStr(result.ir_dump, "ImageSample v8"),
 	      "3D A16 IMAGE_SAMPLE did not lower to sample IR");
 	Check(Common::ContainsStr(result.ir_dump, "image_flags=0x80"),
@@ -3089,7 +3473,8 @@ void TestNewShaderRecompilerImageSampleA16SamplerCoords() {
 	Check(Common::ContainsStr(result.ir_dump, "image_addr=3"),
 	      "3D A16 IMAGE_SAMPLE did not preserve three logical address components");
 	Check(SpirvExtInstCount(result.spirv, 62) == 3,
-	      "sampler A16 xyz coordinates should be converted from three packed f16 components");
+	      "sampler A16 xyz coordinates should be converted from three packed f16 "
+	      "components");
 	Check(SpirvContainsOpcode(result.spirv, 194),
 	      "sampler A16 high-half coordinate extraction is missing");
 	Check(SpirvContainsOpcode(result.spirv, 199),
@@ -3134,7 +3519,8 @@ void TestNewShaderRecompilerImageSampleOpcodeAliases() {
 	Check(!Common::ContainsStr(result.decoded_dump, "a16"),
 	      "A16 must come from MIMG bit 62, not from the opcode alias");
 	Check(!SpirvContainsExtInst(result.spirv, 62),
-	      "opcode aliases without bit 62 must not unpack sampled f16 address halves");
+	      "opcode aliases without bit 62 must not unpack sampled f16 address "
+	      "halves");
 	CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -3169,7 +3555,8 @@ void TestNewShaderRecompilerImageSampleA16ExceptionComponents() {
 		Check(SpirvInstructionOpcodeCount(result.spirv, 90) == 1,
 		      "A16 IMAGE_SAMPLE_C should emit one dref sample");
 		Check(SpirvExtInstCount(result.spirv, 62) == 2,
-		      "PCF reference must remain 32-bit while only xy sampler coords use A16");
+		      "PCF reference must remain 32-bit while only xy sampler coords use "
+		      "A16");
 	}
 
 	{
@@ -3272,7 +3659,8 @@ void TestNewShaderRecompilerImageLoadA16UintCoords() {
 	Check(Common::ContainsStr(result.ir_dump, "image_addr=2"),
 	      "A16 IMAGE_LOAD did not preserve logical address component count");
 	Check(!SpirvContainsExtInst(result.spirv, 62),
-	      "image ops without sampler use u16 A16 addresses and must not unpack f16");
+	      "image ops without sampler use u16 A16 addresses and must not unpack "
+	      "f16");
 	Check(SpirvContainsOpcode(result.spirv, 194),
 	      "u16 A16 high-half coordinate extraction is missing");
 	Check(SpirvContainsOpcode(result.spirv, 199), "u16 A16 low-half coordinate masking is missing");
@@ -3455,7 +3843,8 @@ void TestNewShaderRecompilerImageGatherVariants() {
 	      "IMAGE_GATHER4_C_O did not expose compare+offset sample metadata");
 	Check(Common::ContainsStr(result.decoded_dump,
 	                          "sample_flags=compare|offset|level_zero addr_components=4"),
-	      "IMAGE_GATHER4_C_LZ_O did not expose compare+offset+level-zero sample metadata");
+	      "IMAGE_GATHER4_C_LZ_O did not expose compare+offset+level-zero sample "
+	      "metadata");
 	Check(Common::ContainsStr(result.ir_dump, "ImageGather4 v60"),
 	      "IMAGE_GATHER4_LZ did not lower to shared IR ImageGather4");
 	Check(Common::ContainsStr(result.ir_dump, "ImageGather4 v64"),
@@ -3527,7 +3916,8 @@ void TestNewShaderRecompilerImageLoadVariants() {
 	Check(Common::ContainsStr(result.ir_dump, "data_dwords=2"),
 	      "image_load dmask xy did not preserve two-component result metadata");
 	Check(Common::ContainsStr(result.ir_dump, "data_dwords=4"),
-	      "image_load_mip dmask xyzw did not preserve four-component result metadata");
+	      "image_load_mip dmask xyzw did not preserve four-component result "
+	      "metadata");
 	Check(Common::ContainsStr(result.ir_dump, "image_addr=3 image_mip=1"),
 	      "image_load_mip did not preserve mip address component metadata");
 	Check(SpirvContainsOpcode(result.spirv, 95), "SPIR-V binary does not contain OpImageFetch");
@@ -3667,11 +4057,14 @@ void TestNewShaderRecompilerStorageImage2DDescriptorOverridesMimg3D() {
 
 	const auto source = DisassembleSpirvBinary(result.spirv);
 	Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "textures2D_L"),
-	      "2D descriptor storage image store did not access the base storage binding");
+	      "2D descriptor storage image store did not access the base storage "
+	      "binding");
 	Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "textures2D_L_A"),
-	      "2D descriptor storage image store unexpectedly used the array storage binding");
+	      "2D descriptor storage image store unexpectedly used the array storage "
+	      "binding");
 	Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "textures2D_L_3D"),
-	      "2D descriptor storage image store unexpectedly used the 3D storage binding");
+	      "2D descriptor storage image store unexpectedly used the 3D storage "
+	      "binding");
 }
 
 void TestNewShaderRecompilerImageAtomicLowering() {
@@ -3826,7 +4219,8 @@ void TestNewShaderRecompilerVintrpLowering() {
 	      error.c_str());
 	Check(ProgramInputCount(duplicate_result.program,
 	                        ShaderRecompiler::IR::StageInputKind::Parameter) == 2,
-	      "duplicate-location VINTRP shader did not reflect both raw parameter attrs");
+	      "duplicate-location VINTRP shader did not reflect both raw parameter "
+	      "attrs");
 	Check(SpirvDecorationValueCount(duplicate_result.spirv, 30u, 0u) == 1,
 	      "duplicate-location VINTRP emitted more than one Location 0 input");
 	Check(SpirvDecorationValueCount(duplicate_result.spirv, 30u, 1u) == 1,
@@ -4062,7 +4456,8 @@ void TestNewShaderRecompilerBufferSignedLoadLowering() {
 	      "buffer_load_sshort did not lower to signed short IR load");
 	Check(SpirvContainsOpcode(result.spirv, 61), "SPIR-V binary does not contain OpLoad");
 	Check(SpirvContainsOpcode(result.spirv, 195),
-	      "SPIR-V binary does not contain OpShiftRightArithmetic for sign extension");
+	      "SPIR-V binary does not contain OpShiftRightArithmetic for sign "
+	      "extension");
 	Check(SpirvContainsOpcode(result.spirv, 196),
 	      "SPIR-V binary does not contain OpShiftLeftLogical for sign extension");
 	Check(SpirvContainsOpcode(result.spirv, 199), "SPIR-V binary does not contain OpBitwiseAnd");
@@ -4345,7 +4740,8 @@ void TestNewShaderRecompilerFlatSignedLoadLowering() {
 	      "signed global load did not preserve global metadata");
 	Check(SpirvContainsOpcode(result.spirv, 61), "SPIR-V binary does not contain OpLoad");
 	Check(SpirvContainsOpcode(result.spirv, 195),
-	      "SPIR-V binary does not contain OpShiftRightArithmetic for sign extension");
+	      "SPIR-V binary does not contain OpShiftRightArithmetic for sign "
+	      "extension");
 	Check(SpirvContainsOpcode(result.spirv, 196),
 	      "SPIR-V binary does not contain OpShiftLeftLogical for sign extension");
 	Check(SpirvContainsOpcode(result.spirv, 199), "SPIR-V binary does not contain OpBitwiseAnd");
@@ -4422,7 +4818,8 @@ void TestNewShaderRecompilerFlatStoreLowering() {
 	Check(SpirvContainsOpcode(result.spirv, 65), "SPIR-V binary does not contain OpAccessChain");
 	Check(SpirvContainsOpcode(result.spirv, 62), "SPIR-V binary does not contain OpStore");
 	Check(SpirvContainsOpcode(result.spirv, 197),
-	      "SPIR-V binary does not contain OpBitwiseOr for sub-dword flat store merge");
+	      "SPIR-V binary does not contain OpBitwiseOr for sub-dword flat store "
+	      "merge");
 	Check(SpirvContainsOpcode(result.spirv, 200),
 	      "SPIR-V binary does not contain OpNot for sub-dword flat store mask");
 	CheckSpirvBinaryValidates(result.spirv);
@@ -4432,6 +4829,8 @@ void TestNewShaderRecompilerAtomicLowering() {
 	const uint32_t shader[] = {
 	    EncodeMubuf0(0x30, 4, true, true),
 	    EncodeMubuf1(0, 0, 1), // buffer_atomic_swap
+	    EncodeMubuf0(0x50, 44, true, true),
+	    EncodeMubuf1(25, 0, 1), // buffer_atomic_swap_x2
 	    EncodeMubuf0(0x32, 8, true, true),
 	    EncodeMubuf1(1, 0, 1), // buffer_atomic_add
 	    EncodeMubuf0(0x33, 12, true, true),
@@ -4450,6 +4849,8 @@ void TestNewShaderRecompilerAtomicLowering() {
 	    EncodeMubuf1(5, 0, 1), // buffer_atomic_or
 	    EncodeMubuf0(0x3b, 40, true, true),
 	    EncodeMubuf1(6, 0, 1), // buffer_atomic_xor
+	    EncodeMubuf0(0x0d, 52, true, true),
+	    EncodeMubuf1(27, 0, 1), // buffer_load_dwordx2 glc from the qword-atomic resource
 	    EncodeDs0(0x00),
 	    EncodeDs1(0, 2, 1), // ds_add_u32
 	    EncodeDs0(0x01),
@@ -4494,6 +4895,8 @@ void TestNewShaderRecompilerAtomicLowering() {
 	Check(ShaderRecompiler::TryRecompile(shader, options, &result, &error), error.c_str());
 	Check(Common::ContainsStr(result.decoded_dump, "buffer_atomic_swap"),
 	      "new decoder did not decode buffer atomic swap");
+	Check(Common::ContainsStr(result.decoded_dump, "buffer_atomic_swap_x2"),
+	      "new decoder did not decode 64-bit buffer atomic swap");
 	Check(Common::ContainsStr(result.decoded_dump, "buffer_atomic_add"),
 	      "new decoder did not decode buffer atomic add");
 	Check(Common::ContainsStr(result.decoded_dump, "buffer_atomic_sub"),
@@ -4518,6 +4921,8 @@ void TestNewShaderRecompilerAtomicLowering() {
 	      "new decoder did not decode DS atomic add-return");
 	Check(Common::ContainsStr(result.ir_dump, "AtomicSwapU32 v0"),
 	      "buffer atomic swap did not lower to IR");
+	Check(Common::ContainsStr(result.ir_dump, "AtomicSwapU64 v25"),
+	      "64-bit buffer atomic swap did not lower to indivisible IR");
 	Check(Common::ContainsStr(result.ir_dump, "AtomicAddU32 v1"),
 	      "buffer atomic add did not lower to IR");
 	Check(Common::ContainsStr(result.ir_dump, "AtomicSubU32 v7"),
@@ -4570,6 +4975,20 @@ void TestNewShaderRecompilerAtomicLowering() {
 	      "DS write-exchange-return did not lower to shared atomic swap IR");
 	Check(SpirvContainsOpcode(result.spirv, 229),
 	      "SPIR-V binary does not contain OpAtomicExchange");
+	Check(SpirvAtomicUsesMemorySemantics(result.spirv, 229, 64, 0x48),
+	      "buffer atomic exchange does not use acquire-release UniformMemory semantics");
+	Check(SpirvAtomicUsesMemorySemantics(result.spirv, 227, 64, 0x42),
+	      "matched GLC dword-pair load does not use acquire UniformMemory semantics");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 227) == 1,
+	      "matched GLC dword-pair load was not emitted as one native OpAtomicLoad");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 229) == 3,
+	      "64-bit buffer exchange was not emitted as one native OpAtomicExchange");
+	Check(SpirvContainsCapability(result.spirv, 11),
+	      "64-bit atomic SPIR-V binary does not declare Int64");
+	Check(SpirvContainsCapability(result.spirv, 12),
+	      "64-bit atomic SPIR-V binary does not declare Int64Atomics");
+	Check(SpirvHasDecoration(result.spirv, 20),
+	      "overlapping uint32/uint64 buffer views are not decorated Aliased");
 	Check(SpirvContainsOpcode(result.spirv, 234), "SPIR-V binary does not contain OpAtomicIAdd");
 	Check(SpirvContainsOpcode(result.spirv, 235), "SPIR-V binary does not contain OpAtomicISub");
 	Check(SpirvContainsOpcode(result.spirv, 236), "SPIR-V binary does not contain OpAtomicSMin");
@@ -4985,22 +5404,89 @@ void TestNewShaderRecompilerCfgPostEndTargetMergePS() {
 	      "post-end branch target was not decoded");
 	Check(Common::ContainsStr(result.ir_dump, "mode=structured"),
 	      "post-end terminal branch should stay on structured path");
-	Check(Common::ContainsStr(result.ir_dump, "pc=0x0000000c"),
-	      "post-end branch target did not reach IR blocks");
-	Check(!Common::ContainsStr(result.ir_dump, "conditional block 0 has no structured merge"),
-	      "known post-end PS branch shape still reports missing merge");
-	Check(SpirvContainsOpcode(result.spirv, 247),
-	      "post-end terminal branch SPIR-V lacks OpSelectionMerge");
-	CheckSpirvBinaryValidates(result.spirv);
+        Check(Common::ContainsStr(result.ir_dump, "pc=0x0000000c"),
+              "post-end branch target did not reach IR blocks");
+        Check(
+            !Common::ContainsStr(result.ir_dump,
+                                 "conditional block 0 has no structured merge"),
+            "known post-end PS branch shape still reports missing merge");
+        Check(SpirvContainsOpcode(result.spirv, 247),
+              "post-end terminal branch SPIR-V lacks OpSelectionMerge");
+        CheckSpirvBinaryValidates(result.spirv);
 }
 
 void TestNewShaderRecompilerCfgLoopBreakContinue() {
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 128),       // s0 = 0
+      EncodeSopc(0x0a, 0, 129),    // s_cmp_lt_u32 s0, 1
+      EncodeSopp(0x04, 2),         // break when scc == 0
+      EncodeSop2(0x00, 0, 0, 129), // s_add_u32 s0, s0, 1
+      EncodeSopp(0x02, 0xfffcu),   // continue/backedge
+      0xbf810000u,
+  };
+
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.dump_ir = true;
+
+  ShaderRecompiler::CompileResult result;
+  std::string error;
+  Check(ShaderRecompiler::TryRecompile(shader, options, &result, &error),
+        error.c_str());
+  Check(Common::ContainsStr(result.ir_dump, "backedge"),
+        "loop backedge was not detected");
+  Check(Common::ContainsStr(result.ir_dump, "loop_header=1"),
+        "loop header was not marked");
+  Check(Common::ContainsStr(result.ir_dump, "continue="),
+        "loop continue block was not identified");
+  Check(SpirvContainsOpcode(result.spirv, 246),
+        "loop SPIR-V lacks OpLoopMerge");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgLoopLatchBreakSharesMerge() {
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 0),    // loop header condition
+      EncodeSopp(0x04, 4),       // header exit -> end
+      EncodeSMovB32(1, 129),     // loop body
+      EncodeSopc(0x06, 1, 1),    // latch break condition
+      EncodeSopp(0x05, 1),       // latch exit -> same loop merge
+      EncodeSopp(0x02, 0xfffau), // backedge -> loop header
+      0xbf810000u,
+  };
+
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.dump_ir = true;
+
+  ShaderRecompiler::CompileResult result;
+  std::string error;
+  Check(ShaderRecompiler::TryRecompile(shader, options, &result, &error),
+        error.c_str());
+  Check(Common::ContainsStr(result.ir_dump, "mode=structured"),
+        "loop latch break incorrectly selected dispatcher fallback");
+  Check(!Common::ContainsStr(result.ir_dump,
+                             "shared merge splitting exceeded budget") &&
+            !Common::ContainsStr(result.ir_dump,
+                                 "duplicate structured merge block"),
+        "loop latch break claimed the loop merge as a selection merge");
+  Check(SpirvContainsOpcode(result.spirv, 246),
+        "loop latch break SPIR-V lacks OpLoopMerge");
+  Check(!SpirvContainsOpcode(result.spirv, 251),
+        "loop latch break unexpectedly used dispatcher OpSwitch");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgConditionalLoopHeaderSplit() {
 	const uint32_t shader[] = {
-	    EncodeSMovB32(0, 128),       // s0 = 0
-	    EncodeSopc(0x0a, 0, 129),    // s_cmp_lt_u32 s0, 1
-	    EncodeSopp(0x04, 2),         // break when scc == 0
-	    EncodeSop2(0x00, 0, 0, 129), // s_add_u32 s0, s0, 1
-	    EncodeSopp(0x02, 0xfffcu),   // continue/backedge
+	    EncodeSMovB32(0, 128),       // preheader: s0 = 0
+	    EncodeSopc(0x06, 1, 1),      // loop header also starts an internal selection
+	    EncodeSopp(0x05, 1),         // skip the optional body instruction
+	    EncodeSMovB32(2, 129),       // optional body
+	    EncodeSop2(0x00, 0, 0, 129), // join: s0++
+	    EncodeSopc(0x0a, 0, 130),    // loop while s0 < 2
+	    EncodeSopp(0x04, 1),         // exit
+	    EncodeSopp(0x02, 0xfff9u),   // backedge -> conditional loop header
 	    0xbf810000u,
 	};
 
@@ -5011,34 +5497,53 @@ void TestNewShaderRecompilerCfgLoopBreakContinue() {
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
 	Check(ShaderRecompiler::TryRecompile(shader, options, &result, &error), error.c_str());
-	Check(Common::ContainsStr(result.ir_dump, "backedge"), "loop backedge was not detected");
-	Check(Common::ContainsStr(result.ir_dump, "loop_header=1"), "loop header was not marked");
-	Check(Common::ContainsStr(result.ir_dump, "continue="),
-	      "loop continue block was not identified");
-	Check(SpirvContainsOpcode(result.spirv, 246), "loop SPIR-V lacks OpLoopMerge");
+	Check(Common::ContainsStr(result.ir_dump, "mode=structured"),
+	      "conditional loop header did not stay on the structured path");
+	bool found_split_header = false;
+	for (const auto& block: result.program.blocks) {
+		const auto successor = block.terminator.true_block;
+		if (!block.terminator.loop_header ||
+		    block.terminator.kind != ShaderRecompiler::CFG::TerminatorKind::Branch ||
+		    !block.instructions.empty() || successor >= result.program.blocks.size()) {
+			continue;
+		}
+		const auto& nested = result.program.blocks[successor];
+		found_split_header =
+		    nested.terminator.kind == ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch &&
+		    nested.terminator.merge_block != UINT32_MAX;
+		if (found_split_header) {
+			break;
+		}
+	}
+	Check(found_split_header,
+	      "conditional loop header did not split into loop and selection headers");
+	Check(SpirvContainsOpcode(result.spirv, 246),
+	      "conditional loop-header SPIR-V lacks OpLoopMerge");
+	Check(SpirvContainsOpcode(result.spirv, 247),
+	      "conditional loop-header SPIR-V lacks the nested OpSelectionMerge");
 	CheckSpirvBinaryValidates(result.spirv);
 }
 
 void TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured() {
-	const uint32_t shader[] = {
-	    EncodeSMovB32(0, 128), // preheader: s0 = 0
-	    EncodeSmem0(0x08, 8, 4),
-	    0u,                          // loop: s_buffer_load_dword s8, s[4:7]
-	    EncodeSop2(0x00, 0, 0, 129), // s_add_u32 s0, s0, 1
-	    EncodeSopc(0x0a, 0, 130),    // s_cmp_lt_u32 s0, 2
-	    EncodeSopp(0x05, 0xfffbu),   // s_cbranch_scc1 loop
-	    0xbf810000u,
-	};
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 128), // preheader: s0 = 0
+      EncodeSmem0(0x08, 8, 4),
+      0u,                          // loop: s_buffer_load_dword s8, s[4:7]
+      EncodeSop2(0x00, 0, 0, 129), // s_add_u32 s0, s0, 1
+      EncodeSopc(0x0a, 0, 130),    // s_cmp_lt_u32 s0, 2
+      EncodeSopp(0x05, 0xfffbu),   // s_cbranch_scc1 loop
+      0xbf810000u,
+  };
 
-	ShaderRecompiler::CompileOptions options;
-	options.stage   = ShaderType::Compute;
-	options.dump_ir = true;
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.dump_ir = true;
 
-	ShaderRecompiler::CompileResult result;
-	std::string                     error;
-	Check(!ShaderRecompiler::TryRecompile(shader, options, &result, &error) &&
-	          Common::ContainsStr(error, "unsupported GPU selection"),
-	      "self-modifying scalar-buffer descriptor should fail explicitly");
+  ShaderRecompiler::CompileResult result;
+  std::string error;
+  Check(!ShaderRecompiler::TryRecompile(shader, options, &result, &error) &&
+            Common::ContainsStr(error, "unsupported GPU selection"),
+        "self-modifying scalar-buffer descriptor should fail explicitly");
 }
 
 void TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher() {
@@ -5058,9 +5563,20 @@ void TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher() {
 
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
-	Check(!ShaderRecompiler::TryRecompile(shader, options, &result, &error) &&
-	          Common::ContainsStr(error, "unsupported GPU selection"),
-	      "self-modifying vector-buffer descriptor should fail explicitly");
+	Check(ShaderRecompiler::TryRecompile(shader, options, &result, &error), error.c_str());
+	Check(result.program.info.buffers.size() == 1 && result.program.info.buffers[0].bindless,
+	      "self-modifying vector-buffer descriptor did not use the bindless path");
+	bool found_live_descriptor = false;
+	for (const auto& block: result.program.blocks) {
+		for (const auto& inst: block.instructions) {
+			if (inst.op == ShaderRecompiler::IR::Opcode::BufferLoadDword) {
+				found_live_descriptor = inst.memory.bindless_sgprs == 0;
+			}
+		}
+	}
+	Check(found_live_descriptor,
+	      "bindless vector-buffer load did not retain its live SGPR descriptor");
+	CheckSpirvBinaryValidates(result.spirv);
 }
 
 void TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeDispatcher() {
@@ -5240,22 +5756,14 @@ void TestNewShaderRecompilerExecMaskHelpers() {
 }
 
 void TestComputeShaderInputWaveSize() {
-	const auto decode_wave_size = [](uint32_t rsrc1) {
-		const bool wave32 = (((rsrc1 >> Pm4::COMPUTE_PGM_RSRC1_W32_EN_SHIFT) &
-		                      Pm4::COMPUTE_PGM_RSRC1_W32_EN_MASK) != 0u);
-		return wave32 ? 32u : 64u;
-	};
-
-	constexpr uint32_t observed_wave32_rsrc1_a = 0x402c0146u;
-	constexpr uint32_t observed_wave32_rsrc1_b = 0x402c00c1u;
-	Check(decode_wave_size(observed_wave32_rsrc1_a) == 32u,
-	      "COMPUTE_PGM_RSRC1 W32_EN bit did not match observed PS5 value A");
-	Check(decode_wave_size(observed_wave32_rsrc1_b) == 32u,
-	      "COMPUTE_PGM_RSRC1 W32_EN bit did not match observed PS5 value B");
-
-	constexpr uint32_t w32_en_bit = 1u << Pm4::COMPUTE_PGM_RSRC1_W32_EN_SHIFT;
-	Check(decode_wave_size(observed_wave32_rsrc1_a & ~w32_en_bit) == 64u,
-	      "cleared COMPUTE_PGM_RSRC1 W32_EN bit did not decode as wave64");
+	constexpr uint32_t observed_mem_ordered_rsrc1 = 0x402c0085u;
+	Check(((observed_mem_ordered_rsrc1 >> Pm4::COMPUTE_PGM_RSRC1_MEM_ORDERED_SHIFT) &
+	       Pm4::COMPUTE_PGM_RSRC1_MEM_ORDERED_MASK) == 1u,
+	      "observed COMPUTE_PGM_RSRC1 did not retain MEM_ORDERED bit 30");
+	Check(Pm4::ComputeDispatchWaveSize(0x00000041u) == 64u,
+	      "wave64 dispatch initiator was misclassified");
+	Check(Pm4::ComputeDispatchWaveSize(0x00008041u) == 32u,
+	      "CS_W32_EN dispatch initiator was not classified as wave32");
 }
 
 void TestNewShaderRecompilerWave32MasksExecHighStores() {
@@ -5306,7 +5814,8 @@ void TestNewShaderRecompilerWave32VccHighScalarStores() {
 	Check(CountSourceOccurrences(source, "OpStore %vcc_hi") >= 2u,
 	      "wave32 VCC high scalar load did not store to vcc_hi");
 	Check(CountSourceOccurrences(source, "OpStore %vcc_hi %uint_0") == 1u,
-	      "wave32 VCC high scalar load was clamped to zero instead of preserving data");
+	      "wave32 VCC high scalar load was clamped to zero instead of preserving "
+	      "data");
 }
 
 void TestNewShaderRecompilerCompareMaskIsFullWaveBallot() {
@@ -5330,7 +5839,8 @@ void TestNewShaderRecompilerCompareMaskIsFullWaveBallot() {
 	Check(Common::ContainsStr(result.ir_dump, "CompareLtU32 vcc_lo"),
 	      "compare-mask ballot regression did not lower compare to VCC");
 	Check(Common::ContainsStr(result.ir_dump, "BitwiseAndU64 s2, exec_lo, vcc_lo"),
-	      "compare-mask ballot regression did not consume VCC through scalar mask ALU");
+	      "compare-mask ballot regression did not consume VCC through scalar mask "
+	      "ALU");
 	CheckSpirvBinaryValidates(result.spirv);
 
 	const auto source = DisassembleSpirvBinary(result.spirv);
@@ -5365,8 +5875,8 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
 	const auto array_length = Common::FindIndex(source, std::string("OpArrayLength"), 0);
 	const auto bounds_branch =
 	    Common::FindIndex(source, std::string("OpBranchConditional"), array_length);
-	const auto element_access =
-	    Common::FindIndex(source, std::string("OpAccessChain %_ptr_StorageBuffer_uint"), 0);
+	const auto element_access = Common::FindIndex(
+	    source, std::string("OpAccessChain %_ptr_StorageBuffer_uint"), bounds_branch);
 	Check(exec_branch != Common::FIND_INVALID_INDEX, "buffer load SPIR-V lacks EXEC guard branch");
 	Check(array_length != Common::FIND_INVALID_INDEX,
 	      "buffer load SPIR-V lacks storage buffer array-length bounds check");
@@ -5408,6 +5918,8 @@ void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
 	Check(bounds_branch != Common::FIND_INVALID_INDEX,
 	      "buffer atomic SPIR-V lacks storage buffer bounds branch");
 	Check(atomic != Common::FIND_INVALID_INDEX, "buffer atomic SPIR-V lacks atomic operation");
+	Check(SpirvAtomicUsesMemorySemantics(result.spirv, 234, 32, 0x48),
+	      "buffer atomic SPIR-V lacks acquire-release UniformMemory semantics");
 	Check(memory_barrier != Common::FIND_INVALID_INDEX,
 	      "buffer atomic SPIR-V lacks memory barrier after atomic operation");
 	Check(bounds_branch < atomic, "buffer atomic was emitted before bounds guard");
@@ -5680,7 +6192,8 @@ void TestNewShaderRecompilerPerInvocationMasks() {
 	      error.c_str());
 	CheckSpirvBinaryValidates(result.spirv);
 	Check(Common::ContainsStr(DisassembleSpirvBinary(result.spirv), "OpGroupNonUniformBallot"),
-	      "per-invocation cross-lane EXEC was not reconstructed as a subgroup ballot");
+	      "per-invocation cross-lane EXEC was not reconstructed as a subgroup "
+	      "ballot");
 }
 
 void TestNewShaderRecompilerExpPixelOutputs() {
@@ -5731,10 +6244,10 @@ void TestRenderTargetReverseFloat16ExportMapping() {
 	          format.export_mapping.ApplyMask(0xfu) == 0xfu,
 	      "reverse RGBA16F render-target export or write-mask mapping is "
 	      "incorrect");
-	const auto legacy_alt = TextureGetRenderTargetFormat(
-	    Prospero::GpuEnumValue(Prospero::ChannelLayout::k8_8_8_8),
-	    Prospero::GpuEnumValue(Prospero::ChannelType::kUNorm),
-	    Prospero::GpuEnumValue(Prospero::ChannelOrder::kAlt));
+	const auto legacy_alt =
+	    TextureGetRenderTargetFormat(Prospero::GpuEnumValue(Prospero::ChannelLayout::k8_8_8_8),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelType::kUNorm),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelOrder::kAlt));
 	Check(legacy_alt.format == VK_FORMAT_B8G8R8A8_UNORM && legacy_alt.export_mapping.IsIdentity(),
 	      "legacy BGRA render target acquired a duplicate shader export mapping");
 
@@ -5773,7 +6286,7 @@ void TestRenderTargetReverseFloat16ExportMapping() {
 	ShaderMappedData mapped {};
 	mapped.code_size_bytes = sizeof(shader);
 	ShaderMapUserData(regs.ps_regs.data_addr, mapped);
-	HW::ShaderRegisters sh {};
+	HW::ShaderRegisters   sh {};
 	ShaderVertexInputInfo vs_info {};
 	vs_info.stage.program = std::make_shared<ShaderRecompiler::IR::Program>();
 	std::array<Prospero::ColorComponentMapping, 8> mappings {};
@@ -5783,7 +6296,8 @@ void TestRenderTargetReverseFloat16ExportMapping() {
 	Check(ShaderCompileInfoPS(&regs, &sh, ShaderLaneMaskMode::NativeWave, &vs_info, mappings,
 	                          &compiled_info, &compiled_spirv) &&
 	          compiled_info.target_export_mapping[0].IsIdentity(),
-	      "inactive reverse MRT mapping was not normalized out of the shader cache key");
+	      "inactive reverse MRT mapping was not normalized out of the shader "
+	      "cache key");
 	sh.target_output_mode[0] = 4;
 	Check(ShaderCompileInfoPS(&regs, &sh, ShaderLaneMaskMode::NativeWave, &vs_info, mappings,
 	                          &compiled_info, &compiled_spirv) &&
@@ -5814,7 +6328,8 @@ void TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled() {
 	Check(SpirvContainsOpcode(result.spirv, 252),
 	      "pixel valid-mask export should still lower to OpKill");
 	Check(!SpirvContainsExecutionMode(result.spirv, ExecutionModeEarlyFragmentTests),
-	      "pixel shaders that may kill fragments must not request EarlyFragmentTests");
+	      "pixel shaders that may kill fragments must not request "
+	      "EarlyFragmentTests");
 	CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -5917,7 +6432,8 @@ void TestNewShaderRecompilerNativeBindingPlan() {
 	                                            nullptr, &rejected_spirv, &rejected_error) &&
 	          rejected_spirv == rejected_before &&
 	          rejected_error.find("contract") != std::string::npos,
-	      "malformed native instruction was not rejected before fatal emitter paths");
+	      "malformed native instruction was not rejected before fatal emitter "
+	      "paths");
 
 	auto missing_buffer_operand = result.program;
 	buffer_inst                 = FindBufferInstruction(&missing_buffer_operand);
@@ -6059,6 +6575,39 @@ bool ReadSrtHostDword(void*, uint64_t address, uint32_t* value) {
 	return true;
 }
 
+void TestScalarProvenanceSequentialLoopPhiConvergence() {
+	const uint32_t shader[] = {
+	    EncodeSMovB32(0, 128),        // s0 = 0
+	    EncodeSop2(0x00, 0, 0, 129),  // first loop: s0++
+	    EncodeSopc(0x0a, 0, 130),     // s0 < 2
+	    EncodeSopp(0x05, 0xfffdu),    // backedge to first loop
+	    EncodeSMovB32(1, 128),        // s1 = 0
+	    EncodeSop2(0x00, 1, 1, 129),  // second loop: s1++
+	    EncodeSopc(0x0a, 1, 130),     // s1 < 2
+	    EncodeSopp(0x05, 0xfffdu),    // backedge to second loop
+	    EncodeSopp(0x01),
+	};
+
+	std::string                       error;
+	ShaderRecompiler::Decoder::Program decoded;
+	Check(ShaderRecompiler::Decoder::DecodeProgram(shader, &decoded, &error), error.c_str());
+	ShaderRecompiler::CFG::Graph cfg;
+	Check(ShaderRecompiler::CFG::BuildGraph(decoded, &cfg, &error), error.c_str());
+	Check(ShaderRecompiler::CFG::Structurize(&cfg, &error), error.c_str());
+	ShaderRecompiler::IR::Program ir;
+	Check(ShaderRecompiler::IR::LowerProgram(decoded, cfg, ShaderType::Compute, 64, &ir, &error),
+	      error.c_str());
+	Check(ShaderRecompiler::IR::BuildScalarProvenance(&ir, &error), error.c_str());
+
+	const auto phis = std::count_if(
+	    ir.provenance.values.begin(), ir.provenance.values.end(), [](const auto& value) {
+		    return value.op == ShaderRecompiler::IR::ScalarValueOp::Phi;
+	    });
+	Check(phis >= 2, "sequential loops did not retain scalar fixed-point phis");
+	Check(ir.provenance.values.size() < 256,
+	      "sequential-loop scalar provenance did not converge to a bounded graph");
+}
+
 void TestScalarProvenanceRealWideMoveLowering() {
 	const uint32_t shader[] = {
 	    EncodeSop1(0x04, 0, 20),                        // s_mov_b64 s[0:1], s[20:21]
@@ -6188,7 +6737,8 @@ void TestScalarProvenanceRealCarryAndScalarLoads() {
 	                                                         0x10, runtime, &sampler, &error) &&
 	          sampler.dwords[0] == 0 && sampler.dwords[1] == 0x00fff000u &&
 	          sampler.dwords[2] == 0x09500000u && sampler.dwords[3] == 0,
-	      "real inline sampler construction was unresolved or evaluated incorrectly");
+	      "real inline sampler construction was unresolved or evaluated "
+	      "incorrectly");
 
 	auto                             user_data = ImageTestUserData();
 	ShaderRecompiler::CompileOptions options;
@@ -6204,8 +6754,11 @@ void TestSrtWalkerRealSmemLowering() {
 	const uint32_t shader[] = {
 	    EncodeSMovB32(124, 130), // m0 = 2
 	    EncodeSmem0(0x02, 0, 4),
-	    (124u << 25u) | 2u, // s_load_dwordx4 s[0:3], s[8:9], m0 offset + immediate 2
-	    EncodeMubuf0(0x0c),      EncodeMubuf1(0, 0, 1), EncodeSopp(0x01),
+	    (124u << 25u) | 2u, // s_load_dwordx4 s[0:3], s[8:9], m0 offset +
+	                        // immediate 2
+	    EncodeMubuf0(0x0c),
+	    EncodeMubuf1(0, 0, 1),
+	    EncodeSopp(0x01),
 	};
 	std::string                   error;
 	ShaderRecompiler::IR::Program ir;
@@ -6315,9 +6868,10 @@ void TestScalarMemoryLoadsSnapshotOverlappingOperands() {
 		Check(LowerProvenanceOnly(shader, static_cast<uint32_t>(std::size(shader)), &ir, &error),
 		      error.c_str());
 		Check(ir.srt.reads.size() == 4 && ir.srt.dynamic_reads.empty(),
-		      opcode == 0x02
-		          ? "overlapping S_LOAD operands were evaluated after a component write"
-		          : "overlapping S_BUFFER_LOAD operands were evaluated after a component write");
+		      opcode == 0x02 ? "overlapping S_LOAD operands were evaluated after a "
+		                       "component write"
+		                     : "overlapping S_BUFFER_LOAD operands were evaluated "
+		                       "after a component write");
 		Check(ShaderRecompiler::IR::PatchSrtReads(&ir, &error), error.c_str());
 		uint32_t patched = 0;
 		for (const auto& block: ir.blocks) {
@@ -6354,7 +6908,8 @@ void TestScalarMemoryLoadCrossesIntoVcc() {
 		for (const auto& inst: block.instructions) {
 			if (inst.op == ShaderRecompiler::IR::Opcode::LoadSrtDword) {
 				Check(inst.src[0].imm == patched++,
-				      "wide SMEM destination crossing into VCC used the wrong flat offset");
+				      "wide SMEM destination crossing into VCC used the wrong flat "
+				      "offset");
 			}
 		}
 	}
@@ -6606,15 +7161,16 @@ void TestPixelProgramCacheDescriptorSetIdentity() {
 			ShaderVertexInputInfo vs_info {};
 			vs_info.stage.program = std::move(vs_program);
 			const std::array<Prospero::ColorComponentMapping, 8> identity_mappings {};
-			ShaderPixelInputInfo      ps_info {};
-			std::span<const uint32_t> spirv;
+			ShaderPixelInputInfo                                 ps_info {};
+			std::span<const uint32_t>                            spirv;
 			Check(ShaderCompileInfoPS(&regs, &sh, ShaderLaneMaskMode::NativeWave, &vs_info,
 			                          identity_mappings, &ps_info, &spirv),
 			      "pixel program-cache transition failed to compile");
 			const auto expected_set = has_vs_descriptors ? 1u : 0u;
 			Check(ps_info.descriptor_set == expected_set && ps_info.stage.program != nullptr &&
 			          ps_info.stage.program->bindings.descriptor_set == expected_set,
-			      "pixel program cache reused SPIR-V with the paired VS descriptor set");
+			      "pixel program cache reused SPIR-V with the paired VS descriptor "
+			      "set");
 		};
 
 		compile(first_has_vs_descriptors);
@@ -6634,8 +7190,8 @@ void TestPixelProgramCacheDescriptorSetIdentity() {
 		ShaderVertexInputInfo vs_info {};
 		vs_info.stage.program = std::make_shared<ShaderRecompiler::IR::Program>();
 		const std::array<Prospero::ColorComponentMapping, 8> identity_mappings {};
-		ShaderPixelInputInfo      ps_info {};
-		std::span<const uint32_t> spirv;
+		ShaderPixelInputInfo                                 ps_info {};
+		std::span<const uint32_t>                            spirv;
 		Check(ShaderCompileInfoPS(&mask_regs, &sh, mode, &vs_info, identity_mappings, &ps_info,
 		                          &spirv),
 		      "pixel lane-mask cache transition failed to compile");
@@ -6740,6 +7296,8 @@ int main() {
 	TestNewShaderRecompilerRdna2ScalarOpcodes();
 	TestNewShaderRecompilerScalarVectorAlu();
 	TestNewShaderRecompilerVop3LaneReadDestinationEncoding();
+	TestNewShaderRecompilerLaneIndexUsesGuestWaveSize();
+	TestNewShaderRecompilerWorkgroupWave64();
 	TestNewShaderRecompilerMoreAluFamilies();
 	TestNewShaderRecompilerExpandedAluBatch();
 	TestNewShaderRecompilerVop3pPackedF16();
@@ -6751,6 +7309,7 @@ int main() {
 	TestNewShaderRecompilerSignedMinShiftAlu();
 	TestNewShaderRecompilerScalarBitfieldAlu();
 	TestNewShaderRecompilerMemoryFamilyLowering();
+	TestNewShaderRecompilerGlcBufferLoadVisibility();
 	TestNewShaderRecompilerImageQueryLowering();
 	TestNewShaderRecompilerImageSampleVariants();
 	TestNewShaderRecompilerImageSampleA16SamplerCoords();
@@ -6781,27 +7340,29 @@ int main() {
 	TestNewShaderRecompilerFlatStoreLowering();
 	TestNewShaderRecompilerAtomicLowering();
 	TestNewShaderRecompilerDsReadWrite2Lowering();
-	TestNewShaderRecompilerDsSubDwordLowering();
-	TestNewShaderRecompilerDsWideAndAtomicLowering();
-	TestNewShaderRecompilerDsSwizzleLowering();
-	TestNewShaderRecompilerDsAddtidLowering();
-	TestNewShaderRecompilerDsFloatMinMaxLowering();
-	TestNewShaderRecompilerCfgStraightLine();
-	TestNewShaderRecompilerCfgIfElse();
-	TestNewShaderRecompilerCfgTerminalExitMergePS();
-	TestNewShaderRecompilerCfgPostEndTargetMergePS();
-	TestNewShaderRecompilerCfgLoopBreakContinue();
-	TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured();
-	TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher();
-	TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeDispatcher();
-	TestNewShaderRecompilerCfgSharedOuterAndLoopMerge();
-	TestNewShaderRecompilerCfgLoopSharedContinueSelectionMerges();
-	TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit();
-	TestNewShaderRecompilerCfgIrreducibleDispatcher();
-	TestNewShaderRecompilerExecMaskHelpers();
-	TestComputeShaderInputWaveSize();
-	TestNewShaderRecompilerWave32MasksExecHighStores();
-	TestNewShaderRecompilerWave32VccHighScalarStores();
+        TestNewShaderRecompilerDsSubDwordLowering();
+        TestNewShaderRecompilerDsWideAndAtomicLowering();
+        TestNewShaderRecompilerDsSwizzleLowering();
+        TestNewShaderRecompilerDsAddtidLowering();
+        TestNewShaderRecompilerDsFloatMinMaxLowering();
+        TestNewShaderRecompilerCfgStraightLine();
+        TestNewShaderRecompilerCfgIfElse();
+        TestNewShaderRecompilerCfgTerminalExitMergePS();
+        TestNewShaderRecompilerCfgPostEndTargetMergePS();
+        TestNewShaderRecompilerCfgLoopBreakContinue();
+        TestNewShaderRecompilerCfgLoopLatchBreakSharesMerge();
+	TestNewShaderRecompilerCfgConditionalLoopHeaderSplit();
+        TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured();
+        TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher();
+        TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeDispatcher();
+        TestNewShaderRecompilerCfgSharedOuterAndLoopMerge();
+        TestNewShaderRecompilerCfgLoopSharedContinueSelectionMerges();
+        TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit();
+        TestNewShaderRecompilerCfgIrreducibleDispatcher();
+        TestNewShaderRecompilerExecMaskHelpers();
+        TestComputeShaderInputWaveSize();
+        TestNewShaderRecompilerWave32MasksExecHighStores();
+        TestNewShaderRecompilerWave32VccHighScalarStores();
 	TestNewShaderRecompilerCompareMaskIsFullWaveBallot();
 	TestNewShaderRecompilerBufferLoadsGuardedByExec();
 	TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
@@ -6815,6 +7376,7 @@ int main() {
 	TestNewShaderRecompilerExpPixelOutputs();
 	TestRenderTargetReverseFloat16ExportMapping();
 	TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled();
+	TestScalarProvenanceSequentialLoopPhiConvergence();
 	TestScalarProvenanceRealWideMoveLowering();
 	TestScalarProvenanceRealCarryAndScalarLoads();
 	TestSrtWalkerRealSmemLowering();

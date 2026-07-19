@@ -716,9 +716,7 @@ void EmitLaneMaskPairFromBool(EmitterState* state, const IR::Operand& dst, uint3
 		EmitPerInvocationMask(state, dst, write_mask);
 		return;
 	}
-	const auto ballot = state->builder.AllocateId();
-	state->builder.AddFunction({OpGroupNonUniformBallot, state->vec4_uint_type, ballot,
-	                            ConstantU32(state, ScopeSubgroup), write_mask});
+	const auto ballot = EmitWaveBallot(state, write_mask);
 	for (uint32_t part = 0; part < 2u; part++) {
 		uint32_t result = ConstantU32(state, 0);
 		if (state->wave_size != 32u || part == 0u) {
@@ -1161,10 +1159,16 @@ void EmitBitFieldInsertSelectU32(EmitterState* state, const IR::Instruction& ins
 	EmitStoreU32(state, inst.dst, ret);
 }
 
-void EmitAlignBitU32(EmitterState* state, const IR::Instruction& inst) {
-	const auto hi           = EmitValueLoad(state, inst.src[0]);
-	const auto lo           = EmitValueLoad(state, inst.src[1]);
-	const auto shift        = EmitAndConstant(state, EmitValueLoad(state, inst.src[2]), 31u);
+void EmitAlignU32(EmitterState* state, const IR::Instruction& inst, bool byte_shift) {
+	const auto hi = EmitValueLoad(state, inst.src[0]);
+	const auto lo = EmitValueLoad(state, inst.src[1]);
+	const auto raw_shift =
+	    EmitAndConstant(state, EmitValueLoad(state, inst.src[2]), byte_shift ? 3u : 31u);
+	const auto shift = byte_shift ? state->builder.AllocateId() : raw_shift;
+	if (byte_shift) {
+		state->builder.AddFunction(
+		    {OpShiftLeftLogical, state->uint_type, shift, raw_shift, ConstantU32(state, 3)});
+	}
 	const auto lo_part      = state->builder.AllocateId();
 	const auto hi_shift_raw = state->builder.AllocateId();
 	const auto hi_shift     = state->builder.AllocateId();
@@ -1184,6 +1188,14 @@ void EmitAlignBitU32(EmitterState* state, const IR::Instruction& inst) {
 	    {OpSelect, state->uint_type, hi_part, non_zero, hi_part_raw, ConstantU32(state, 0)});
 	state->builder.AddFunction({OpBitwiseOr, state->uint_type, ret, lo_part, hi_part});
 	EmitStoreU32(state, inst.dst, ret);
+}
+
+void EmitAlignBitU32(EmitterState* state, const IR::Instruction& inst) {
+	EmitAlignU32(state, inst, false);
+}
+
+void EmitAlignByteU32(EmitterState* state, const IR::Instruction& inst) {
+	EmitAlignU32(state, inst, true);
 }
 
 void EmitSelectU32(EmitterState* state, const IR::Instruction& inst) {

@@ -105,4 +105,8 @@ bool NggRectlistDrawEnabled() {
 	return g_config->ngg_rectlist_draw_enabled;
 }
 
+bool CsSkipUnresolvedEnabled() {
+	return g_config->cs_skip_unresolved_enabled;
+}
+
 } // namespace Config

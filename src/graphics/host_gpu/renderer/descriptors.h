@@ -17,6 +17,22 @@ struct TargetTextureViewInfo {
 	uint32_t        layer_count = 0;
 };
 
+enum class StorageBufferDescriptorKind {
+	Buffer,
+	ActiveImageAlias,
+	TextureBackedImage,
+};
+
+struct StorageBufferDescriptorInfo {
+	StorageBufferDescriptorKind kind    = StorageBufferDescriptorKind::Buffer;
+	uint64_t                    address = 0;
+	uint64_t                    size    = 0;
+};
+
+[[nodiscard]] StorageBufferDescriptorInfo
+ResolveStorageBufferDescriptor(const ShaderBufferResource&                 descriptor,
+                               const ShaderRecompiler::IR::BufferResource& resource);
+
 [[nodiscard]] TargetTextureViewInfo
 ResolveTargetTextureView(const ShaderRecompiler::IR::ImageResource& resource,
                          Prospero::ImageType type, uint32_t base_layer, uint32_t image_layers);

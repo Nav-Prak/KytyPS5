@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_IMAGEVIEW_H_
 
 #include "common/assert.h"
+#include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/imageInfo.h"
 #include "graphics/shader/recompiler/ShaderIR.h"
@@ -44,8 +45,43 @@ namespace Libs::Graphics {
 	        height != 0 && depth == 1);
 }
 
-[[nodiscard]] inline bool IsSupportedCachedRenderTargetImageType(
-    bool storage, Prospero::ImageType type, uint32_t height) noexcept {
+[[nodiscard]] inline bool IsSupportedStorageTile(uint32_t format, uint32_t tile,
+                                                 bool supported_depth_tile) noexcept {
+	return tile == Prospero::GpuEnumValue(Prospero::TileMode::kLinear) ||
+	       tile == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) ||
+	       (tile == Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB) &&
+	        TileIsStandard4KBTextureSupported(format)) ||
+	       supported_depth_tile;
+}
+
+enum class StorageImageReadbackLayout : uint8_t {
+	Unsupported,
+	Linear,
+	RenderTarget,
+	Standard4KB,
+};
+
+[[nodiscard]] inline StorageImageReadbackLayout
+ClassifyStorageImageReadbackLayout(const ImageInfo& info) noexcept {
+	const auto type = static_cast<Prospero::ImageType>(info.type);
+	if ((type != Prospero::ImageType::kColor2D && type != Prospero::ImageType::kColor2DArray) ||
+	    info.depth != 1 || info.base_level != 0 || info.levels != 1 || info.base_array != 0) {
+		return StorageImageReadbackLayout::Unsupported;
+	}
+	switch (static_cast<Prospero::TileMode>(info.tile)) {
+		case Prospero::TileMode::kLinear: return StorageImageReadbackLayout::Linear;
+		case Prospero::TileMode::kRenderTarget: return StorageImageReadbackLayout::RenderTarget;
+		case Prospero::TileMode::kStandard4KB:
+			return TileIsStandard4KBTextureSupported(info.format)
+			           ? StorageImageReadbackLayout::Standard4KB
+			           : StorageImageReadbackLayout::Unsupported;
+		default: return StorageImageReadbackLayout::Unsupported;
+	}
+}
+
+[[nodiscard]] inline bool IsSupportedCachedRenderTargetImageType(bool                storage,
+                                                                 Prospero::ImageType type,
+                                                                 uint32_t height) noexcept {
 	if (type == Prospero::ImageType::kColor2D) {
 		return true;
 	}

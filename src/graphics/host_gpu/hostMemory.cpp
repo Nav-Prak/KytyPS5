@@ -107,4 +107,13 @@ bool HostMemoryRangeIsReadable(uint64_t addr, uint64_t size) {
 	return HostMemoryQueryReadable(addr, size, &readable_size) && readable_size >= size;
 }
 
+bool HostMemoryRangeIsMapped(uint64_t addr, uint64_t size) {
+	if (addr == 0 || size == 0 || UINT64_MAX - addr < size) {
+		return false;
+	}
+	uint64_t mapped_size = 0;
+	return HostMemoryQueryRange(addr, size, HostMemoryAccess::Mapped, &mapped_size) &&
+	       mapped_size >= size;
+}
+
 } // namespace Libs::Graphics

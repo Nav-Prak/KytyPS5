@@ -34,13 +34,14 @@ class ResourceMutex;
 class TextureCache {
 public:
 	struct RegionInfo {
-		bool image_pages        = false;
-		bool image_bytes        = false;
-		bool gpu_image_bytes    = false;
-		bool non_sampled_pages  = false;
-		bool metadata_pages     = false;
-		bool metadata_bytes     = false;
-		bool gpu_metadata_bytes = false;
+		bool image_pages                  = false;
+		bool image_bytes                  = false;
+		bool gpu_image_bytes              = false;
+		bool non_buffer_owned_image_bytes = false;
+		bool non_sampled_pages            = false;
+		bool metadata_pages               = false;
+		bool metadata_bytes               = false;
+		bool gpu_metadata_bytes           = false;
 	};
 
 	TextureCache(PageManager& page_manager, BufferCache& buffer_cache,

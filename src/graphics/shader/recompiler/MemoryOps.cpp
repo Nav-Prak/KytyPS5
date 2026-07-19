@@ -48,6 +48,7 @@ constexpr MemoryOpcodeInfo MUBUF_OPS[] = {
     {0x1eu, Opcode::BufferStoreDwordx4, 4, 32},
     {0x1fu, Opcode::BufferStoreDwordx3, 3, 32},
     {0x30u, Opcode::BufferAtomicSwap, 1, 32},
+    {0x50u, Opcode::BufferAtomicSwapX2, 2, 32},
     {0x32u, Opcode::BufferAtomicAdd, 1, 32},
     {0x33u, Opcode::BufferAtomicSub, 1, 32},
     {0x35u, Opcode::BufferAtomicSMin, 1, 32},
@@ -57,6 +58,8 @@ constexpr MemoryOpcodeInfo MUBUF_OPS[] = {
     {0x39u, Opcode::BufferAtomicAnd, 1, 32},
     {0x3au, Opcode::BufferAtomicOr, 1, 32},
     {0x3bu, Opcode::BufferAtomicXor, 1, 32},
+    {0x3fu, Opcode::BufferAtomicFMin, 1, 32},
+    {0x40u, Opcode::BufferAtomicFMax, 1, 32},
 };
 
 constexpr MemoryOpcodeInfo MTBUF_OPS[] = {

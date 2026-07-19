@@ -260,6 +260,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BitCompare0B32: text += "BitCompare0B32"; break;
 		case Opcode::BitCompare1B32: text += "BitCompare1B32"; break;
 		case Opcode::AlignBitU32: text += "AlignBitU32"; break;
+		case Opcode::AlignByteU32: text += "AlignByteU32"; break;
 		case Opcode::ShiftLeftAddU32: text += "ShiftLeftAddU32"; break;
 		case Opcode::AddShiftLeftU32: text += "AddShiftLeftU32"; break;
 		case Opcode::XorAddU32: text += "XorAddU32"; break;
@@ -466,6 +467,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BufferStoreShort: text += "BufferStoreShort"; break;
 		case Opcode::BufferStoreDword: text += "BufferStoreDword"; break;
 		case Opcode::AtomicSwapU32: text += "AtomicSwapU32"; break;
+		case Opcode::AtomicSwapU64: text += "AtomicSwapU64"; break;
 		case Opcode::AtomicAddU32: text += "AtomicAddU32"; break;
 		case Opcode::AtomicSubU32: text += "AtomicSubU32"; break;
 		case Opcode::AtomicSMinI32: text += "AtomicSMinI32"; break;
@@ -475,6 +477,8 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::AtomicAndU32: text += "AtomicAndU32"; break;
 		case Opcode::AtomicOrU32: text += "AtomicOrU32"; break;
 		case Opcode::AtomicXorU32: text += "AtomicXorU32"; break;
+		case Opcode::AtomicFMinF32: text += "AtomicFMinF32"; break;
+		case Opcode::AtomicFMaxF32: text += "AtomicFMaxF32"; break;
 		case Opcode::FlatLoadUbyte: text += "FlatLoadUbyte"; break;
 		case Opcode::FlatLoadSbyte: text += "FlatLoadSbyte"; break;
 		case Opcode::FlatLoadUshort: text += "FlatLoadUshort"; break;

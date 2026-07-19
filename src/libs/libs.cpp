@@ -26,6 +26,10 @@ namespace VideoDec2 {
 LIB_DEFINE(InitVideoDec2_1);
 } // namespace VideoDec2
 
+namespace LibVideoRecordingP {
+LIB_DEFINE(InitVideoRecordingP_1);
+} // namespace LibVideoRecordingP
+
 namespace LibMouse {
 LIB_DEFINE(InitMouse_1);
 } // namespace LibMouse
@@ -103,6 +107,7 @@ void InitAll(Loader::SymbolDatabase* s) {
 	LIB_LOAD(LibUlt::InitUlt_1);
 	LIB_LOAD(InitUserService_1);
 	LIB_LOAD(VideoDec2::InitVideoDec2_1);
+	LIB_LOAD(LibVideoRecordingP::InitVideoRecordingP_1);
 	LIB_LOAD(InitVideoOut_1);
 }
 

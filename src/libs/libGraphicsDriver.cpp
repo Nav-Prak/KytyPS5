@@ -258,6 +258,8 @@ LIB_DEFINE(InitGraphicsDriver_1) {
 	LIB_FUNC("VEGu4dixjUg", Gen5::GraphicsDcbJumpGetSize);
 	LIB_FUNC("QIXCsbipds0", Gen5::GraphicsDcbRewindGetSize);
 	LIB_FUNC("zfcxg-ewMK8", Gen5::GraphicsDcbRewind);
+	// Alternate Agc_v1 export used with the same get-size/initial-state packet contract.
+	LIB_FUNC("ziVA3whp3p4", Gen5::GraphicsDcbRewind);
 	LIB_FUNC("BIPexNBSGog", Gen5::GraphicsDcbCondExec);
 	LIB_FUNC("ou16V5hh5sg", Gen5::GraphicsDcbCondExecGetSize);
 	LIB_FUNC("bbFueFP+J4k", Gen5::GraphicsDcbSetPredication);

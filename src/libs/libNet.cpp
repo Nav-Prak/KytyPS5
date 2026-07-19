@@ -1399,6 +1399,115 @@ LIB_DEFINE(InitNet_1_NpManager) {
 
 } // namespace LibNpManager
 
+namespace LibNpUtility {
+
+LIB_VERSION("NpUtility", 1, "NpUtility", 1, 1);
+
+// GTA V builds this exact 0x38-byte input at 0x02a89eb0 before both request-start imports.
+// The public names for these NIDs are not available, so keep the implementation bounded to the
+// recovered ABI and the emulator's existing signed-out NP policy.
+struct NpUtilityRequestParameter {
+	uint64_t size;
+	uint32_t measurement_size;
+	uint8_t  reserved[44];
+};
+static_assert(sizeof(NpUtilityRequestParameter) == 0x38);
+
+struct NpUtilityResult {
+	double   value_a;
+	double   value_b;
+	int32_t  result;
+	uint32_t reserved;
+};
+static_assert(sizeof(NpUtilityResult) == 0x18);
+
+constexpr int NP_UTILITY_ERROR_INVALID_ARGUMENT  = -2141913085; /* 0x80550003 */
+constexpr int NP_UTILITY_ERROR_SIGNED_OUT        = -2141913082; /* 0x80550006 */
+constexpr int NP_UTILITY_ERROR_INVALID_SIZE      = -2141913071; /* 0x80550011 */
+constexpr int NP_UTILITY_ERROR_REQUEST_NOT_FOUND = -2141913068; /* 0x80550014 */
+
+static int np_utility_start_offline(const NpUtilityRequestParameter* param) {
+	if (param == nullptr) {
+		return NP_UTILITY_ERROR_INVALID_ARGUMENT;
+	}
+	if (param->size < sizeof(NpUtilityRequestParameter)) {
+		return NP_UTILITY_ERROR_INVALID_SIZE;
+	}
+
+	// NpManager reports this emulator as signed out. Returning a negative start error is preferable
+	// to inventing a successful asynchronous request and fabricated measurement values.
+	return NP_UTILITY_ERROR_SIGNED_OUT;
+}
+
+static int KYTY_SYSV_ABI NpUtilityStartMeasurementA(const NpUtilityRequestParameter* param,
+                                                    uint64_t                         timeout_us) {
+	PRINT_NAME();
+
+	LOGF("\t param      = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(param));
+	LOGF("\t timeout_us = %" PRIu64 "\n", timeout_us);
+
+	return np_utility_start_offline(param);
+}
+
+static int KYTY_SYSV_ABI NpUtilityStartMeasurementB(const NpUtilityRequestParameter* param,
+                                                    uint64_t                         timeout_us) {
+	PRINT_NAME();
+
+	LOGF("\t param      = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(param));
+	LOGF("\t timeout_us = %" PRIu64 "\n", timeout_us);
+
+	return np_utility_start_offline(param);
+}
+
+static int KYTY_SYSV_ABI NpUtilityPollRequest(int req_id, int* state) {
+	PRINT_NAME();
+
+	LOGF("\t req_id = %d\n", req_id);
+	LOGF("\t state  = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(state));
+
+	if (state == nullptr) {
+		return NP_UTILITY_ERROR_INVALID_ARGUMENT;
+	}
+
+	*state = 0;
+	return NP_UTILITY_ERROR_REQUEST_NOT_FOUND;
+}
+
+static int KYTY_SYSV_ABI NpUtilityAbortRequest(int req_id) {
+	PRINT_NAME();
+
+	LOGF("\t req_id = %d\n", req_id);
+
+	return NP_UTILITY_ERROR_REQUEST_NOT_FOUND;
+}
+
+static int KYTY_SYSV_ABI NpUtilityGetResult(int req_id, NpUtilityResult* result) {
+	PRINT_NAME();
+
+	LOGF("\t req_id = %d\n", req_id);
+	LOGF("\t result = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(result));
+
+	if (result == nullptr) {
+		return NP_UTILITY_ERROR_INVALID_ARGUMENT;
+	}
+
+	memset(result, 0, sizeof(*result));
+	return NP_UTILITY_ERROR_REQUEST_NOT_FOUND;
+}
+
+LIB_DEFINE(InitNet_1_NpUtility) {
+	// Recovered call sites: start A 0x02a89f03, abort 0x02a8a07a/0x02a8a0cb,
+	// get result 0x02a89fb0/0x02a8a086/0x02a8a0d7, start B 0x02a8a019, and poll
+	// 0x02a89f74. Do not reuse these handlers for other NpUtility NIDs without ABI evidence.
+	LIB_FUNC("hqzi1IHdQQQ", LibNpUtility::NpUtilityStartMeasurementA);
+	LIB_FUNC("kvdMF48mB3Y", LibNpUtility::NpUtilityAbortRequest);
+	LIB_FUNC("pLr1fEQS1z8", LibNpUtility::NpUtilityGetResult);
+	LIB_FUNC("mA0zsbqm+kA", LibNpUtility::NpUtilityStartMeasurementB);
+	LIB_FUNC("BYIZGKm6bO4", LibNpUtility::NpUtilityPollRequest);
+}
+
+} // namespace LibNpUtility
+
 namespace LibNpSessionSignaling {
 
 LIB_VERSION("NpSessionSignaling", 1, "NpSessionSignaling", 1, 1);
@@ -3966,6 +4075,7 @@ LIB_DEFINE(InitNet_1) {
 	LibHttp2::InitNet_1_Http2(s);
 	LibNetCtl::InitNet_1_NetCtl(s);
 	LibNpManager::InitNet_1_NpManager(s);
+	LibNpUtility::InitNet_1_NpUtility(s);
 	LibNpSessionSignaling::InitNet_1_NpSessionSignaling(s);
 	LibNpEntitlementAccess::InitNet_1_NpEntitlementAccess(s);
 	LibNpAuth::InitNet_1_NpAuth(s);

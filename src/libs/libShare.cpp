@@ -242,4 +242,85 @@ LIB_DEFINE(InitShare_1) {
 	LIB_FUNC("kCurUZVFqcI", Share::ShareSetCaptureSource);
 }
 
+namespace LibVideoRecordingP {
+
+LIB_VERSION("VideoRecordingP", 1, "VideoRecording", 1, 1);
+
+constexpr int VIDEO_RECORDING_ERROR_INVALID_PARAM = static_cast<int32_t>(0x80a80001u);
+constexpr int VIDEO_RECORDING_ERROR_NOT_SUPPORTED = static_cast<int32_t>(0x80a80003u);
+
+static KYTY_SYSV_ABI int VideoRecordingSetParameter(uint32_t command, const void* data,
+                                                    size_t size) {
+	PRINT_NAME();
+
+	LOGF("\t command = 0x%08" PRIx32 "\n", command);
+	LOGF("\t data    = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(data));
+	LOGF("\t size    = %" PRIu64 "\n", static_cast<uint64_t>(size));
+
+	switch (command) {
+		case 0x0002:
+		case 0x0006:
+		case 0x0a01:
+			// GTA V uses these as best-effort UTF-16 metadata setters and discards the result.
+			if (data == nullptr || size == 0 || (size & 1u) != 0) {
+				return VIDEO_RECORDING_ERROR_INVALID_PARAM;
+			}
+			return OK;
+		case 0xa004:
+		case 0xa006:
+			if (data != nullptr || size != 0) {
+				return VIDEO_RECORDING_ERROR_INVALID_PARAM;
+			}
+			return VIDEO_RECORDING_ERROR_NOT_SUPPORTED;
+		default: return VIDEO_RECORDING_ERROR_INVALID_PARAM;
+	}
+}
+
+static KYTY_SYSV_ABI int VideoRecordingGetParameter(uint32_t command, void* data, size_t size) {
+	PRINT_NAME();
+
+	LOGF("\t command = 0x%08" PRIx32 "\n", command);
+	LOGF("\t data    = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(data));
+	LOGF("\t size    = %" PRIu64 "\n", static_cast<uint64_t>(size));
+
+	if (data == nullptr) {
+		return VIDEO_RECORDING_ERROR_INVALID_PARAM;
+	}
+
+	switch (command) {
+		case 0xa001:
+		case 0xa00c:
+			if (size != sizeof(uint32_t)) {
+				return VIDEO_RECORDING_ERROR_INVALID_PARAM;
+			}
+			*static_cast<uint32_t*>(data) = 0;
+			return OK;
+		case 0xa003:
+		case 0xa005:
+			if (size != sizeof(uint64_t)) {
+				return VIDEO_RECORDING_ERROR_INVALID_PARAM;
+			}
+			*static_cast<uint64_t*>(data) = 0;
+			return VIDEO_RECORDING_ERROR_NOT_SUPPORTED;
+		default: return VIDEO_RECORDING_ERROR_INVALID_PARAM;
+	}
+}
+
+static KYTY_SYSV_ABI int VideoRecordingProbeCapability() {
+	PRINT_NAME();
+
+	// GTA V explicitly recognizes 0x80a80003 at 0x02e98fed and disables the recorder before it
+	// allocates capture buffers or calls the remaining private imports.
+	return VIDEO_RECORDING_ERROR_NOT_SUPPORTED;
+}
+
+LIB_DEFINE(InitVideoRecordingP_1) {
+	// These registrations are limited to the three NIDs whose caller contracts were recovered.
+	LIB_FUNC("Fc8qxlKINYQ", LibVideoRecordingP::VideoRecordingSetParameter);
+	LIB_FUNC("sA6+5XdbqMA", LibVideoRecordingP::VideoRecordingGetParameter);
+	LIB_FUNC("ZvWzS2wTIMc", LibVideoRecordingP::VideoRecordingProbeCapability);
+}
+
+} // namespace LibVideoRecordingP
+
 } // namespace Libs

@@ -786,16 +786,33 @@ until the four commits have been built from a clean index and the later in-game 
 the two older Hades stashes can be kept as historical recovery points but must not be applied to
 this branch.
 
-The next upstream range is intentionally isolated. `upstream/main` advanced from the already merged
-`587cb23` to `bd9086e` through a 95-file graphics refactor: Vulkan SDK coupling is removed, the
-backend migrates to Vulkan-Hpp, and transfer helpers are centralized. It does not implement blocker
-47's dispatch-initiator wave-size decode or workgroup-wave64 path, so it is not a direct fix for the
-current device loss. Its new abstractions may help later transfer and synchronization work, but the
-renderer overlap is too broad to merge into the fallback branch. After the four audited commits,
-create `feature/gtav-upstream-bd9086e` at the exact `feature/gtav-compatibility` tip and merge
-`upstream/main` only there. Keep the original branch pointer unchanged, preserve all GTA semantics
-while adapting them to Vulkan-Hpp, leave all stashes intact, and require the full automated and
-in-game comparison before adopting the integration branch.
+The next upstream range was integrated in isolation on 2026-07-19. The audited GTA work was first
+split into commits `31467bb`, `1b4f1b4`, `7163ff6`, and `3e9e0b9` on
+`feature/gtav-compatibility`; that branch remains fixed at `3e9e0b9` as the pre-refactor fallback.
+`feature/gtav-upstream-bd9086e` was then created at the same tip and merged with `upstream/main` at
+`bd9086e`. The upstream range removes Vulkan SDK coupling, migrates the backend to Vulkan-Hpp,
+centralizes transfer helpers, and touches 95 files. It still does not directly implement blocker
+47's dispatch-initiator wave-size decode or workgroup-wave64 path, so any in-game improvement must
+be demonstrated rather than assumed.
+
+The isolated merge produced 21 textual conflicts concentrated in the renderer and shader
+regressions. Resolution retained the upstream Vulkan-Hpp command-buffer, image, transfer, and
+lifetime APIs while porting the GTA cache layouts, metadata ownership, compatible image views,
+recording-generation tracking, dispatch diagnostics, and workgroup-wave64 implementation onto
+them. The compiler audit also restored pre-refactor behavior that a textual merge could silently
+drop: format-usage-aware texture selection, shader-address write guards, the texture-descriptor
+address updater, draw/compute address-write propagation, DCC initialization/readback through the
+new transfer API, and the GTA-specific regression cases. A stale `storage-mip` fatal expectation
+was removed because dynamic storage mips are now intentionally admitted and validated by their
+dedicated descriptor death cases.
+
+The merged Release `kyty_emulator`, `shader_cfg_tests`, and
+`shader_recompiler_compute_tests` build successfully against the refactored backend. All eleven
+standalone regression executables pass, including the Vulkan workgroup-wave64 case; both
+`git diff --check` and the staged-diff check are clean. `_DownloadData/`, `_TempData/`, and all
+three stashes remain outside the merge. The integration branch is ready for a like-for-like Story
+Mode run, but it does not replace the fallback branch until that test advances or at least matches
+blocker 47 without a new regression.
 
 That audit did expose one intentionally incomplete merge bridge unrelated to the immediate R8
 assertion: `ConsumeVideoOutDccMetadataTransfer` returned `false`, and registration/acquisition had

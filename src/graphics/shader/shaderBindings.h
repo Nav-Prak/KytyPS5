@@ -52,7 +52,6 @@ struct ShaderBufferResource {
 	[[nodiscard]] uint32_t DstSelXYZW() const { return (fields[3] >> 0u) & 0xFFFu; }
 	[[nodiscard]] bool     AddTid() const { return ((fields[3] >> 23u) & 0x1u) == 1; }
 	[[nodiscard]] uint8_t  IndexStride() const { return (fields[3] >> 21u) & 0x3u; }
-	[[nodiscard]] uint32_t IndexStrideRecords() const { return 8u << IndexStride(); }
 	[[nodiscard]] uint32_t PackedStride() const {
 		return Stride() | (static_cast<uint32_t>(SwizzleEnabled()) << 14u) |
 		       (static_cast<uint32_t>(IndexStride()) << 16u) |
@@ -125,8 +124,6 @@ struct ShaderTextureResource {
 
 struct ShaderSamplerResource {
 	uint32_t fields[4] = {0};
-
-	void UpdateIndex(uint32_t index) { fields[0] = index; }
 
 	[[nodiscard]] uint8_t  ClampX() const { return (fields[0] >> 0u) & 0x7u; }
 	[[nodiscard]] uint8_t  ClampY() const { return (fields[0] >> 3u) & 0x7u; }

@@ -11,6 +11,7 @@ namespace Libs::Graphics {
 
 struct ImageImageCopy;
 struct RenderColorInfo;
+struct ShaderVertexInputInfo;
 
 #pragma pack(push, 1)
 
@@ -45,8 +46,10 @@ static_assert(sizeof(PipelineDynamicParameters) ==
                                                   const RenderColorInfo& dst, uint32_t width,
                                                   uint32_t height);
 [[nodiscard]] bool ResolveUnitQuadPresentationViewport(
-    const std::array<std::array<float, 2>, 4>& ndc, VkExtent2D extent,
+    const std::array<std::array<float, 2>, 4>& ndc, vk::Extent2D extent,
     std::array<float, 2>* scale, std::array<float, 2>* offset);
+[[nodiscard]] int32_t        ResolveVertexOffset(uint32_t                     index_offset,
+                                                 const ShaderVertexInputInfo& vs_input_info);
 
 } // namespace Libs::Graphics
 

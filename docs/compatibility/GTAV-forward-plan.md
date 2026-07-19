@@ -347,12 +347,25 @@ wave-size decode or the workgroup-wave64 implementation, so it is not expected t
 itself. It may still improve long-term transfer, synchronization, and Vulkan maintenance, but its
 95-file overlap makes an in-place merge too risky for the known GTA baseline.
 
-Commit the audited work above on `feature/gtav-compatibility`, then create
-`feature/gtav-upstream-bd9086e` at that exact tip and merge `upstream/main` only there. Keep the
-original branch pointer unchanged as the pre-refactor fallback. Resolve conflicts by retaining the
-generic GTA semantics while adapting them to upstream's new Vulkan-Hpp and transfer abstractions;
-do not apply any stash wholesale. The integration branch can replace the baseline only after a
-Release build, every standalone regression, and a like-for-like Story Mode run.
+The isolation plan is complete. `feature/gtav-compatibility` is preserved at `3e9e0b9` after the
+four audited commits (`31467bb`, `1b4f1b4`, `7163ff6`, `3e9e0b9`). The active integration branch is
+`feature/gtav-upstream-bd9086e`, created from that exact tip and merged with `upstream/main` at
+`bd9086e`. No stash was applied and the three recovery stashes remain intact.
+
+Twenty-one conflicts were resolved by keeping upstream's Vulkan-Hpp handles, centralized transfer
+helpers, and resource-lifetime structure while porting the existing GTA cache, metadata,
+descriptor, command-generation, and workgroup-wave64 semantics to those interfaces. A subsequent
+compiler-driven audit restored format-usage texture selection, shader-address write propagation,
+the texture address updater, DCC initialization/readback, and the affected regression coverage
+where mechanical conflict resolution was insufficient. Release `kyty_emulator` builds, the focused
+shader suites pass, all eleven standalone regression executables pass, and the diff checks are
+clean. The refactor is therefore code-safe enough for comparison testing, but it is not yet the
+new gameplay baseline.
+
+Next action: run the same quiet Story Mode reproducer from
+`feature/gtav-upstream-bd9086e`. Compare the last completed submit, shader address, shader count,
+audio state, and first fatal diagnostic with blocker 47. Keep `feature/gtav-compatibility` as the
+immediate fallback unless the refactored branch matches or advances the prior result.
 
 ## Verification gate
 

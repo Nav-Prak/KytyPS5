@@ -19,7 +19,8 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderTargetBarriers.h"
 #include "graphics/host_gpu/renderer/resourceMutex.h"
-#include "graphics/host_gpu/utils.h"
+#include "graphics/host_gpu/transfer.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -82,11 +83,11 @@ void InitializeVideoOutDccContent(GraphicContext* ctx, VideoOutVulkanImage* imag
 		EXIT("TextureCache: unsupported DCC native initialization, content=%u\n",
 		     static_cast<uint32_t>(content));
 	}
-	image->layout = VK_IMAGE_LAYOUT_UNDEFINED;
-	UtilScratchBuffer scratch(info.size);
+	image->layout = vk::ImageLayout::eUndefined;
+	Transfer::ScratchBuffer scratch(info.size);
 	std::memset(scratch.Data(), 0, static_cast<size_t>(info.size));
-	UtilFillImage(ctx, image, scratch.Data(), info.size, info.pitch,
-	              static_cast<uint64_t>(VK_IMAGE_LAYOUT_GENERAL));
+	Transfer::UploadImage(ctx, image, scratch.Data(), info.size, info.pitch,
+	                      vk::ImageLayout::eGeneral);
 }
 
 class FaultSafeTextureLock final {
@@ -135,7 +136,6 @@ struct TextureCache::CachedImage {
 	VideoOutInfo           video_out;
 	GraphicContext*        ctx   = nullptr;
 	VulkanImage*           image = nullptr;
-	VulkanMemory           memory;
 	bool                   gpu_modified        = false;
 	bool                   buffer_modified     = false;
 	bool                   stencil_initialized = false;
@@ -151,21 +151,7 @@ struct TextureCache::CachedImage {
 			     static_cast<const void*>(ctx), static_cast<const void*>(image),
 			     static_cast<uint32_t>(kind), registered);
 		}
-		switch (kind) {
-			case Kind::Texture:
-			case Kind::StorageTexture:
-				ImageOps::Destroy(ctx, static_cast<GpuTextureVulkanImage*>(image), &memory);
-				break;
-			case Kind::RenderTarget:
-				ImageOps::Destroy(ctx, static_cast<RenderTextureVulkanImage*>(image), &memory);
-				break;
-			case Kind::DepthTarget:
-				ImageOps::Destroy(ctx, static_cast<DepthStencilVulkanImage*>(image), &memory);
-				break;
-			case Kind::VideoOut:
-				ImageOps::Destroy(ctx, static_cast<VideoOutVulkanImage*>(image), &memory);
-				break;
-		}
+		ImageOps::Destroy(ctx, image);
 		image = nullptr;
 	}
 
@@ -283,7 +269,7 @@ VulkanImage* TextureCache::PublishImage(CommandBuffer*               command,
 		     image != nullptr ? static_cast<const void*>(image->image) : nullptr,
 		     image != nullptr && image->registered);
 	}
-	auto* result = image->image;
+	auto result = image->image;
 	command->RetainResourceUntilFence(image);
 	m_images.push_back(std::move(image));
 	RegisterImageLocked(*m_images.back());
@@ -429,10 +415,10 @@ struct TextureCache::ReadbackWorker {
 		                             size <= info.address + info.size - vaddr;
 		const bool  d16 =
 		    info.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm) &&
-		    info.format == VK_FORMAT_D16_UNORM && info.bytes_per_element == 2;
+		    info.format == vk::Format::eD16Unorm && info.bytes_per_element == 2;
 		const bool d32 =
 		    info.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float) &&
-		    info.format == VK_FORMAT_D32_SFLOAT && info.bytes_per_element == 4;
+		    info.format == vk::Format::eD32Sfloat && info.bytes_per_element == 4;
 		TileSizeAlign expected_stencil {};
 		TileSizeAlign expected_htile {};
 		TileSizeAlign expected_depth {};
@@ -497,10 +483,10 @@ struct TextureCache::ReadbackWorker {
 		download.resize(info.size);
 		std::fill(download.begin(), download.end(), 0);
 		const auto regions =
-		    MakeLayeredImageBufferCopies(info.layers, slice_size, info.pitch, info.width,
-		                                 info.height, VK_IMAGE_ASPECT_DEPTH_BIT);
-		UtilFillBuffer(cached.ctx, download.data(), info.size, regions, cached.image,
-		               cached.image->layout);
+		    Transfer::MakeLayeredImageBufferCopies(info.layers, slice_size, info.pitch, info.width,
+		                                           info.height, vk::ImageAspectFlagBits::eDepth);
+		Transfer::DownloadImage(cached.ctx, download.data(), info.size, regions, cached.image,
+		                        cached.image->layout);
 		guest.resize(info.size);
 		cache.m_tiler.TileImage(guest.data(), download.data(), info);
 		Libs::LibKernel::Memory::WriteBacking(info.address, guest.data(), info.size);
@@ -511,7 +497,7 @@ struct TextureCache::ReadbackWorker {
 		const bool storage = cached.kind == CachedImage::Kind::StorageTexture;
 		const bool target  = cached.kind == CachedImage::Kind::RenderTarget;
 		const auto info    = storage ? MakeColorImageTransferInfo(
-		                                   cached.info, Prospero::SurfaceFormat(cached.info.format),
+		                                   cached.info, VulkanFormat(cached.info.format),
 		                                   Prospero::NumBytesPerElement(cached.info.format))
 		                             : MakeColorImageTransferInfo(cached.target);
 		const bool linear  = info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
@@ -542,10 +528,10 @@ struct TextureCache::ReadbackWorker {
 		}
 		download.resize(info.size);
 		std::fill(download.begin(), download.end(), 0);
-		const auto regions =
-		    MakeLayeredImageBufferCopies(layers, slice_size, info.pitch, info.width, info.height);
-		UtilFillBuffer(cached.ctx, download.data(), info.size, regions, cached.image,
-		               cached.image->layout);
+		const auto regions = Transfer::MakeLayeredImageBufferCopies(layers, slice_size, info.pitch,
+		                                                            info.width, info.height);
+		Transfer::DownloadImage(cached.ctx, download.data(), info.size, regions, cached.image,
+		                        cached.image->layout);
 		if (tiled_target || tiled_storage || standard4_storage) {
 			guest.resize(info.size);
 			if (standard4_storage) {
@@ -846,7 +832,7 @@ bool Equal(const DepthTargetInfo& left, const DepthTargetInfo& right) {
 }
 
 void AppendLayerCopies(std::vector<ImageImageCopy>& regions, VulkanImage* source,
-                       VkImageAspectFlags aspect) {
+                       vk::ImageAspectFlags aspect) {
 	for (uint32_t layer = 0; layer < source->layers; layer++) {
 		for (uint32_t level = 0; level < source->mip_levels; level++) {
 			ImageImageCopy region {};
@@ -985,7 +971,7 @@ void TextureCache::RetireSampledTargetAliases(GraphicContext* ctx, const ImageIn
 	}
 	RequireRetirementIsolation(retire, "sampled target", requested.address, requested.size);
 	if (wait_idle) {
-		VulkanDeviceWaitIdle(ctx);
+		Transfer::WaitForGraphicsIdle(ctx);
 	}
 	for (auto* cached: retire) {
 		if (!cached->gpu_modified) {
@@ -1088,7 +1074,7 @@ void TextureCache::RetireStorageDepthAliasLocked(GraphicContext* ctx, const Imag
 		    cached.ctx == ctx && cached.gpu_modified && !cached.buffer_modified &&
 		    depth.address == requested.address && depth.size == requested.size &&
 		    depth.stencil_address == 0 && depth.stencil_size == 0 && depth.htile_address == 0 &&
-		    depth.htile_size == 0 && depth.layers == 1 && depth.format == VK_FORMAT_D32_SFLOAT &&
+		    depth.htile_size == 0 && depth.layers == 1 && depth.format == vk::Format::eD32Sfloat &&
 		    depth.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float) &&
 		    depth.bytes_per_element == 4 && depth.width == requested.width &&
 		    depth.height == requested.height && depth.pitch == requested.pitch &&
@@ -1108,7 +1094,7 @@ void TextureCache::RetireStorageDepthAliasLocked(GraphicContext* ctx, const Imag
 	if (selected == nullptr) {
 		return;
 	}
-	VulkanDeviceWaitIdle(ctx);
+	Transfer::WaitForGraphicsIdle(ctx);
 	const auto transfer = m_readback->DownloadDepthTarget(*selected, false);
 	m_memory_tracker.ForEachDownloadRange<true>(transfer.address, transfer.size,
 	                                            [](uint64_t, uint64_t) noexcept {});
@@ -1119,7 +1105,7 @@ void TextureCache::RetireStorageDepthAliasLocked(GraphicContext* ctx, const Imag
 TextureCache::~TextureCache() {
 	m_readback.reset();
 	if (!m_images.empty()) {
-		VulkanDeviceWaitIdle(m_images.front()->ctx);
+		Transfer::WaitForGraphicsIdle(m_images.front()->ctx);
 	}
 	for (const auto& image: m_images) {
 		UnregisterImageLocked(*image, false);
@@ -1164,7 +1150,7 @@ VulkanImage* TextureCache::FindTexture(CommandBuffer* command, GraphicContext* c
 		     info.address, info.size, metadata_read);
 	}
 	std::shared_ptr<CachedImage> storage_match;
-	const auto requested_view_format = TextureGetFormat(info.format, TextureFormatUsage::Sampled);
+	const auto                   requested_view_format = TextureGetFormat(info.format);
 	for (auto& cached: m_images) {
 		if (cached->kind != CachedImage::Kind::StorageTexture) {
 			continue;
@@ -1293,8 +1279,8 @@ VulkanImage* TextureCache::FindTexture(CommandBuffer* command, GraphicContext* c
 	cached->kind = CachedImage::Kind::Texture;
 	cached->info = info;
 	cached->ctx  = ctx;
-	VkComponentMapping components {};
-	cached->image = ImageOps::CreateTexture(ctx, info, false, &cached->memory, &components);
+	vk::ComponentMapping components {};
+	cached->image = ImageOps::CreateTexture(ctx, info, false, &components);
 	m_memory_tracker.ForEachUploadRange(
 	    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
 	    [&]() noexcept {
@@ -1429,8 +1415,8 @@ StorageTextureVulkanImage* TextureCache::FindStorageTexture(CommandBuffer*   com
 	cached->kind = CachedImage::Kind::StorageTexture;
 	cached->info = info;
 	cached->ctx  = ctx;
-	VkComponentMapping components {};
-	cached->image = ImageOps::CreateTexture(ctx, info, true, &cached->memory, &components);
+	vk::ComponentMapping components {};
+	cached->image = ImageOps::CreateTexture(ctx, info, true, &components);
 	m_memory_tracker.ForEachUploadRange(
 	    info.address, info.size, true, [](uint64_t, uint64_t) noexcept {},
 	    [&]() noexcept {
@@ -1448,7 +1434,7 @@ RenderTextureVulkanImage* TextureCache::FindRenderTarget(CommandBuffer*         
                                                          const RenderTargetInfo& info) {
 	const bool standard64 = IsSupportedStandard64RenderTarget(info);
 	if (info.address == 0 || info.size == 0 || info.address >= TRACKER_ADDRESS_SIZE ||
-	    info.size > TRACKER_ADDRESS_SIZE - info.address || info.format == VK_FORMAT_UNDEFINED ||
+	    info.size > TRACKER_ADDRESS_SIZE - info.address || info.format == vk::Format::eUndefined ||
 	    info.width == 0 || info.height == 0 || info.pitch < info.width ||
 	    info.bytes_per_element == 0 || info.levels == 0 || info.levels > 16 || info.layers == 0 ||
 	    info.size % info.layers != 0 ||
@@ -1640,7 +1626,7 @@ RenderTextureVulkanImage* TextureCache::FindRenderTarget(CommandBuffer*         
 	}
 	RequireRetirementIsolation(retire, "render target", info.address, info.size);
 	if (!readback.empty()) {
-		VulkanDeviceWaitIdle(ctx);
+		Transfer::WaitForGraphicsIdle(ctx);
 		for (auto* cached: readback) {
 			const auto transfer = m_readback->DownloadColorImage(*cached);
 			m_memory_tracker.ForEachDownloadRange<true>(transfer.address, transfer.size,
@@ -1658,7 +1644,7 @@ RenderTextureVulkanImage* TextureCache::FindRenderTarget(CommandBuffer*         
 	cached->kind               = CachedImage::Kind::RenderTarget;
 	cached->target             = info;
 	cached->ctx                = ctx;
-	cached->image              = ImageOps::CreateRenderTarget(ctx, info, &cached->memory);
+	cached->image              = ImageOps::CreateRenderTarget(ctx, info);
 	const bool preserve_native = native_image_source != nullptr;
 	if (preserve_native) {
 		command->RetainResourceUntilFence(native_image_source);
@@ -1683,9 +1669,8 @@ RenderTextureVulkanImage* TextureCache::FindRenderTarget(CommandBuffer*         
 		std::vector<ImageImageCopy> regions;
 		regions.reserve(static_cast<size_t>(native_image_source->image->layers) *
 		                native_image_source->image->mip_levels);
-		AppendLayerCopies(regions, native_image_source->image, VK_IMAGE_ASPECT_COLOR_BIT);
-		UtilImageToImage(command, regions, cached->image,
-		                 static_cast<uint64_t>(RENDER_COLOR_IMAGE_LAYOUT));
+		AppendLayerCopies(regions, native_image_source->image, vk::ImageAspectFlagBits::eColor);
+		Transfer::CopyImage(command, regions, cached->image, RENDER_COLOR_IMAGE_LAYOUT);
 	} else {
 		m_memory_tracker.ForEachUploadRange(
 		    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
@@ -1934,7 +1919,7 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 	cached->depth               = info;
 	cached->ctx                 = ctx;
 	cached->stencil_initialized = !has_stencil;
-	cached->image               = ImageOps::CreateDepthTarget(ctx, info, &cached->memory);
+	cached->image               = ImageOps::CreateDepthTarget(ctx, info);
 	if (discarded_depth_source != nullptr) {
 		command->RetainResourceUntilFence(discarded_depth_source);
 	}
@@ -1983,17 +1968,18 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 		}
 		std::vector<ImageImageCopy> regions;
 		regions.reserve(native_depth_source->image->layers * (has_stencil ? 2u : 1u));
-		AppendLayerCopies(regions, native_depth_source->image, VK_IMAGE_ASPECT_DEPTH_BIT);
+		AppendLayerCopies(regions, native_depth_source->image, vk::ImageAspectFlagBits::eDepth);
 		if (has_stencil) {
-			AppendLayerCopies(regions, native_depth_source->image, VK_IMAGE_ASPECT_STENCIL_BIT);
+			AppendLayerCopies(regions, native_depth_source->image,
+			                  vk::ImageAspectFlagBits::eStencil);
 		}
-		UtilImageToImage(command, regions, cached->image,
-		                 static_cast<uint64_t>(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL));
+		Transfer::CopyImage(command, regions, cached->image,
+		                    vk::ImageLayout::eDepthStencilAttachmentOptimal);
 		cached->gpu_modified = true;
 	} else {
 		if (sampled_depth_source != nullptr &&
 		    (sampled_depth_source->image->type != VulkanImageType::Texture ||
-		     sampled_depth_source->image->format != Prospero::SurfaceFormat(info.guest_format) ||
+		     sampled_depth_source->image->format != VulkanFormat(info.guest_format) ||
 		     sampled_depth_source->image->extent.width != info.width ||
 		     sampled_depth_source->image->extent.height != info.height)) {
 			EXIT("TextureCache: sampled-depth native source is inconsistent\n");
@@ -2015,11 +2001,11 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 					    break;
 				    case DepthTransitionSource::Native:
 					    command->RetainResourceUntilFence(sampled_depth_source);
-					    UtilCopyImageWithBuffer(
-					        command, ctx, sampled_depth_source->image, VK_IMAGE_ASPECT_COLOR_BIT,
-					        cached->image, VK_IMAGE_ASPECT_DEPTH_BIT, info.bytes_per_element,
-					        static_cast<uint64_t>(
-					            VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL));
+					    Transfer::CopyImageViaBuffer(
+					        command, ctx, sampled_depth_source->image,
+					        vk::ImageAspectFlagBits::eColor, cached->image,
+					        vk::ImageAspectFlagBits::eDepth, info.bytes_per_element,
+					        vk::ImageLayout::eDepthStencilAttachmentOptimal);
 					    break;
 			    }
 		    });
@@ -2101,7 +2087,7 @@ TextureCache::RegisterVideoOutSurfaces(GraphicContext*                  ctx,
 		cached->kind      = CachedImage::Kind::VideoOut;
 		cached->video_out = info;
 		cached->ctx       = ctx;
-		cached->image     = ImageOps::CreateVideoOut(ctx, info, &cached->memory);
+		cached->image     = ImageOps::CreateVideoOut(ctx, info);
 		if (info.compression == VideoOutCompression::Uncompressed) {
 			m_memory_tracker.ForEachUploadRange(
 			    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
@@ -2476,7 +2462,7 @@ void TextureCache::UnregisterVideoOutSurfaces(const std::vector<VideoOutVulkanIm
 			     cached->Address(), cached->Size());
 		}
 	}
-	VulkanDeviceWaitIdle(ctx);
+	Transfer::WaitForGraphicsIdle(ctx);
 	for (auto* cached: selected) {
 		if (cached->gpu_modified) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(cached->Address(), cached->Size());
@@ -2598,18 +2584,17 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer* command, uint64_t vaddr, 
 		     image_cpu_modified);
 	}
 
-	auto* vk_buffer = command->GetPool()->buffers[command->GetIndex()];
+	auto vk_buffer = command->Handle();
 	if (aspect == ClearAspect::Color) {
-		VkClearColorValue clear {};
+		vk::ClearColorValue clear {};
 		if (!DecodePackedColorClear(match->image->format, packed_clear, &clear)) {
 			return false;
 		}
 		GraphicsRenderColorImageBarrier(vk_buffer, match->image,
-		                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-		const VkImageSubresourceRange range {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS,
-		                                     0, match->image->layers};
-		vkCmdClearColorImage(vk_buffer, match->image->image, match->image->layout, &clear, 1,
-		                     &range);
+		                                vk::ImageLayout::eTransferDstOptimal);
+		const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0,
+		                                       VK_REMAINING_MIP_LEVELS, 0, match->image->layers};
+		vk_buffer.clearColorImage(match->image->image, match->image->layout, &clear, 1, &range);
 		GraphicsRenderColorImageBarrier(vk_buffer, match->image, RENDER_COLOR_IMAGE_LAYOUT);
 		if (!match->gpu_modified) {
 			m_memory_tracker.MarkRegionAsGpuModified(vaddr, size);
@@ -2619,22 +2604,22 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer* command, uint64_t vaddr, 
 		return true;
 	}
 
-	if (match->image->layout == VK_IMAGE_LAYOUT_UNDEFINED ||
-	    match->image->layout == VK_IMAGE_LAYOUT_PREINITIALIZED) {
+	if (match->image->layout == vk::ImageLayout::eUndefined ||
+	    match->image->layout == vk::ImageLayout::ePreinitialized) {
 		EXIT("TextureCache: compute %s clear has invalid source layout %u\n",
 		     aspect == ClearAspect::Depth ? "depth" : "stencil",
 		     static_cast<uint32_t>(match->image->layout));
 	}
 	const auto old_layout = match->image->layout;
 	GraphicsRenderDepthStencilImageBarrier(vk_buffer, match->image,
-	                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-	const VkClearDepthStencilValue clear {depth_clear, stencil_clear};
-	const auto                     clear_aspect = static_cast<VkImageAspectFlags>(
-	    aspect == ClearAspect::Depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_STENCIL_BIT);
-	const VkImageSubresourceRange range {clear_aspect, 0, VK_REMAINING_MIP_LEVELS, 0,
-	                                     match->image->layers};
-	vkCmdClearDepthStencilImage(vk_buffer, match->image->image, match->image->layout, &clear, 1,
-	                            &range);
+	                                       vk::ImageLayout::eTransferDstOptimal);
+	const vk::ClearDepthStencilValue clear {depth_clear, stencil_clear};
+	const auto                       clear_aspect = static_cast<vk::ImageAspectFlags>(
+	    aspect == ClearAspect::Depth ? vk::ImageAspectFlagBits::eDepth
+	                                 : vk::ImageAspectFlagBits::eStencil);
+	const vk::ImageSubresourceRange range {clear_aspect, 0, VK_REMAINING_MIP_LEVELS, 0,
+	                                       match->image->layers};
+	vk_buffer.clearDepthStencilImage(match->image->image, match->image->layout, &clear, 1, &range);
 	GraphicsRenderDepthStencilImageBarrier(vk_buffer, match->image, old_layout);
 	if (aspect == ClearAspect::Stencil) {
 		match->stencil_initialized = true;
@@ -2808,7 +2793,7 @@ void TextureCache::SynchronizeColorImageToBufferLocked(CachedImage& cached, uint
 		const auto& info         = cached.info;
 		target.address           = info.address;
 		target.size              = info.size;
-		target.format            = Prospero::SurfaceFormat(info.format);
+		target.format            = VulkanFormat(info.format);
 		target.width             = info.width;
 		target.height            = info.height;
 		target.pitch             = info.pitch;
@@ -2883,7 +2868,7 @@ void TextureCache::SynchronizeColorImageToBufferLocked(CachedImage& cached, uint
 	// This is the CPU Tiler backend for the image-to-buffer synchronization seam.
 	// The vectors and Vulkan staging allocation retain capacity; a future PS5 GPU tiler can replace
 	// this block without changing alias classification or ownership transitions.
-	VulkanDeviceWaitIdle(cached.ctx);
+	Transfer::WaitForGraphicsIdle(cached.ctx);
 	m_buffer_transition_linear.resize(target.size);
 	std::fill(m_buffer_transition_linear.begin(), m_buffer_transition_linear.end(), 0);
 	std::vector<ImageBufferCopy> regions;
@@ -2903,11 +2888,11 @@ void TextureCache::SynchronizeColorImageToBufferLocked(CachedImage& cached, uint
 			                   upload.dst_y, upload.dst_z, upload.aspect});
 		}
 	} else {
-		regions = MakeLayeredImageBufferCopies(target.layers, slice_size, target.pitch,
-		                                       target.width, target.height);
+		regions = Transfer::MakeLayeredImageBufferCopies(target.layers, slice_size, target.pitch,
+		                                                 target.width, target.height);
 	}
-	UtilFillBuffer(cached.ctx, m_buffer_transition_linear.data(), target.size, regions,
-	               cached.image, cached.image->layout);
+	Transfer::DownloadImage(cached.ctx, m_buffer_transition_linear.data(), target.size, regions,
+	                        cached.image, cached.image->layout);
 	if (storage) {
 		m_buffer_transition_guest.resize(target.size);
 		m_tiler.TileImage(m_buffer_transition_guest.data(), m_buffer_transition_linear.data(),
@@ -2944,10 +2929,10 @@ void TextureCache::SynchronizeDepthImageToBufferLocked(CachedImage& cached, uint
 	TileSizeAlign expected_depth {};
 	const bool    d16 =
 	    info.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm) &&
-	    info.format == VK_FORMAT_D16_UNORM && info.bytes_per_element == 2;
+	    info.format == vk::Format::eD16Unorm && info.bytes_per_element == 2;
 	const bool d32 =
 	    info.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float) &&
-	    info.format == VK_FORMAT_D32_SFLOAT && info.bytes_per_element == 4;
+	    info.format == vk::Format::eD32Sfloat && info.bytes_per_element == 4;
 	const bool layout =
 	    (d16 || d32) &&
 	    TileGetDepthSize(info.width, info.height, 0,
@@ -2969,13 +2954,13 @@ void TextureCache::SynchronizeDepthImageToBufferLocked(CachedImage& cached, uint
 		     info.layers, static_cast<int>(info.format), info.guest_format, info.bytes_per_element,
 		     has_stencil, has_htile, cached.gpu_modified, cached.buffer_modified);
 	}
-	VulkanDeviceWaitIdle(cached.ctx);
+	Transfer::WaitForGraphicsIdle(cached.ctx);
 	m_buffer_transition_linear.resize(info.size);
 	std::fill(m_buffer_transition_linear.begin(), m_buffer_transition_linear.end(), 0);
-	const auto regions = MakeLayeredImageBufferCopies(1, info.size, info.pitch, info.width,
-	                                                  info.height, VK_IMAGE_ASPECT_DEPTH_BIT);
-	UtilFillBuffer(cached.ctx, m_buffer_transition_linear.data(), info.size, regions, cached.image,
-	               cached.image->layout);
+	const auto regions = Transfer::MakeLayeredImageBufferCopies(
+	    1, info.size, info.pitch, info.width, info.height, vk::ImageAspectFlagBits::eDepth);
+	Transfer::DownloadImage(cached.ctx, m_buffer_transition_linear.data(), info.size, regions,
+	                        cached.image, cached.image->layout);
 	m_buffer_transition_guest.resize(info.size);
 	m_tiler.TileImage(m_buffer_transition_guest.data(), m_buffer_transition_linear.data(), info);
 	Libs::LibKernel::Memory::WriteBacking(info.address, m_buffer_transition_guest.data(),
@@ -3586,7 +3571,7 @@ void TextureCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		}
 	}
 	if (wait_ctx != nullptr) {
-		VulkanDeviceWaitIdle(wait_ctx);
+		Transfer::WaitForGraphicsIdle(wait_ctx);
 	}
 	for (auto& cached: m_images) {
 		if (!cached->OverlapsRange(vaddr, size, false) || !cached->gpu_modified) {

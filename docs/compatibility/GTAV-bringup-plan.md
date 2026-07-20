@@ -783,6 +783,35 @@ Deterministic compatibility blockers fixed in this phase (continuing the list):
     ballot shape. Release `kyty_emulator` and both shader test targets build, all eleven standalone
     regression executables pass, and in-game validation beyond frame 1932 is pending.
 
+50. Auditing the wave64 cross-lane value path built by blockers 47-49 found a concrete DPP defect
+    that corrupts any wave64 reduction. The RDNA2 DPP control field is decoded as a full nine-bit
+    value and passed straight to the emitter, but `EmitDppTargetLane` handled only quad-permute,
+    the three row shift/rotate forms, and the two mirror forms. The cross-row broadcast controls
+    `row_bcast15` (`0x142`) and `row_bcast31` (`0x143`) fell through to the identity return, so a
+    lane read *itself* instead of the broadcast source lane. These two controls are precisely the
+    final combine stages of the canonical wave64 sum/max reduction — after four `row_shr` steps
+    reduce each sixteen-lane row, `row_bcast15` carries lane 15 into lanes 16-31 and lane 47 into
+    lanes 48-63, then `row_bcast31` carries lane 31 into lanes 32-63. Emulating them as identity
+    makes the reduction add each partial to itself rather than to the neighboring row, so a shader
+    that reduces across its 64-lane wave computes a wrong aggregate. In the decoupled-lookback scan
+    of `0x9039cff00` a wrong per-partition aggregate would keep followers polling a state that never
+    advances, which is consistent with the observed post-pipeline device loss, though this fix is
+    not yet proven to be the sole submission-44572 terminator.
+
+    `EmitDppTargetLane` now maps both controls to a shared `EmitDppRowBroadcastTargetLane` helper.
+    `row_bcast31` selects lane 31 for every lane at or above 32 and self otherwise; `row_bcast15`
+    uses bit 4 to detect the upper sixteen lanes of each 32-lane block and selects `(lane & 0x20) |
+    15` for them, i.e. lane 15 for lanes 16-31 and lane 47 for lanes 48-63, self otherwise. Every
+    lane has a valid in-bounds source, so the fetch stays active and the existing bound-control and
+    fetch-inactive paths are unchanged. The same target-lane math is correct for a 32-lane wave,
+    where `row_bcast31` reduces to identity and `row_bcast15` broadcasts lane 15 into lanes 16-31.
+    Two Vulkan-executed regressions run 64-thread wave64 dispatches through the isolated
+    workgroup-scratch path (`guest_wave64_scratch` + `OpControlBarrier`, no native subgroup
+    shuffle) and verify the exact per-lane broadcast for both controls; expected values are derived
+    from the ISA definition, not from the implementation. The full `shader_recompiler_compute_tests`
+    suite passes, including the existing quad-permute, bank-mask, and bounds-control DPP cases; an
+    in-game retest beyond frame 1932 / the submission-44572 device loss is pending.
+
 The same build also closes the three called static-import groups identified by the first Ghidra
 campaign. `ziVA3whp3p4` is registered as the alternate AGC rewind export proven by its get-size,
 packet-write, and initial-state caller sequence. The five recovered NpUtility handlers preserve the
@@ -893,7 +922,8 @@ confirm `0x9039cff00` passes frame 1932 and its former queue-1 submission-44572 
 the first subsequent deterministic failure or visible progress. Do not restore helper-generated
 selection blocks in the workgroup ballot, the split 32-bit atomic approximation, weaken atomicity,
 broaden the qword-load matcher, force either kernel to wave32, admit conditional multi-wave
-barriers, or relax texture-cache ownership without new evidence. The remaining
+barriers, revert the `row_bcast15`/`row_bcast31` DPP target lanes to identity, or relax
+texture-cache ownership without new evidence. The remaining
 capability backlog is
 `VOP3 0x14c` (native FP64 paired-register FMA) and two `MIMG 0xe6` BVH variants; none may be
 approximated as an ordinary F32/image operation. Preserve the oversized-window size guard and

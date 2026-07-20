@@ -116,6 +116,34 @@ Get runtime VALUE visibility. Options:
 The offline cross-lane-reduction regression is the highest-value non-game-run step: if the wave64
 workgroup shuffle/ballot/reduce produces a wrong value for a known input, that IS the bug.
 
+### FOUND (2026-07-19): `row_bcast15`/`row_bcast31` DPP emulated as identity (blocker 50)
+
+Pursuing candidate 1 by auditing the cross-lane value path (not the game) found a concrete instance
+of it. `EmitDppTargetLane` (`spirvEmitterValues.cpp`) handled quad-perm, row shift/rotate, and the
+two mirror controls, but **fell through to the identity `return {subid, ...}` for `row_bcast15`
+(dpp_ctrl `0x142`) and `row_bcast31` (`0x143`)** — even though the decoder passes the full nine-bit
+dpp_ctrl through unvalidated, so those controls reach the emitter and silently self-shuffle. These
+two are the **final cross-row combine stages of the canonical wave64 reduction**: after four
+`row_shr` steps reduce each 16-lane row, `row_bcast15` carries lane 15 → lanes 16-31 and lane 47 →
+lanes 48-63, then `row_bcast31` carries lane 31 → lanes 32-63. Emulated as identity, the reduction
+adds each partial to itself instead of the neighboring row → **wrong per-partition aggregate**,
+which is exactly candidate 1's "the scan never reaches state 2, followers poll forever."
+
+Fix: added `EmitDppRowBroadcastTargetLane`; `0x142` → `(lane & 0x10) ? ((lane & 0x20) | 15) : lane`,
+`0x143` → `(lane >= 32) ? 31 : lane`. All lanes have a valid in-bounds source so the fetch stays
+active. Validated by two new Vulkan-executed wave64 regressions (`DppRowBroadcast15Wave64`,
+`DppRowBroadcast31Wave64`) that run 64-thread dispatches through the isolated workgroup-scratch path
+(`guest_wave64_scratch` + `OpControlBarrier`, `forbidden: OpGroupNonUniformShuffle`) and check the
+exact per-lane broadcast; expected values come from the ISA, not the implementation. Full
+`shader_recompiler_compute_tests` passes.
+
+**Still pending in-game confirmation** that `0x9039cff00` actually uses `row_bcast` and that this
+clears submission-44572 device loss. Not yet proven to be the sole terminator — it is a proven bug
+in the same reduction path. To confirm the shader uses it, dump the decoded RDNA2
+(`--shader-log-direction File`, `DumpShaderRecompilerOriginal`) and grep for `row_bcast`. If a
+retest still hangs, the next candidate is a different cross-lane primitive (`ds_swizzle`,
+`v_permlane`, or a `readlane`-based reduction) or candidate 2 (forward progress).
+
 ### Diagnostic added (built, ran — served its purpose; can be removed later)
 
 Added targeted logging in `descriptors.cpp` `BindDescriptors` (the buffer loop): for

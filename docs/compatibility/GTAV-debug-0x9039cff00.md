@@ -202,6 +202,50 @@ ever publish a terminating state and whether the polled slots match — separati
 (some other wrong value) from a visibility/initialization problem. Do NOT change the wave64 machinery
 further without that evidence; it is now audited and test-covered.
 
+## Run of 2026-07-19 (80 shaders, submit_seq 39690) — mechanics all verified correct
+
+The retest carrying the blocker-50 row_bcast fix still lost the device, as expected: this shader has
+no `row_bcast`. New facts from that log and the matching 29,280-word SPIR-V dump:
+
+- **The shader is dispatched exactly ONCE and hangs on that first dispatch.** `grep -c` on the
+  submit pattern returns 2 only because the `vkWaitForFences failed` line repeats the same `args=`
+  text; there is a single `vkQueueSubmit`, `DispatchDirect(6,1,1)`, `submit_seq=39690`, queue 0.
+  Cross-dispatch drift of the ticket counter is therefore **not** the mechanism in this run.
+- **The `Vulkan running N 64-lane compute wave...` line is rate-limited to the first 16 emissions**
+  (`shaders.cpp` `log_count < 16`), and exactly 16 appear. Its absence for a given shader proves
+  nothing. `0x9039cff00` must be on `WorkgroupWave64` anyway: `ConfigureShaderSubgroup` would have
+  hit the `Unsupported` `EXIT` for a 64-wide compute program that needs exact subgroup ops, and no
+  such exit occurred.
+- **The 256-byte bind-remainder is correct on the qword view.** buf[2] reports
+  `desc_base=0x60a5be6708` but `offset=0x6700`, i.e. remainder 8. `EmitMemoryByteAddress` adds that
+  remainder for both the publish (`EmitAtomicSwapU64`) and the poll (`EmitAtomicQwordAcquireLoad`),
+  so both compute `qword_index = (8 + p*8) >> 3 = 1 + p` — consistent, 8-aligned, and inside the
+  `OpArrayLength` of `0x38/8 = 7` for partitions 0..5. buf[0]'s ticket counter has remainder 0.
+- **The poll loop is structurally correct in the emitted SPIR-V.** Loop header `%227` re-loads `v9`
+  (`%2862`), recomputes the per-lane predicate `v9 == 0 && exec_active` (`%2864`), runs the
+  branch-free workgroup ballot (`OpAtomicAnd` / barrier / `OpAtomicOr` / barrier / load / barrier)
+  into `vcc`, derives `scc`, and exits on `%2905`. The three barriers live in the loop header and so
+  re-execute every iteration under uniform control flow. Inside the body the atomic load is guarded
+  only by `aligned && in_range` (`%2966`); the write-back to `v9` is separately exec-masked, so
+  exec-inactive lanes retain the `v9 = 1` set at guest PC `0x2b0` and never hold the loop open.
+- `EmitDeviceAtomicMemoryBarrier` emits `OpMemoryBarrier`, not `OpControlBarrier`, so the
+  publish's divergent (`exec = lane 0`) region contains no execution barrier — no deadlock there.
+
+Every mechanical layer — reduction value, cross-lane primitives, exec masking, qword index, bounds,
+memory ordering, loop structure, barrier placement — has now been verified. What has **never** been
+observed is the **contents** of buf[0] and buf[2] at dispatch start. If the ticket counter does not
+begin at 0, every workgroup takes a partition index past the 6-record array; publishes then fall
+outside `OpArrayLength` and are dropped, and pollers read out-of-range slots whose phi default is
+**zero** — which is exactly the loop's "keep spinning" value. That single unobserved input explains
+the hang without contradicting any verified layer.
+
+`descriptors.cpp` now dumps up to 12 leading guest dwords per buffer next to each `ScanBufferBind`
+line (`buf[N] guest@0x... dwords: ...`). The CPU read enters the memory tracker's fault path, which
+synchronizes native bytes, so it reports the authoritative contents. Read buf[0]'s single dword (the
+ticket counter — expect 0) and buf[2]'s 12 dwords (six `{state, value}` pairs — expect all zero, i.e.
+state INVALID, before the scan). A nonzero counter or pre-set states confirms the initialization
+candidate and points at which clear the emulator is losing.
+
 ### Diagnostic added (built, ran — served its purpose; can be removed later)
 
 Added targeted logging in `descriptors.cpp` `BindDescriptors` (the buffer loop): for

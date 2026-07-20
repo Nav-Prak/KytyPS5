@@ -35,9 +35,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
+#include <string>
 
 #ifdef min
 #undef min
@@ -941,6 +943,30 @@ BindDescriptors(uint64_t submit_id, CommandBuffer* buffer,
 				     i, b.bindless, b.written, b.read, b.atomic, descriptor.Base48(),
 				     descriptor.Stride(), descriptor.NumRecords(),
 				     static_cast<uint64_t>(view.range), static_cast<uint64_t>(view.offset));
+				// Dump the leading guest dwords. The scan's ticket counter (buf[0]) and its
+				// published state/value pairs (buf[2]) have never been observed; a partition
+				// index past the record count, or a state slot that stays zero, keeps the
+				// lookback poll spinning until the GPU is lost. The CPU read enters the memory
+				// tracker's fault path, which synchronizes native bytes, so this reports the
+				// contents the dispatch actually starts from.
+				const auto     guest_base = descriptor.Base48();
+				const uint32_t dwords     = static_cast<uint32_t>(std::min<uint64_t>(
+                    static_cast<uint64_t>(view.range) / sizeof(uint32_t), 12u));
+				if (guest_base != 0 && dwords > 0 &&
+				    HostMemoryRangeIsMapped(guest_base,
+				                            static_cast<uint64_t>(dwords) * sizeof(uint32_t))) {
+					std::string text;
+					for (uint32_t d = 0; d < dwords; d++) {
+						uint32_t value = 0;
+						std::memcpy(
+						    &value,
+						    reinterpret_cast<const void*>(guest_base + d * sizeof(uint32_t)),
+						    sizeof(value));
+						text += fmt::format(" {:08x}", value);
+					}
+					LOGF("ScanBufferBind 0x9039cff00: buf[%u] guest@0x%012" PRIx64 " dwords:%s\n",
+					     i, guest_base, text.c_str());
+				}
 			}
 		}
 		descriptors.buffers.push_back(view);

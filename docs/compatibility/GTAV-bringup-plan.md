@@ -793,10 +793,21 @@ Deterministic compatibility blockers fixed in this phase (continuing the list):
     reduce each sixteen-lane row, `row_bcast15` carries lane 15 into lanes 16-31 and lane 47 into
     lanes 48-63, then `row_bcast31` carries lane 31 into lanes 32-63. Emulating them as identity
     makes the reduction add each partial to itself rather than to the neighboring row, so a shader
-    that reduces across its 64-lane wave computes a wrong aggregate. In the decoupled-lookback scan
-    of `0x9039cff00` a wrong per-partition aggregate would keep followers polling a state that never
-    advances, which is consistent with the observed post-pipeline device loss, though this fix is
-    not yet proven to be the sole submission-44572 terminator.
+    that reduces across its 64-lane wave computes a wrong aggregate.
+
+    This is a real defect but is **not** the `0x9039cff00` terminator: the decoded RDNA2 on disk
+    (`_Shaders/original/*_9039cff00.rdna2`) contains zero `row_bcast`. That shader's wave64 reduction
+    uses `row_shr` 1/2/4/8, then `v_permlanex16_b32 v, v, -1, -1`, then an `s_bfm_b64 exec_lo, 32, 32`
+    split with `v_readlane_b32` on lanes 31/63. Those primitives were audited on the wave64 workgroup
+    path and found correct: readlane and permlanex16 both shuffle through the 64-lane workgroup
+    scratch, `s_bfm_b64` lowers to `exec_lo=0, exec_hi=0xFFFFFFFF`, and compute's forced
+    `NativeWave`/`exact_subgroup_operations` mode masks the following `v_add` by guest lane so only
+    lanes 32-63 receive the cross-half partial. Tracing the sequence with per-lane value = lane index
+    yields lane 63 = 2016 = sum(0..63). A new `Permlanex16Wave64BroadcastsOtherHalf` Vulkan regression
+    confirms the one primitive that lacked direct wave64 coverage. The cross-lane VALUE emulation for
+    `0x9039cff00` is therefore correct, and its submission-44572 device loss must be pursued as a
+    runtime state/publish or cross-workgroup visibility issue, not a wrong aggregate; see the
+    `GTAV-debug-0x9039cff00.md` candidate list.
 
     `EmitDppTargetLane` now maps both controls to a shared `EmitDppRowBroadcastTargetLane` helper.
     `row_bcast31` selects lane 31 for every lane at or above 32 and self otherwise; `row_bcast15`
@@ -808,9 +819,11 @@ Deterministic compatibility blockers fixed in this phase (continuing the list):
     Two Vulkan-executed regressions run 64-thread wave64 dispatches through the isolated
     workgroup-scratch path (`guest_wave64_scratch` + `OpControlBarrier`, no native subgroup
     shuffle) and verify the exact per-lane broadcast for both controls; expected values are derived
-    from the ISA definition, not from the implementation. The full `shader_recompiler_compute_tests`
-    suite passes, including the existing quad-permute, bank-mask, and bounds-control DPP cases; an
-    in-game retest beyond frame 1932 / the submission-44572 device loss is pending.
+    from the ISA definition, not from the implementation. A third regression,
+    `Permlanex16Wave64BroadcastsOtherHalf`, covers the `v_permlanex16_b32` cross-half combine on the
+    same path. The full `shader_recompiler_compute_tests` suite passes, including the existing
+    quad-permute, bank-mask, and bounds-control DPP cases; an in-game retest beyond frame 1932 / the
+    submission-44572 device loss is pending.
 
 The same build also closes the three called static-import groups identified by the first Ghidra
 campaign. `ziVA3whp3p4` is registered as the alternate AGC rewind export proven by its get-size,

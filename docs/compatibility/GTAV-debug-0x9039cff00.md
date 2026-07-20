@@ -137,12 +137,70 @@ active. Validated by two new Vulkan-executed wave64 regressions (`DppRowBroadcas
 exact per-lane broadcast; expected values come from the ISA, not the implementation. Full
 `shader_recompiler_compute_tests` passes.
 
-**Still pending in-game confirmation** that `0x9039cff00` actually uses `row_bcast` and that this
-clears submission-44572 device loss. Not yet proven to be the sole terminator — it is a proven bug
-in the same reduction path. To confirm the shader uses it, dump the decoded RDNA2
-(`--shader-log-direction File`, `DumpShaderRecompilerOriginal`) and grep for `row_bcast`. If a
-retest still hangs, the next candidate is a different cross-lane primitive (`ds_swizzle`,
-`v_permlane`, or a `readlane`-based reduction) or candidate 2 (forward progress).
+### UPDATE (2026-07-19): this shader does NOT use row_bcast — candidate 1 REFUTED for it
+
+The decoded RDNA2 is already on disk at
+`_Shaders/original/3443_0078_new_shader_cs_00000009039cff00.rdna2` (and the `1835_0079` copy). It
+contains **zero `row_bcast`**. Its wave64 reduction (two copies, at PC `0x204` and `0x310`) is:
+
+```
+v_add_nc_u32 v20, v20.dpp(ctrl=0x111), v20   ; row_shr:1  \
+v_add_nc_u32 v20, v20.dpp(ctrl=0x112), v20   ; row_shr:2   > inclusive scan within each 16-lane row
+v_add_nc_u32 v20, v20.dpp(ctrl=0x114), v20   ; row_shr:4   > lanes 15/31/47/63 = their row sums
+v_add_nc_u32 v20, v20.dpp(ctrl=0x118), v20   ; row_shr:8  /
+v_permlanex16_b32 v19, v20, -1, -1           ; each half reads lane 15/31 of the OTHER half
+v_add_nc_u32 v20, v20.dpp(ctrl=0xe4), v19    ; lanes 15,31 = sum(0..31); 47,63 = sum(32..63)
+s_bfm_b64 exec_lo, 32, 32                     ; exec = lanes 32..63 only
+v_readlane_b32 s0, v20, 31                    ; s0 = sum(0..31)
+v_add_nc_u32 v20, s0, v20                      ; lanes 32..63 += sum(0..31) => lane 63 = sum(0..63)
+s_mov_b64 exec_lo, vcc_lo                      ; restore exec
+```
+
+So the row_bcast fix (blocker 50), while a real bug, is **not this shader's terminator**. The
+reduction instead relies on `v_permlanex16_b32`, `v_readlane_b32` on lanes 31/63, and an
+`s_bfm_b64` exec split. Each was audited on the wave64 workgroup path:
+
+- **`EmitReadLaneU32` / `EmitPermlaneB32`** both call `EmitWaveShuffleU32(value, guest_lane)`, which
+  in wave64 mode reads the 64-lane workgroup scratch, so lanes 32-63 correctly read a source lane in
+  subgroup 0. `permlanex16 -1,-1` computes `target = (row ^ 16) | 15`, i.e. each 16-lane half reads
+  lane 15 of the other half; for the reduction only lanes 15/31/47/63 matter and those are identical
+  under swap or broadcast semantics.
+- **`s_bfm_b64 exec_lo, 32, 32`** lowers through `EmitBitFieldMaskU64` to `exec_lo=0,
+  exec_hi=0xFFFFFFFF` (lanes 32-63). Compute forces `lane_mask_mode=NativeWave`
+  (`shaderSubgroup.cpp:37`), so the emitter runs in `exact_subgroup_operations` mode where
+  `EmitMaskActiveBool` tests `EmitLaneMaskPartU32` by **guest** lane 0-63 — lane 40 checks `exec_hi`
+  bit 8, lane 10 checks `exec_lo` bit 10. The masked `v_add` therefore applies only to lanes 32-63.
+
+Tracing the whole sequence with per-lane value = lane index yields lane 63 = 2016 = sum(0..63), the
+correct wave sum. A new Vulkan wave64 regression `Permlanex16Wave64BroadcastsOtherHalf` confirms the
+one primitive that previously lacked direct wave64 coverage (permlanex16) produces the exact
+per-lane broadcast on the workgroup-scratch path. **So the cross-lane VALUE emulation for this
+shader's reduction is correct; candidate 1 is refuted for `0x9039cff00`.**
+
+### Remaining candidates after candidate-1 refutation (need runtime value visibility)
+
+The device is lost even at `DispatchDirect(2,1,1)` — two workgroups trivially co-reside, so this is
+not a many-workgroup occupancy/forward-progress failure. With the aggregate proven correct, the
+open candidates are all runtime-value-level and need a game run to distinguish:
+
+1. **State-field / publish or ticket-init, not the aggregate.** The published qword is
+   `{state, aggregate}` via `buffer_atomic_swap_x2 v9,v19` where `state = (partition>0) ? 1 : 2`.
+   Partition 0 publishes state 2 (inclusive) immediately. If the ticket counter (buf[0]) or the
+   state/value pairs (buf[2]) are not zero-initialized at dispatch start, a follower can read a
+   stale state or a wrong partition index and never converge. Verify the guest clears these before
+   the scan and that the emulator preserves that clear.
+2. **Cross-workgroup visibility of the publish on this host.** Publish is device-scope release
+   `OpAtomicExchange` (`0x48`) and poll is device-scope acquire `OpAtomicLoad` (`0x42`) on the same
+   `Coherent` uint64 view (blocker 45/46). If the host driver does not make the exchange visible to
+   another workgroup's acquire load despite device scope, the poll spins. This is host/driver
+   behavior, hard to prove offline.
+
+**Highest-value next diagnostic (requires one game run):** enable `--spirv-debug-printf true` and
+log `(polled_partition, state_read)` at the poll and `(published_partition, state_written)` at the
+publish, OR read back buf[2] after the timed-out dispatch. That directly shows whether producers
+ever publish a terminating state and whether the polled slots match — separating candidate 1-residue
+(some other wrong value) from a visibility/initialization problem. Do NOT change the wave64 machinery
+further without that evidence; it is now audited and test-covered.
 
 ### Diagnostic added (built, ran — served its purpose; can be removed later)
 

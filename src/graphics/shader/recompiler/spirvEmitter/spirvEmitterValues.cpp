@@ -263,6 +263,39 @@ DppTargetLane EmitDppMirrorTargetLane(EmitterState* state, uint32_t subid, bool 
 	return {target, EmitTrueBool(state)};
 }
 
+// RDNA2 cross-row broadcasts used by wave reductions.
+//   row_bcast15 (0x142): lanes 16-31 read lane 15, lanes 48-63 read lane 47, others read self.
+//   row_bcast31 (0x143): lanes 32-63 read lane 31, others read self.
+// Emulating these as identity (the former default) made a DPP reduction combine each lane with
+// itself instead of the neighboring row, corrupting every wave64 sum/max reduction.
+DppTargetLane EmitDppRowBroadcastTargetLane(EmitterState* state, uint32_t subid, bool bcast31) {
+	const auto target = state->builder.AllocateId();
+	if (bcast31) {
+		const auto is_bcast = state->builder.AllocateId();
+		state->builder.AddFunction(
+		    {OpUGreaterThanEqual, state->bool_type, is_bcast, subid, ConstantU32(state, 32u)});
+		state->builder.AddFunction(
+		    {OpSelect, state->uint_type, target, is_bcast, ConstantU32(state, 31u), subid});
+		return {target, EmitTrueBool(state)};
+	}
+	// bit 4 selects the upper 16 lanes of each 32-lane block (16-31 and 48-63); those read lane
+	// 15 of their block, i.e. (subid & 0x20) | 15.
+	const auto upper_half = state->builder.AllocateId();
+	const auto is_bcast   = state->builder.AllocateId();
+	const auto block      = state->builder.AllocateId();
+	const auto bcast_lane = state->builder.AllocateId();
+	state->builder.AddFunction(
+	    {OpBitwiseAnd, state->uint_type, upper_half, subid, ConstantU32(state, 0x10u)});
+	state->builder.AddFunction(
+	    {OpINotEqual, state->bool_type, is_bcast, upper_half, ConstantU32(state, 0u)});
+	state->builder.AddFunction(
+	    {OpBitwiseAnd, state->uint_type, block, subid, ConstantU32(state, 0x20u)});
+	state->builder.AddFunction(
+	    {OpBitwiseOr, state->uint_type, bcast_lane, block, ConstantU32(state, 15u)});
+	state->builder.AddFunction({OpSelect, state->uint_type, target, is_bcast, bcast_lane, subid});
+	return {target, EmitTrueBool(state)};
+}
+
 DppTargetLane EmitDppTargetLane(EmitterState* state, uint32_t control) {
 	const auto subid = EmitSubgroupLocalInvocationId(state);
 	if (control <= 0xffu) {
@@ -282,6 +315,12 @@ DppTargetLane EmitDppTargetLane(EmitterState* state, uint32_t control) {
 	}
 	if (control == 0x141u) {
 		return EmitDppMirrorTargetLane(state, subid, true);
+	}
+	if (control == 0x142u) {
+		return EmitDppRowBroadcastTargetLane(state, subid, false);
+	}
+	if (control == 0x143u) {
+		return EmitDppRowBroadcastTargetLane(state, subid, true);
 	}
 	return {subid, EmitTrueBool(state)};
 }

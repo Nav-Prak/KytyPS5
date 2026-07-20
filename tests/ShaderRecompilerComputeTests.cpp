@@ -5349,6 +5349,85 @@ TestCase VectorDppBoundsControlZeroPreservesDestination() {
   return test;
 }
 
+// RDNA2 row_bcast15 (dpp_ctrl 0x142): lanes 16-31 read lane 15, lanes 48-63 read
+// lane 47, all other lanes read themselves. This is the first cross-row combine of
+// a wave64 reduction; emulating it as identity made the reduction add each lane to
+// itself. Each lane holds its own index (v0 = local_id.x), so the shuffled value is
+// the expected source-lane index.
+TestCase DppRowBroadcast15Wave64() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0);                           // v1 = 0 (add identity)
+  code.push_back(EncodeVop2(0x25, 2, 250, 1));          // v2 = dpp(v0) + v1
+  code.push_back(EncodeVop2Dpp(0, 0x142));              // row_bcast15 on v0
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 0)); // v3 = v0 << 2 (byte offset)
+  AppendBufferStoreDword(&code, 2, 3);
+  AppendEnd(&code);
+
+  std::vector<u32> expected(64);
+  for (u32 i = 0; i < 64; ++i) {
+    if (i >= 16 && i < 32) {
+      expected[i] = 15;
+    } else if (i >= 48) {
+      expected[i] = 47;
+    } else {
+      expected[i] = i;
+    }
+  }
+
+  TestCase test;
+  test.name = "DppRowBroadcast15Wave64";
+  test.code = code;
+  test.expected = expected;
+  test.opcodes = {O::VMovB32, O::VAddNcU32, O::VLshlrevB32, O::BufferStoreDword,
+                  O::SEndpgm};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.required_spirv = {"guest_wave64_scratch", "OpControlBarrier"};
+  test.forbidden_spirv = {"OpGroupNonUniformShuffle"};
+  return test;
+}
+
+// RDNA2 row_bcast31 (dpp_ctrl 0x143): lanes 32-63 read lane 31, all other lanes read
+// themselves. This is the final cross-row combine of a wave64 reduction.
+TestCase DppRowBroadcast31Wave64() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0);                           // v1 = 0 (add identity)
+  code.push_back(EncodeVop2(0x25, 2, 250, 1));          // v2 = dpp(v0) + v1
+  code.push_back(EncodeVop2Dpp(0, 0x143));              // row_bcast31 on v0
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 0)); // v3 = v0 << 2 (byte offset)
+  AppendBufferStoreDword(&code, 2, 3);
+  AppendEnd(&code);
+
+  std::vector<u32> expected(64);
+  for (u32 i = 0; i < 64; ++i) {
+    expected[i] = (i >= 32) ? 31u : i;
+  }
+
+  TestCase test;
+  test.name = "DppRowBroadcast31Wave64";
+  test.code = code;
+  test.expected = expected;
+  test.opcodes = {O::VMovB32, O::VAddNcU32, O::VLshlrevB32, O::BufferStoreDword,
+                  O::SEndpgm};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.required_spirv = {"guest_wave64_scratch", "OpControlBarrier"};
+  test.forbidden_spirv = {"OpGroupNonUniformShuffle"};
+  return test;
+}
+
 TestCase Vop3LdexpSourceModifier() {
   using O = ShaderOpcode;
 
@@ -9337,6 +9416,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorDppQuadPermuteReverse);
   AddCase(VectorDppBankMaskPreservesDestination);
   AddCase(VectorDppBoundsControlZeroPreservesDestination);
+  AddCase(DppRowBroadcast15Wave64);
+  AddCase(DppRowBroadcast31Wave64);
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
   AddCase(Vop1MoveRelDestination);

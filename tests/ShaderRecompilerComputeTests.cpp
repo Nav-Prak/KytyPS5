@@ -5428,6 +5428,46 @@ TestCase DppRowBroadcast31Wave64() {
   return test;
 }
 
+// v_permlanex16_b32 with -1/-1 selectors is the cross-16-lane-half combine of the
+// wave64 reduction in compute shader 0x9039cff00. On a subgroup-32 host the guest
+// wave spans two native subgroups, so this must route through the 64-lane workgroup
+// scratch, not a native subgroup shuffle. With -1/-1 selectors every lane reads lane
+// 15 of the *other* 16-lane half within its 32-lane block: lanes 0-15 read lane 31,
+// 16-31 read lane 15, 32-47 read lane 63, 48-63 read lane 47. Each lane holds its own
+// index, so the shuffled value equals that source-lane index.
+TestCase Permlanex16Wave64BroadcastsOtherHalf() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 3, 0xffffffffu);            // v3 = -1 selector (low 8 lanes)
+  AppendVMovLiteral(&code, 4, 0xffffffffu);            // v4 = -1 selector (high 8 lanes)
+  AppendVop3(&code, 0x378, 1, Vgpr(0), Vgpr(3), Vgpr(4)); // v1 = permlanex16(v0, -1, -1)
+  code.push_back(EncodeVop2(0x1a, 2, InlineU32(2), 0)); // v2 = v0 << 2 (byte offset)
+  AppendBufferStoreDword(&code, 1, 2);
+  AppendEnd(&code);
+
+  std::vector<u32> expected(64);
+  for (u32 i = 0; i < 64; ++i) {
+    expected[i] = ((i & 0xf0u) ^ 0x10u) | 0x0fu;
+  }
+
+  TestCase test;
+  test.name = "Permlanex16Wave64BroadcastsOtherHalf";
+  test.code = code;
+  test.expected = expected;
+  test.opcodes = {O::VMovB32, O::VPermlanex16B32, O::VLshlrevB32,
+                  O::BufferStoreDword, O::SEndpgm};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.required_spirv = {"guest_wave64_scratch", "OpControlBarrier"};
+  test.forbidden_spirv = {"OpGroupNonUniformShuffle"};
+  return test;
+}
+
 TestCase Vop3LdexpSourceModifier() {
   using O = ShaderOpcode;
 
@@ -9418,6 +9458,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorDppBoundsControlZeroPreservesDestination);
   AddCase(DppRowBroadcast15Wave64);
   AddCase(DppRowBroadcast31Wave64);
+  AddCase(Permlanex16Wave64BroadcastsOtherHalf);
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
   AddCase(Vop1MoveRelDestination);

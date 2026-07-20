@@ -3,34 +3,33 @@
 ## Context and current baseline
 
 GTA V (PPSA04264) boots through platform initialization, reaches Story Mode, and drives RAGE's
-GPU-driven bindless object pipeline. The latest 2026-07-19 blocker-46 retest reported 81 shader-
-compile messages before queue 0 lost the Vulkan device at submission 58380. The recorded operation
-was `DispatchDirect(6, 1, 1)` in mode `0x41` using compute shader `0x9039cff00`. This is the same
-terminator family as the preceding 77/79-message runs; compile-message count, logical queue,
-submission number, and dispatch width are supporting context rather than stable progress identities.
+GPU-driven bindless object pipeline on the isolated Vulkan-Hpp integration branch. The 2026-07-19
+blocker-48 retest cleared the launch-time wave64 failure: the `32x32x1` shader now runs as sixteen
+isolated guest waves. The game reached frame 1932 and 82 shader-compile messages before queue 1 lost
+the device while executing `0x9039cff00`, the cross-workgroup prefix-scan kernel previously tracked
+through blockers 42-47.
 
-The matched qword acquire path was active: the live module dropped from the pre-blocker-46 24,712
-words to 24,228 words, created successfully, and then failed during execution. The remaining
-concrete defect is wave-size decoding. Kyty treated `COMPUTE_PGM_RSRC1` bit 30 as `W32_EN`, although
-that bit is `MEM_ORDERED`; the wave32 selector is `COMPUTE_DISPATCH_INITIATOR.CS_W32_EN` bit 15.
-The exact shader requests `64x1x1` threads and dispatch mode `0x41` has bit 15 clear, so it is one
-wave64 guest wave. Its lane-63 and high-half `exec` operations confirm that classification. Splitting
-it into two unrelated host wave32 subgroups breaks guest ballot and lane exchange across the halves.
+The fatal at `context.cpp:445` is a generic fence-result guard, not an unimplemented feature in that
+file. The exact failing submit is queue 1 sequence 44572, `DispatchDirect(41, 1, 1)`, mode `0x41`.
+The 289-instruction wave64 shader decoded into 71 CFG blocks with three loops/back edges and
+structurized to 73 blocks. Its module, layout, and compute pipeline were created successfully; the
+device was lost only after execution began.
 
-PM4 decode now derives compute wave size from the dispatch initiator. For exactly one 64-thread
-guest wave on a host with subgroup size 32, a separate 66-dword workgroup scratch array plus
-workgroup barriers and atomics implements ballot, shuffle, DPP, read-lane, and read-first-lane
-semantics across both host subgroups. The path is deliberately bounded to a single guest wave per
-workgroup; multi-wave workgroups remain unsupported. Static SPIR-V coverage and a Vulkan execution
-test in which every invocation reads enabled guest lane 63 pass, as do the focused shader suites and
-Release emulator build. All eleven standalone regression executables pass. Blocker 47 is
-code-complete pending in-game validation. The qword, native atomic, structured-CFG, and memory-
-ordering fixes remain in place.
+Exact offline replay found blocker 49. The workgroup-wave64 ballot helper inserted conditional
+scratch-clear and predicate-set blocks inside a guest loop header. That moved `OpLoopMerge` into a
+continuation block while the guest back edge still targeted the original header, producing invalid
+SPIR-V. With game validation disabled the driver accepted the module and later lost the device.
+The helper now uses branch-free per-lane atomic clear and set operations separated by workgroup
+barriers, so it adds no selection merge to guest control flow. The exact shader validates and
+completes a synthetic 41-workgroup Vulkan dispatch. Permanent static and Vulkan regressions cover a
+wave64 ballot in a loop header. Release builds and all eleven standalone tests pass; blocker 49 is
+code-complete pending the next in-game run. All blocker 42-48 qword, CFG, ordering, wave-size, and
+multi-wave fixes remain in place.
 
 Current-log inventory:
 
 - unresolved import calls: 0;
-- one negative Vulkan result at queue 0 submission 58380;
+- one negative Vulkan result: `eErrorDeviceLost` at queue 1 submission 44572;
 - `ReadConst` failures: 0;
 - compute skips: three unique shaders: capability-gated `V_FMA_F64` and the two
   `IMAGE_BVH_INTERSECT_RAY` variants remain deferred;
@@ -38,11 +37,14 @@ Current-log inventory:
 - 13 image/metadata-boundary reads safely degrade to null and are not the current terminator;
 - eight bindless-window messages form four repeated pairs: an oversized union at PCs `0x86c`/`0x850`
   and an unusable unbased global window at PCs `0x140`/`0x13c`; they remain bounded null fallbacks;
-- `0x9039cff00` reports 73 structured blocks and creates a valid 24,228-word pipeline; the qword
-  acquire path is live, but the pre-blocker-47 build still loses the device;
-- SDL output/capture endpoints opened and AJM decode batches continued until the final shader and
-  fence failure, with no audio error; the audible stop around 68 messages is currently a downstream
-  game/GPU-scheduling symptom rather than a proven decoder defect;
+- `0x604258d000` clears launch through the new sixteen-wave path, validating blocker 48 in game;
+- `0x9039cff00` is the exact failing queue-1 dispatch: 41 groups, local size `64x1x1`, 289 decoded
+  instructions, 71 input/73 structured blocks, three loops, four buffer resources, and two
+  bindings. Its malformed SPIR-V came from helper-inserted ballot selections inside a loop header;
+- exact offline replay now validates and executes that shader with 41 workgroups after the
+  branch-free ballot fix;
+- the reported freeze is at frame 1932; no new import, audio, or texture-cache terminator precedes
+  the queue-1 device loss;
 - shaders `0x605ac67400`, `0x605ac68a00`, and `0x9039ba900` hit the duplicate-merge CFG gap but
   successfully emitted 81,730-, 90,087-, and 6,725-word dispatcher modules. They are one separate
   high-risk CFG implementation family.
@@ -54,25 +56,29 @@ invariant guards rather than 14 missing game features. Line 540 only reports tha
 operation lost the device; implementing another branch in that file cannot repair the shader that
 caused the loss.
 
-This log exposes five implementation families, counted by generic behavior rather than by repeated
-warning or shader instance:
+The accumulated logs expose six implementation families, counted by generic behavior rather than
+by repeated warning or shader instance:
 
-1. The `0x9039cff00` cross-workgroup prefix-scan/polling kernel: the one proven blocker that must be
-   cleared to advance beyond the current checkpoint.
-2. Duplicate-merge CFG structurization shared by three shaders: pipelines currently succeed through
+1. Bounded multi-wave wave64 emulation for straight-line compute workgroups: blocker 48 is complete
+   and validated in game.
+2. Structurally valid workgroup-wave64 ballot lowering inside guest loops: blocker 49 is complete,
+   exact-replay validated, and is the immediate in-game retest gate for `0x9039cff00`.
+3. Duplicate-merge CFG structurization shared by three shaders: pipelines currently succeed through
    dispatcher fallback, but this remains correctness, size, and GPU-risk debt.
-3. Bindless range provenance/materialization: two repeated null-fallback symptoms, treated as one
+4. Bindless range provenance/materialization: two repeated null-fallback symptoms, treated as one
    implementation family.
-4. Native paired-register FP64 FMA (`V_FMA_F64`): capability-gated and not currently required for
+5. Native paired-register FP64 FMA (`V_FMA_F64`): capability-gated and not currently required for
    the offline non-RT path because the affected dispatch is safely skipped.
-5. BVH ray intersection (`IMAGE_BVH_INTERSECT_RAY`): one feature family used by two shaders and
+6. BVH ray intersection (`IMAGE_BVH_INTERSECT_RAY`): one feature family used by two shaders and
    deferred with ray-tracing modes outside the initial target.
 
-Therefore the known lower bound before further progress is one fix, the complete visible backlog is
-five families, and the plausible near-term pre-playable core is one to three families depending on
-whether the successful CFG fallbacks and bindless nulls cause visible or stability failures after
-blocker 47. There is no defensible exact count to full playability yet: execution stops before player
-control and cannot expose later streaming, presentation, input, save, or audio defects.
+Therefore the known immediate blocker is implemented but unvalidated in game; the visible backlog
+is six families, two of which are deliberately deferred capabilities. The plausible near-term
+pre-playable core remains one to three additional families depending on whether blocker 49, the
+successful CFG fallbacks, and bindless nulls cause visible or stability failures after frame 1932.
+There is no
+defensible exact count to full playability yet: execution still stops before player control and
+cannot expose later streaming, presentation, input, save, or audio defects.
 
 The Ghidra import campaign remains useful, but the current log confirms that the previously
 implemented NpUtility, VideoRecordingP, and AGC handlers resolve. Graphics aliases, descriptor
@@ -168,17 +174,58 @@ Status: complete in game as progression-positive but insufficient.
 
 ## Phase A8 - Correct dispatch wave size and emulate one guest wave64
 
-Status: code and full automated validation complete; in-game validation pending.
+Status: code and automated validation complete; launch shaders use the corrected wave64 path, while
+the former `0x9039cff00` checkpoint still needs an in-game retest after blocker 48.
 
 - Decode wave32 from `COMPUTE_DISPATCH_INITIATOR.CS_W32_EN` bit 15. Keep
   `COMPUTE_PGM_RSRC1` bit 30 as `MEM_ORDERED`; it is not a wave-size flag.
 - The exact `64x1x1`, mode-`0x41` kernel is wave64. A bounded workgroup-backed path combines two
   host wave32 subgroups into one guest wave for ballot and lane exchange without aliasing guest LDS.
-- Limit the mode to exactly one 64-thread wave per workgroup. A later multi-wave implementation
-  needs per-wave synchronization that cannot be modeled by unconditional workgroup barriers.
+- The initial mode was limited to exactly one 64-thread wave per workgroup. Phase A9 extends it only
+  to structurally uniform multi-wave programs with isolated scratch; arbitrary multi-wave control
+  flow still cannot be modeled by unconditional workgroup barriers.
 - Static checks require workgroup scratch, barriers, and atomics and forbid subgroup ballot/shuffle.
   The Vulkan test enables only guest lane 63 and verifies `V_READFIRSTLANE_B32` returns 63 to all 64
   invocations.
+
+## Phase A9 - Isolate straight-line multi-wave wave64 workgroups
+
+Status: complete in game.
+
+- The blocker-48 launch shader uses `32x32x1` local invocations, or sixteen guest wave64 waves. Host
+  subgroup size control cannot request 64 because the device reports `min=max=32`.
+- Replace the Boolean workgroup-wave64 marker with an explicit wave count. Allocate 66 dwords per
+  wave and index each lane/ballot slice from flattened local invocation index. The observed
+  sixteen-wave case uses 1,056 dwords, separate from guest LDS.
+- Admit multi-wave workgroups only when total invocations are a multiple of 64 and no greater than
+  1,024, and structured IR contains only unconditional branches/returns with no loop header or
+  dispatcher fallback. This proves every invocation reaches the stronger workgroup barriers in the
+  same structural order. Continue rejecting conditional, indirect, looping, partial-wave, and
+  oversized cases.
+- Static coverage verifies 132-dword scratch and per-wave indexing for two waves and rejects a
+  conditional variant. A Vulkan test makes wave 0 read lane 0 and wave 1 read lane 64, proving the
+  scratch slices do not alias.
+- The retest cleared the former five-shader launch fatal, reached frame 1932 and 82 shader-compile
+  messages, and then failed in the distinct single-wave looped kernel tracked as blocker 49.
+
+## Phase A10 - Keep wave64 ballot helpers out of guest control flow
+
+Status: code, exact replay, and full automated validation complete; in-game validation pending.
+
+- Queue 1 submission 44572 lost the device while executing `0x9039cff00` as
+  `DispatchDirect(41, 1, 1)`. The pipeline created successfully, so `context.cpp:445` only surfaced
+  the asynchronous failure.
+- Exact ELF replay made SPIR-V validation deterministic. A back edge targeted the original guest
+  loop-header label, while two conditional regions inserted by `EmitWaveBallot` caused
+  `OpLoopMerge` to be emitted in a continuation label. This violated SPIR-V loop structure.
+- Replace conditional scratch initialization and predicate publication with branch-free per-lane
+  `OpAtomicAnd`/`OpAtomicOr` operations separated by workgroup barriers. Every invocation clears
+  its unique bit and conditionally ORs either that bit or zero; no helper selection block is needed.
+- Preserve per-wave 66-dword scratch isolation and the multi-wave structural safety gate. This is a
+  generic workgroup-wave64 emission fix, not a shader-address exception.
+- The exact 289-instruction shader now validates and completes a synthetic 41-workgroup Vulkan
+  dispatch. Static coverage requires a loop merge plus atomic clear/set and rejects any selection
+  merge; `WorkgroupWave64BallotInLoop` executes the generic loop shape through Vulkan.
 
 ## Phase B - Shader instruction coverage
 
@@ -291,6 +338,16 @@ guest pair as one observation and establishes a direct acquire/release relations
 qword exchange. All other loads remain on their existing scalar path. Binary SPIR-V validation and
 Vulkan execution cover the strengthened and non-strengthened cases.
 
+### B12 - Branch-free workgroup-wave64 ballot: code complete
+
+Workgroup-wave64 ballot scratch maintenance must not synthesize structured selections inside the
+current guest block. Each invocation now selects its own low/high ballot word, atomically clears its
+unique lane bit, synchronizes the workgroup, selects `bit` or zero from the predicate, and performs
+an unconditional atomic OR before the result loads. Because all 64 bits are independently cleared,
+this resets the ballot without a lane-zero conditional and remains valid for isolated multi-wave
+scratch slices. The exact `0x9039cff00` replay and permanent loop-header regressions prove that the
+emitted back edge targets the real `OpLoopMerge` header.
+
 ## Phase C - GPU and cache correctness
 
 - Keep blockers 32, 35, 36, and 38 narrow. Blocker 35 requires a non-exact raw window fully
@@ -301,14 +358,17 @@ Vulkan execution cover the strengthened and non-strengthened cases.
   or a signaled submission fence. A live producer needs scheduler synchronization, not retirement.
 - If a freeze recurs, use the new analysis-phase brackets to distinguish CPU compiler work, a guest
   spin, and GPU failure before adding recovery behavior.
-- Blocker 41 was CPU-side scalar analysis; blockers 42 through 47 concern one post-pipeline polling
-  kernel. Reopen cache ownership only if a retest supplies new alias evidence.
+- Blocker 41 was CPU-side scalar analysis; blockers 42 through 47 and blocker 49 concern one
+  post-pipeline polling kernel. Blocker 48 is a distinct launch-time multi-wave subgroup-policy gap
+  exposed by the same corrected wave decoding and is now validated in game. Reopen cache ownership
+  only if a retest supplies new alias evidence.
 - The blocker-43 atomicity audit is complete: retain the single native 64-bit exchange. Do not infer
   a return to blocker 39's dispatcher failure. Blocker 44 was a separate structured-CFG validity
   defect and is confirmed live at 73 blocks. Blocker 45 attaches release/acquire semantics directly
-  to its storage-buffer atomics. Blocker 46 adds the matched qword acquire, and blocker 47 corrects
-  wave-size decode and cross-half wave64 communication; keep all four repairs in place during the
-  next game validation.
+  to its storage-buffer atomics. Blocker 46 adds the matched qword acquire, blocker 47 corrects
+  wave-size decode and cross-half wave64 communication, blocker 48 isolates straight-line
+  multi-wave scratch, and blocker 49 keeps ballot helpers structurally branch-free; keep all six
+  repairs in place during the next game validation.
 - Treat the two successful but very large duplicate-merge dispatcher modules as GPU-risk debt. Fix
   their shared CFG shape before they become a device-loss terminator; do not raise fallback budgets.
 - Treat null-binding at an incoherent image/metadata boundary as an intentional safety result;
@@ -331,9 +391,9 @@ Keep the existing four-commit strategy; do not commit the dirty tree as one snap
 
 The graphics commit must include the decoder/IR/emitter changes, descriptor materialization,
 texture/buffer ownership and queue-lifetime rules, CMake wiring, and their regressions together.
-Blockers 31-47, both F32 buffer atomics, the native 64-bit exchange, loop-control and conditional
-loop-header splitting, scalar-provenance, wave-size lane, and GLC visibility fixes, and
-`V_ALIGNBYTE_B32` belong in that graphics contract. Preserve the newest
+Blockers 31-49, both F32 buffer atomics, the native 64-bit exchange, loop-control and conditional
+loop-header splitting, scalar-provenance, wave-size lane, single/multi-wave workgroup isolation, and
+GLC visibility fixes, plus `V_ALIGNBYTE_B32`, belong in that graphics contract. Preserve the newest
 GTA stash until the split commits build from a clean index and a later in-game retest passes. Do
 not stage `_DownloadData/`, `_TempData/`, `gtav-work/`, extracted game ELFs, import inventories,
 logs, shader/pipeline dumps, or game paths.
@@ -362,10 +422,19 @@ shader suites pass, all eleven standalone regression executables pass, and the d
 clean. The refactor is therefore code-safe enough for comparison testing, but it is not yet the
 new gameplay baseline.
 
-Next action: run the same quiet Story Mode reproducer from
-`feature/gtav-upstream-bd9086e`. Compare the last completed submit, shader address, shader count,
-audio state, and first fatal diagnostic with blocker 47. Keep `feature/gtav-compatibility` as the
-immediate fallback unless the refactored branch matches or advances the prior result.
+The first comparison run exposed blocker 48 during launch: a straight-line `32x32x1` wave64 shader
+needed sixteen isolated guest waves. The same single-wave guard exists on the fallback branch, so
+this does not by itself disqualify the refactor. The generic bounded multi-wave fix now builds on the
+integration branch, and its in-game retest clears launch. The later frame-1932 loss is blocker 49,
+a generic invalid-SPIR-V defect in the shared workgroup-wave64 ballot helper rather than evidence of
+a cache-refactor regression. Exact replay and all eleven tests pass with the branch-free helper.
+
+Next action: rerun the same quiet Story Mode reproducer from
+`feature/gtav-upstream-bd9086e`. Confirm the launch shader still selects sixteen-wave isolated
+workgroup emulation, then verify that `0x9039cff00` passes frame 1932 and queue-1 submission 44572.
+Record the next completed submit, shader address, visible state, audio state, and first fatal
+diagnostic. Keep `feature/gtav-compatibility` as the immediate fallback until the refactored branch
+reaches player control or establishes a clearly superior stable checkpoint.
 
 ## Verification gate
 

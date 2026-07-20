@@ -4,7 +4,7 @@ This document is the engineering plan and running bring-up record for a legally 
 PlayStation 5 copy of *Grand Theft Auto V* in offline Story Mode. It records technical milestones,
 but it is not a playability claim.
 
-Plan date: 2026-07-17
+Plan date: 2026-07-19
 
 Starting source branch: `feature/hades-compatibility`
 
@@ -722,6 +722,67 @@ Deterministic compatibility blockers fixed in this phase (continuing the list):
     invocations observe lane 63. The Release emulator builds, `git diff --check` passes, and all
     eleven standalone regression executables pass. In-game validation is pending.
 
+48. The first in-game run on `feature/gtav-upstream-bd9086e` did not reach the former queue-loss
+    checkpoint. It stopped during launch after five shader-compile messages when runtime-loaded
+    compute code at `0x604258d000` requested wave64 for a `32x32x1` local workgroup. The host reports
+    subgroup size 32 with minimum and maximum 32, so Vulkan cannot request a native 64-lane
+    subgroup. This workgroup contains 1,024 invocations, or sixteen independent guest wave64 waves,
+    while blocker 47 deliberately enabled the workgroup-memory fallback only for one 64-thread
+    wave. The program itself is a 276-dword AGC shader with two CFG blocks, no loop/back edge, one
+    buffer, and one read/write storage image. The dispatch is `groups=1x1x32`, mode `0x41`.
+
+    This is not evidence that the Vulkan-Hpp merge regressed shader execution. The pre-refactor
+    fallback branch contains the same single-wave subgroup guard, and no game run occurred between
+    blocker 47's corrected wave-size decode and the isolated upstream merge. The launch failure is
+    therefore the first observed multi-wave consequence of classifying these programs correctly as
+    wave64.
+
+    Workgroup wave64 emulation now records a wave count rather than a Boolean. Every guest wave owns
+    a disjoint 66-dword scratch slice: lane data uses entries 0-63, and combined ballot words use
+    entries 64-65. `LocalInvocationIndex >> 6` selects the guest wave, `LocalInvocationIndex & 63`
+    selects its lane, and the scratch base is `wave * 66`; the observed sixteen-wave program uses
+    1,056 dwords (4,224 bytes). The existing full-workgroup barriers are stronger than guest wave
+    synchronization, so multi-wave mode is admitted only for bounded workgroups of at most 1,024
+    invocations whose structured IR has no conditional/indirect control flow, loop header, or
+    dispatcher fallback. One-wave behavior remains unchanged. Conditional multi-wave programs are
+    still rejected instead of risking a divergent workgroup-barrier deadlock.
+
+    Static regression coverage compiles a straight-line 128-thread shader into two isolated slices,
+    verifies a 132-dword scratch array and per-wave indexing, and proves a conditional variant does
+    not enable the mode. A Vulkan execution regression has wave 0 read first lane 0 and wave 1 read
+    first lane 64, confirming that lane and ballot scratch do not alias between guest waves. Release
+    `kyty_emulator` builds, `git diff --check` passes, and all eleven standalone regression
+    executables pass.
+
+49. The blocker-48 retest cleared the launch-time subgroup-size fatal and reached frame 1932 with
+    82 shader-compile messages, proving that the sixteen-wave launch path is active in game. The
+    terminating `context.cpp:445` guard is not an unimplemented renderer feature: it reports
+    `vkWaitForFences` returning `eErrorDeviceLost` for queue 1 submission 44572. The submitted
+    operation was `DispatchDirect(41, 1, 1)` in mode `0x41`, using the previously identified
+    wave64 shader `0x9039cff00`.
+
+    The live shader decoded to 289 instructions in 71 CFG blocks with three loops/back edges and
+    structurized to 73 blocks. Module, descriptor layout, and pipeline creation all succeeded; the
+    device was lost only when the pipeline executed. An exact offline replay extracted the shader
+    from the saved ELF, retained its 41-workgroup launch, and exposed the defect before submission:
+    SPIR-V validation rejected a back edge targeting a block that was no longer the emitted loop
+    header. The workgroup-wave64 ballot helper used two `EmitIfCondition` regions to clear and set
+    its scratch ballot. When a guest ballot occurred in a loop-header block, those helper-generated
+    selections split that block, emitted `OpLoopMerge` in a continuation label, and left the guest
+    back edge targeting the original label. Validation was disabled in the game run, so the driver
+    accepted the malformed module and later lost the device.
+
+    Workgroup-wave64 ballots are now branch-free. Each invocation atomically clears its unique
+    scratch bit, all invocations synchronize, the predicate selects either that bit or zero, and an
+    unconditional atomic OR publishes the result before the existing load/barrier sequence. This
+    preserves the separate 66-dword slice for every guest wave and introduces no selection merge
+    into guest control flow. The exact 289-instruction GTA shader now passes SPIR-V validation and
+    completes its synthetic 41-workgroup Vulkan dispatch. Permanent static coverage places
+    `V_READFIRSTLANE_B32` in a loop header and requires `OpLoopMerge`, `OpAtomicAnd`, and
+    `OpAtomicOr` with no `OpSelectionMerge`; a Vulkan regression executes the same generic looped
+    ballot shape. Release `kyty_emulator` and both shader test targets build, all eleven standalone
+    regression executables pass, and in-game validation beyond frame 1932 is pending.
+
 The same build also closes the three called static-import groups identified by the first Ghidra
 campaign. `ziVA3whp3p4` is registered as the alternate AGC rewind export proven by its get-size,
 packet-write, and initial-state caller sequence. The five recovered NpUtility handlers preserve the
@@ -810,9 +871,10 @@ The merged Release `kyty_emulator`, `shader_cfg_tests`, and
 `shader_recompiler_compute_tests` build successfully against the refactored backend. All eleven
 standalone regression executables pass, including the Vulkan workgroup-wave64 case; both
 `git diff --check` and the staged-diff check are clean. `_DownloadData/`, `_TempData/`, and all
-three stashes remain outside the merge. The integration branch is ready for a like-for-like Story
-Mode run, but it does not replace the fallback branch until that test advances or at least matches
-blocker 47 without a new regression.
+three stashes remain outside the merge. At that point the integration branch was ready for a
+like-for-like Story Mode run, but it did not replace the fallback branch. The subsequent run exposed
+blocker 48's multi-wave limit, which is shared by the fallback code and is tracked above rather than
+classified as a merge regression.
 
 That audit did expose one intentionally incomplete merge bridge unrelated to the immediate R8
 assertion: `ConsumeVideoOutDccMetadataTransfer` returned `false`, and registration/acquisition had
@@ -824,11 +886,15 @@ GPU writes acquire both DCC planes, and the recognized render-to-display metadat
 the native-current image. This removes the last known conservative cache-split bridge while keeping
 upstream's resource lifetime and image-owner registration.
 
-Open items after the 2026-07-19 build: retest blocker 47 with the same quiet launch. Confirm the log
-selects `workgroup cross-lane emulation` for `0x9039cff00`, retains its 73-block structured CFG, and
-advances beyond the device-losing polling dispatch. Do not restore the split 32-bit approximation,
-weaken atomicity, broaden the qword-load matcher, force this kernel to wave32, or relax texture-cache
-ownership without new evidence. The remaining capability backlog is
+Open items after the blocker-49 build: rerun the same quiet launch on
+`feature/gtav-upstream-bd9086e`. Confirm the launch shader still reports
+`Vulkan running 16 64-lane compute waves through isolated workgroup cross-lane emulation`, then
+confirm `0x9039cff00` passes frame 1932 and its former queue-1 submission-44572 device loss. Capture
+the first subsequent deterministic failure or visible progress. Do not restore helper-generated
+selection blocks in the workgroup ballot, the split 32-bit atomic approximation, weaken atomicity,
+broaden the qword-load matcher, force either kernel to wave32, admit conditional multi-wave
+barriers, or relax texture-cache ownership without new evidence. The remaining
+capability backlog is
 `VOP3 0x14c` (native FP64 paired-register FMA) and two `MIMG 0xe6` BVH variants; none may be
 approximated as an ordinary F32/image operation. Preserve the oversized-window size guard and
 identify bad contributors before changing it. Record the first subsequent deterministic failure or

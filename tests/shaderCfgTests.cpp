@@ -613,8 +613,8 @@ void TestNativeSubgroupPolicy() {
 	Check(ConfigureShaderSubgroup(context, vk::ShaderStageFlagBits::eCompute, cross_lane_compute).mode ==
 	          ShaderSubgroupMode::Unsupported,
 	      "cross-lane compute mismatch bypassed the exact subgroup requirement");
-	auto workgroup_wave64              = cross_lane_compute;
-	workgroup_wave64.workgroup_wave64 = true;
+	auto workgroup_wave64 = cross_lane_compute;
+	workgroup_wave64.workgroup_wave64_waves = 1;
 	Check(ConfigureShaderSubgroup(context, vk::ShaderStageFlagBits::eCompute, workgroup_wave64).mode ==
 	          ShaderSubgroupMode::WorkgroupWave64,
 	      "single-wave workgroup emulation was rejected on a subgroup32 host");
@@ -1213,7 +1213,7 @@ void TestNewShaderRecompilerWorkgroupWave64() {
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
 	Check(ShaderRecompiler::TryRecompile(shader, options, &result, &error), error.c_str());
-	Check(result.program.workgroup_wave64,
+	Check(result.program.workgroup_wave64_waves == 1u,
 	      "64-thread wave64 compute shader did not select workgroup wave emulation");
 	Check(ProgramHasInput(result.program,
 	                      ShaderRecompiler::IR::StageInputKind::LocalInvocationIndex),
@@ -1228,6 +1228,60 @@ void TestNewShaderRecompilerWorkgroupWave64() {
 	          !Common::ContainsStr(source, "OpGroupNonUniformShuffle"),
 	      "workgroup wave64 SPIR-V still relies on one native subgroup");
 	CheckSpirvBinaryValidates(result.spirv);
+
+	const uint32_t loop_shader[] = {
+	    EncodeSMovB32(0, 128),
+	    EncodeVop1(0x02, 4, 0 + 256),
+	    EncodeSop2(0x00, 0, 0, 129),
+	    EncodeSopc(0x0a, 0, 130),
+	    EncodeSopp(0x05, 0xfffcu),
+	    EncodeSopp(0x01, 0),
+	};
+	ShaderRecompiler::CompileResult loop_result;
+	Check(ShaderRecompiler::TryRecompile(loop_shader, options, &loop_result, &error),
+	      error.c_str());
+	const auto loop_source = DisassembleSpirvBinary(loop_result.spirv);
+	Check(loop_result.program.workgroup_wave64_waves == 1u &&
+	          Common::ContainsStr(loop_source, "OpLoopMerge") &&
+	          Common::ContainsStr(loop_source, "OpAtomicAnd") &&
+	          Common::ContainsStr(loop_source, "OpAtomicOr") &&
+	          !Common::ContainsStr(loop_source, "OpSelectionMerge"),
+	      "looped workgroup wave64 ballot introduced conditional SPIR-V blocks");
+	CheckSpirvBinaryValidates(loop_result.spirv);
+
+	compute.threads_num[0] = 128;
+	ShaderRecompiler::CompileResult multi_result;
+	Check(ShaderRecompiler::TryRecompile(shader, options, &multi_result, &error), error.c_str());
+	Check(multi_result.program.workgroup_wave64_waves == 2u,
+	      "straight-line 128-thread wave64 shader did not select two isolated guest waves");
+	const auto multi_source = DisassembleSpirvBinary(multi_result.spirv);
+	Check(Common::ContainsStr(multi_source, "guest_wave64_scratch") &&
+	          Common::ContainsStr(multi_source, "%uint_132") &&
+	          Common::ContainsStr(multi_source, "OpShiftRightLogical") &&
+	          Common::ContainsStr(multi_source, "OpIMul"),
+	      "multi-wave workgroup SPIR-V lacks sized scratch or per-wave indexing");
+	CheckSpirvBinaryValidates(multi_result.spirv);
+
+	compute.threads_num[0] = 32;
+	compute.threads_num[1] = 32;
+	ShaderRecompiler::CompileResult max_result;
+	Check(ShaderRecompiler::TryRecompile(shader, options, &max_result, &error), error.c_str());
+	Check(max_result.program.workgroup_wave64_waves == 16u &&
+	          Common::ContainsStr(DisassembleSpirvBinary(max_result.spirv), "%uint_1056"),
+	      "32x32 wave64 workgroup did not allocate sixteen isolated scratch slices");
+	CheckSpirvBinaryValidates(max_result.spirv);
+
+	const uint32_t conditional_shader[] = {
+	    EncodeSopp(0x04, 1), // s_cbranch_scc0 -> end
+	    EncodeSopp(0x00, 0), // s_nop
+	    EncodeSopp(0x01, 0), // s_endpgm
+	};
+	ShaderRecompiler::CompileResult conditional_result;
+	Check(ShaderRecompiler::TryRecompile(conditional_shader, options, &conditional_result, &error),
+	      error.c_str());
+	Check(conditional_result.program.workgroup_wave64_waves == 0u,
+	      "multi-wave shader with conditional control flow enabled workgroup barriers");
+	CheckSpirvBinaryValidates(conditional_result.spirv);
 }
 
 void TestNewShaderRecompilerMoreAluFamilies() {

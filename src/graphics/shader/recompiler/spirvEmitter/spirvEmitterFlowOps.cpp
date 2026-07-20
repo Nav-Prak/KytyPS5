@@ -259,7 +259,7 @@ void EmitReadFirstLaneU32(EmitterState* state, const IR::Instruction& inst) {
 	const auto active     = EmitExecActiveBool(state);
 	const auto ballot     = EmitWaveBallot(state, active);
 	uint32_t   first_lane = 0;
-	if (state->workgroup_wave64) {
+	if (state->workgroup_wave64_waves != 0) {
 		const auto low          = state->builder.AllocateId();
 		const auto high         = state->builder.AllocateId();
 		const auto low_i32      = state->builder.AllocateId();

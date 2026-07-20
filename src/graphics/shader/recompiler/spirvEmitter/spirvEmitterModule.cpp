@@ -468,7 +468,7 @@ void EmitHeaderAndTypes(EmitterState* state) {
 	state->ptr_workgroup_array = state->builder.AllocateId();
 	state->ptr_workgroup_uint  = state->builder.AllocateId();
 	state->lds_variable        = state->builder.AllocateId();
-	if (state->workgroup_wave64) {
+	if (state->workgroup_wave64_waves != 0) {
 		state->wave_scratch_array_type    = state->builder.AllocateId();
 		state->ptr_workgroup_wave_scratch = state->builder.AllocateId();
 		state->wave_scratch_variable      = state->builder.AllocateId();
@@ -817,7 +817,7 @@ void EmitHeaderAndTypes(EmitterState* state) {
 		}
 	}
 	if (state->wave_scratch_variable != 0) {
-		const auto scratch_size = ConstantU32(state, 66u);
+		const auto scratch_size = ConstantU32(state, state->workgroup_wave64_waves * 66u);
 		state->builder.AddType({OpTypeArray, state->wave_scratch_array_type, state->uint_type,
 		                        scratch_size});
 		state->builder.AddType({OpTypePointer, state->ptr_workgroup_wave_scratch,

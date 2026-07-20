@@ -1024,7 +1024,7 @@ static void ShaderAppendNativeSpecialization(std::vector<uint32_t>*             
                                              const ShaderRecompiler::IR::Program& program) {
 	EXIT_IF(ids == nullptr || !program.binding_layout_complete);
 	ids->push_back(static_cast<uint32_t>(program.lane_mask_mode));
-	ids->push_back(static_cast<uint32_t>(program.workgroup_wave64));
+	ids->push_back(program.workgroup_wave64_waves);
 	ids->push_back(program.bindings.descriptor_set);
 	ids->push_back(program.bindings.push_constant_offset);
 	ids->push_back(program.bindings.push_constant_size);

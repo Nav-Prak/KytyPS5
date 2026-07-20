@@ -61,6 +61,17 @@ std::string FormatCfgFailure(const CFG::Graph& cfg, const CompileOptions& option
 	return CFG::FormatBlockDiagnostic(cfg, block_id, StageName(options.stage), reason);
 }
 
+bool HasUniformMultiWaveBarrierControlFlow(const IR::Program& program) {
+	for (const auto& block: program.blocks) {
+		if (block.terminator.loop_header ||
+		    (block.terminator.kind != CFG::TerminatorKind::Branch &&
+		     block.terminator.kind != CFG::TerminatorKind::Return)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 bool InstructionMaySplitSpirvBlock(const IR::Instruction& inst) {
 	switch (inst.op) {
 		case IR::Opcode::SLoadDword:
@@ -794,7 +805,13 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		const auto  threads = static_cast<uint64_t>(cs->threads_num[0]) *
 		                     static_cast<uint64_t>(cs->threads_num[1]) *
 		                     static_cast<uint64_t>(cs->threads_num[2]);
-		ir.workgroup_wave64 = threads == 64u;
+		constexpr uint64_t MaxEmulatedWorkgroupInvocations = 1024u;
+		if (threads >= 64u && threads <= MaxEmulatedWorkgroupInvocations &&
+		    threads % 64u == 0u &&
+		    (threads == 64u ||
+		     (!dispatcher_fallback && HasUniformMultiWaveBarrierControlFlow(ir)))) {
+			ir.workgroup_wave64_waves = static_cast<uint32_t>(threads / 64u);
+		}
 	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR LowerProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",

@@ -314,7 +314,7 @@ struct EmitterState {
 	uint32_t                               wave_size                      = 64;
 	bool                                   exact_subgroup_operations      = false;
 	bool                                   per_invocation_masks           = false;
-	bool                                   workgroup_wave64               = false;
+	uint32_t                               workgroup_wave64_waves         = 0;
 	uint32_t                               void_type                      = 0;
 	uint32_t                               bool_type                      = 0;
 	uint32_t                               uint_type                      = 0;

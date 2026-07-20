@@ -66,23 +66,47 @@ void EmitGuestWaveWorkgroupBarrier(EmitterState* state) {
 }
 
 uint32_t EmitGuestWaveScratchPointer(EmitterState* state, uint32_t index) {
+	if (state->workgroup_wave64_waves > 1u) {
+		const auto local_index = EmitLocalInvocationIndex(state);
+		const auto wave_index  = state->builder.AllocateId();
+		const auto wave_base   = state->builder.AllocateId();
+		const auto absolute    = state->builder.AllocateId();
+		state->builder.AddFunction({OpShiftRightLogical, state->uint_type, wave_index,
+		                            local_index, ConstantU32(state, 6u)});
+		state->builder.AddFunction({OpIMul, state->uint_type, wave_base, wave_index,
+		                            ConstantU32(state, 66u)});
+		state->builder.AddFunction(
+		    {OpIAdd, state->uint_type, absolute, wave_base, index});
+		index = absolute;
+	}
 	const auto pointer = state->builder.AllocateId();
 	state->builder.AddFunction({OpAccessChain, state->ptr_workgroup_uint, pointer,
 	                            state->wave_scratch_variable, index});
 	return pointer;
 }
 
+uint32_t EmitGuestWaveLane(EmitterState* state) {
+	const auto local_index = EmitLocalInvocationIndex(state);
+	if (state->workgroup_wave64_waves == 1u) {
+		return local_index;
+	}
+	const auto lane = state->builder.AllocateId();
+	state->builder.AddFunction({OpBitwiseAnd, state->uint_type, lane, local_index,
+	                            ConstantU32(state, 63u)});
+	return lane;
+}
+
 } // namespace
 
 uint32_t EmitWaveShuffleU32(EmitterState* state, uint32_t value, uint32_t lane) {
-	if (!state->workgroup_wave64) {
+	if (state->workgroup_wave64_waves == 0) {
 		const auto shuffled = state->builder.AllocateId();
 		state->builder.AddFunction({OpGroupNonUniformShuffle, state->uint_type, shuffled,
 		                            ConstantU32(state, ScopeSubgroup), value, lane});
 		return shuffled;
 	}
 
-	const auto self = EmitLocalInvocationIndex(state);
+	const auto self = EmitGuestWaveLane(state);
 	state->builder.AddFunction({OpStore, EmitGuestWaveScratchPointer(state, self), value});
 	EmitGuestWaveWorkgroupBarrier(state);
 
@@ -99,29 +123,22 @@ uint32_t EmitWaveShuffleU32(EmitterState* state, uint32_t value, uint32_t lane) 
 }
 
 uint32_t EmitWaveBallot(EmitterState* state, uint32_t predicate) {
-	if (!state->workgroup_wave64) {
+	if (state->workgroup_wave64_waves == 0) {
 		const auto ballot = state->builder.AllocateId();
 		state->builder.AddFunction({OpGroupNonUniformBallot, state->vec4_uint_type, ballot,
 		                            ConstantU32(state, ScopeSubgroup), predicate});
 		return ballot;
 	}
 
-	const auto lane       = EmitLocalInvocationIndex(state);
-	const auto lane_zero  = state->builder.AllocateId();
+	const auto lane       = EmitGuestWaveLane(state);
 	const auto low_word   = EmitGuestWaveScratchPointer(state, ConstantU32(state, 64u));
 	const auto high_word  = EmitGuestWaveScratchPointer(state, ConstantU32(state, 65u));
-	state->builder.AddFunction(
-	    {OpIEqual, state->bool_type, lane_zero, lane, ConstantU32(state, 0u)});
-	EmitIfCondition(state, lane_zero, [&]() {
-		state->builder.AddFunction({OpStore, low_word, ConstantU32(state, 0u)});
-		state->builder.AddFunction({OpStore, high_word, ConstantU32(state, 0u)});
-	});
-	EmitGuestWaveWorkgroupBarrier(state);
-
 	const auto high_half  = state->builder.AllocateId();
 	const auto word_index = state->builder.AllocateId();
 	const auto bit_index  = state->builder.AllocateId();
 	const auto bit        = state->builder.AllocateId();
+	const auto clear_mask = state->builder.AllocateId();
+	const auto set_bit    = state->builder.AllocateId();
 	state->builder.AddFunction(
 	    {OpUGreaterThanEqual, state->bool_type, high_half, lane, ConstantU32(state, 32u)});
 	state->builder.AddFunction({OpSelect, state->uint_type, word_index, high_half,
@@ -130,15 +147,22 @@ uint32_t EmitWaveBallot(EmitterState* state, uint32_t predicate) {
 	    {OpBitwiseAnd, state->uint_type, bit_index, lane, ConstantU32(state, 31u)});
 	state->builder.AddFunction(
 	    {OpShiftLeftLogical, state->uint_type, bit, ConstantU32(state, 1u), bit_index});
-	EmitIfCondition(state, predicate, [&]() {
-		const auto ignored = state->builder.AllocateId();
-		const auto pointer = EmitGuestWaveScratchPointer(state, word_index);
-		state->builder.AddFunction(
-		    {OpAtomicOr, state->uint_type, ignored, pointer, ConstantU32(state, ScopeWorkgroup),
-		     ConstantU32(state,
-		                 MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory),
-		     bit});
-	});
+	state->builder.AddFunction({OpNot, state->uint_type, clear_mask, bit});
+	const auto pointer = EmitGuestWaveScratchPointer(state, word_index);
+	const auto ignored = state->builder.AllocateId();
+	state->builder.AddFunction(
+	    {OpAtomicAnd, state->uint_type, ignored, pointer, ConstantU32(state, ScopeWorkgroup),
+	     ConstantU32(state, MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory),
+	     clear_mask});
+	EmitGuestWaveWorkgroupBarrier(state);
+
+	state->builder.AddFunction(
+	    {OpSelect, state->uint_type, set_bit, predicate, bit, ConstantU32(state, 0u)});
+	const auto ignored_set = state->builder.AllocateId();
+	state->builder.AddFunction(
+	    {OpAtomicOr, state->uint_type, ignored_set, pointer, ConstantU32(state, ScopeWorkgroup),
+	     ConstantU32(state, MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory),
+	     set_bit});
 	EmitGuestWaveWorkgroupBarrier(state);
 
 	const auto low    = state->builder.AllocateId();
@@ -473,8 +497,8 @@ uint32_t EmitConditionBool(EmitterState* state, const IR::Operand& operand) {
 }
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState* state) {
-	if (state->workgroup_wave64) {
-		return EmitLocalInvocationIndex(state);
+	if (state->workgroup_wave64_waves != 0) {
+		return EmitGuestWaveLane(state);
 	}
 	if (state->subgroup_local_invocation_id_variable == 0) {
 		return ConstantU32(state, 0);

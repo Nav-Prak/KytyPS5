@@ -5128,6 +5128,71 @@ TestCase WorkgroupWave64ReadsHighHalfFirstLane() {
   return test;
 }
 
+TestCase WorkgroupWave64KeepsMultipleWavesIsolated() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeVop1(0x02, 4, Vgpr(0))); // readfirstlane s4, local_id.x
+  code.push_back(EncodeVop1(0x01, 1, 4));       // v1 = first guest-wave lane
+  code.push_back(EncodeVop2(0x1a, 2, InlineU32(2), 0));
+  AppendBufferStoreDword(&code, 1, 2);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "WorkgroupWave64KeepsMultipleWavesIsolated";
+  test.code = code;
+  test.expected.resize(128);
+  std::fill_n(test.expected.begin(), 64, 0u);
+  std::fill_n(test.expected.begin() + 64, 64, 64u);
+  test.opcodes = {O::VReadfirstlaneB32, O::VMovB32, O::VLshlrevB32,
+                  O::BufferStoreDword, O::SEndpgm};
+  test.compute_info.threads_num[0] = 128;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.required_spirv = {"guest_wave64_scratch", "%uint_132", "OpControlBarrier",
+                         "OpShiftRightLogical", "OpIMul"};
+  test.forbidden_spirv = {"OpGroupNonUniformShuffle"};
+  return test;
+}
+
+TestCase WorkgroupWave64BallotInLoop() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code = {
+      EncodeSMovB32(0, InlineU32(0)),
+      EncodeVop1(0x02, 4, Vgpr(0)),
+      EncodeSop2(0x00, 0, 0, InlineU32(1)),
+      EncodeSopc(0x0a, 0, InlineU32(2)),
+      EncodeSopp(0x05, 0xfffcu),
+      EncodeVop1(0x01, 1, 4),
+      EncodeVop2(0x1a, 2, InlineU32(2), 0),
+  };
+  AppendBufferStoreDword(&code, 1, 2);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "WorkgroupWave64BallotInLoop";
+  test.code = std::move(code);
+  test.expected = std::vector<u32>(64, 0u);
+  test.opcodes = {O::SMovB32,          O::VReadfirstlaneB32,
+                  O::SAddU32,          O::SCmpLtU32,
+                  O::SCbranchScc1,     O::VMovB32,
+                  O::VLshlrevB32,      O::BufferStoreDword,
+                  O::SEndpgm};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.required_spirv = {"OpLoopMerge", "OpAtomicAnd", "OpAtomicOr",
+                         "OpControlBarrier"};
+  return test;
+}
+
 TestCase VectorPermlanex16() {
   using O = ShaderOpcode;
 
@@ -9264,6 +9329,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorSpecialF16Ops);
   AddCase(VectorWritelaneIgnoresExecMask);
   AddCase(WorkgroupWave64ReadsHighHalfFirstLane);
+  AddCase(WorkgroupWave64KeepsMultipleWavesIsolated);
+  AddCase(WorkgroupWave64BallotInLoop);
   AddCase(VectorPermlanex16);
   AddCase(VectorPermlane16FetchInactiveZero);
   AddCase(VectorPermlane16FetchInactiveFi);

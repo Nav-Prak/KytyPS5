@@ -450,7 +450,7 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 	state.compute_input_info = compute_input_info;
 	state.stage              = program.stage;
 	state.wave_size          = program.wave_size;
-	state.workgroup_wave64   = program.workgroup_wave64;
+	state.workgroup_wave64_waves = program.workgroup_wave64_waves;
 	state.debug_printf_enabled =
 	    program.stage == ShaderType::Vertex && Config::SpirvDebugPrintfEnabled();
 	state.per_invocation_masks = program.lane_mask_mode == ShaderLaneMaskMode::PerInvocation;

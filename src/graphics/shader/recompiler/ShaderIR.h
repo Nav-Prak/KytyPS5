@@ -751,9 +751,10 @@ struct Program {
 	uint32_t                wave_size           = 64;
 	uint32_t                user_data_base      = 0;
 	uint32_t                user_data_count     = 64;
-	// A single 64-lane guest wave occupies the entire workgroup. Cross-lane operations may
-	// therefore use workgroup memory when the host exposes only 32-lane subgroups.
-	bool                    workgroup_wave64    = false;
+	// Number of 64-lane guest waves whose cross-lane operations are emulated through isolated
+	// workgroup-memory slices when the host exposes only 32-lane subgroups. Multi-wave use is
+	// restricted to control flow that reaches every generated workgroup barrier uniformly.
+	uint32_t                workgroup_wave64_waves = 0;
 	bool                    dispatcher_fallback = false;
 	CFG::FailureKind        cfg_failure_kind    = CFG::FailureKind::None;
 	std::string             fallback_reason;

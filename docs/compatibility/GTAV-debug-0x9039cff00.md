@@ -246,6 +246,64 @@ ticket counter — expect 0) and buf[2]'s 12 dwords (six `{state, value}` pairs 
 state INVALID, before the scan). A nonzero counter or pre-set states confirms the initialization
 candidate and points at which clear the emulator is losing.
 
+## ROOT CAUSE FOUND (2026-07-19, 78-shader run): the tile-state buffer is stale, not zero
+
+The contents dump settled it:
+
+```
+buf[0] guest@0x60a5be6700 dwords: 00000000                          <- ticket counter: correct
+buf[1] guest@0x60a5be6100 dwords: ffffffff x12                      <- payload/input region
+buf[2] guest@0x60a5be6708 dwords: ffffffff ffffffff ffffffff ...    <- tile-state pairs: WRONG
+buf[3] guest@0x60a5be6100 dwords: ffffffff x12                      <- payload bindless view
+```
+
+`buf[2]` is the decoupled-lookback tile-state / value array. The algorithm (Merrill & Garland
+single-pass scan; the shader's own prologue has no self-init of its slot) **requires this buffer
+pre-cleared to 0** so that state 0 = INVALID/not-yet-published. The poll loop
+(`0x2cc`-`0x2f0`) waits *while* the polled state `== 0`, and the outer window-scan
+(`0x2a8`-`0x358`) terminates **only** through `0x300 s_cbranch_scc1` when it finds a predecessor with
+`state == 2` (INCLUSIVE). With every slot stale at `0xffffffff`:
+
+- the poll never waits (`0xffffffff != 0`), so a follower reads garbage instead of waiting for the
+  real publish;
+- no predecessor ever reads as `state == 2`, so `0x300` never breaks out;
+- `0x304 v_subrev_nc_u32 v19, 64, v19` walks the window backward forever.
+
+That is the GPU infinite loop that loses the device. It also explains why the dispatch width
+(2/3/6/9/41) and shader count never mattered: the very first workgroup that does any lookback spins.
+
+**Why the counter is zero but the states are not.** Both live in the same 4 KB page
+(`0x60a5be6000`), so this is not a whole-page allocation state: the counter's 4 bytes at
+`+0x700` were specifically written to 0 while the rest of the page kept `0xffffffff`. So a targeted
+clear zeroed the counter and the tile-state clear is being lost. The diagnostic reads guest memory
+through the tracker fault path (which would pull a GPU-cleared native buffer back to guest), and it
+still shows `0xffffffff` — so the clear is not reaching this guest address through either the CPU
+guest-fill path or a coherent GPU buffer. Candidates: a `DMA_DATA` immediate fill that takes the
+wrong `FillBuffer` path or hits a disjoint buffer-cache entry; or a compute/clear the emulator drops
+(note `--cs-skip-unresolved` dropped three large `0x605ac…` passes this run, though none look
+state-buffer-sized).
+
+### Diagnostic added for the next run (find the missing clear)
+
+- `bufferCache.cpp` `FillBuffer` logs every fill of <= 4 KB as
+  `FillBufferTrace: vaddr=… size=… value=… path=cpu|gpu image_overlap=…`. `DMA_DATA` immediate
+  clears route here (`graphicsRun.cpp` `DmaData` `src_sel==2`).
+- `graphicsRun.cpp` `WriteData` logs small writes as `WriteDataTrace: dst=… dwords=… first=…`. The
+  counter clear likely comes through here; the contrast shows which mechanism handles the counter
+  versus the missing state clear.
+
+After the next run: from `ScanBufferBind` note buf[2]'s guest address (e.g. `…6708`), then
+`grep -aE "FillBufferTrace|WriteDataTrace" _gtav.log` and look for any fill/write whose range covers
+that address with value 0.
+- **If a `FillBufferTrace` covers it:** the clear IS issued; the bug is its `path`/coherence (a
+  `gpu` path fill to a buffer-cache entry the scan doesn't share, or a `cpu` fill racing the bind).
+  Fix the fill so it lands in the memory the scan uploads from.
+- **If nothing covers it:** the clear is a compute dispatch (possibly skipped) or another packet.
+  Next add per-dispatch output-range logging (or check the skip list against the state address).
+
+Both traces are temporary scaffolding gated only by a line cap; remove with the `ScanBufferBind`
+diagnostic once the clear path is fixed.
+
 ### Diagnostic added (built, ran — served its purpose; can be removed later)
 
 Added targeted logging in `descriptors.cpp` `BindDescriptors` (the buffer loop): for

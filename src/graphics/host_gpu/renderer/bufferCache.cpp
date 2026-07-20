@@ -1140,6 +1140,20 @@ void BufferCache::FillBuffer(CommandBuffer* command, GraphicContext* ctx, uint64
 		const bool      image_overlap       = texture_region.image_bytes;
 		const bool      buffer_overlap      = HasPageOverlap(vaddr, size);
 		const bool      buffer_gpu_modified = IsRegionGpuModified(vaddr, size);
+		// Temporary diagnostic for the 0x9039cff00 decoupled-lookback hang: its tile-state buffer
+		// must be pre-cleared to 0 but is observed stale (0xffffffff). Log small fills so a clear
+		// of that state buffer is visible and its path (CPU guest-fill vs GPU buffer-cache fill)
+		// is known. Capped; remove once the missing clear is understood.
+		{
+			static std::atomic_uint fill_log {0};
+			if (size <= 0x1000u && fill_log.fetch_add(1, std::memory_order_relaxed) < 96) {
+				LOGF("FillBufferTrace: vaddr=0x%016" PRIx64 " size=0x%" PRIx64
+				     " value=0x%08" PRIx32 " path=%s image_overlap=%d\n",
+				     vaddr, size, value,
+				     (!buffer_overlap && !buffer_gpu_modified) ? "cpu" : "gpu",
+				     static_cast<int>(image_overlap));
+			}
+		}
 		if (!buffer_overlap && !buffer_gpu_modified) {
 			if (image_overlap) {
 				m_texture_cache->PrepareHostWrite(vaddr, size);

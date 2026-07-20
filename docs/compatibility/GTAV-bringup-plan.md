@@ -825,6 +825,30 @@ Deterministic compatibility blockers fixed in this phase (continuing the list):
     quad-permute, bank-mask, and bounds-control DPP cases; an in-game retest beyond frame 1932 / the
     submission-44572 device loss is pending.
 
+51. The blocker-50 retest still lost the device on `0x9039cff00`, as expected once the decoded RDNA2
+    proved it uses no `row_bcast`. The `ScanBufferBind` diagnostic was extended to dump the leading
+    guest dwords of each bound buffer, and that pinned the root cause. The ticket counter (buf[0] at
+    `+0x700`) reads `0x00000000` — correct — but the decoupled-lookback tile-state/value array
+    (buf[2] at `+0x708`) reads all `0xffffffff`. The scan is a Merrill & Garland single-pass scan and
+    its prologue never initializes its own slot, so correctness depends on that array being
+    pre-cleared to 0 (state 0 = INVALID/not-yet-published). The poll loop waits *while* the polled
+    state is 0, and the window-scan (`0x2a8`-`0x358`) terminates only via `0x300 s_cbranch_scc1`
+    when it finds a predecessor with `state == 2`. With every slot stale at `0xffffffff` the poll
+    never waits, no predecessor is ever `state == 2`, and `0x304 v_subrev_nc_u32 v19, 64, v19` walks
+    the lookback window backward forever — the GPU infinite loop that loses the device. This is why
+    the dispatch width and shader count never correlated with the failure.
+
+    Both the counter and the state array share one 4 KB guest page, and the counter's four bytes are
+    0 while the rest of the page stays `0xffffffff`, so a targeted clear zeroed the counter and the
+    tile-state clear is being lost. The diagnostic reads guest memory through the tracker fault path
+    (which would fold a GPU-cleared native buffer back into guest bytes) and still sees `0xffffffff`,
+    so the clear is reaching neither this guest address nor a coherent buffer the scan uploads from.
+    `bufferCache.cpp` `FillBuffer` (the `DMA_DATA` immediate-fill target) and `graphicsRun.cpp`
+    `WriteData` now log capped `FillBufferTrace`/`WriteDataTrace` lines so the next run reveals
+    whether the state clear is a fill that takes the wrong path or a dropped operation. This blocker
+    is a confirmed diagnosis with the fix pending that evidence; no algorithm, atomic, wave64, or
+    cache-ownership behavior was changed. See `GTAV-debug-0x9039cff00.md` for the grep procedure.
+
 The same build also closes the three called static-import groups identified by the first Ghidra
 campaign. `ziVA3whp3p4` is registered as the alternate AGC rewind export proven by its get-size,
 packet-write, and initial-state caller sequence. The five recovered NpUtility handlers preserve the

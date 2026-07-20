@@ -926,8 +926,24 @@ BindDescriptors(uint64_t submit_id, CommandBuffer* buffer,
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		ShaderBufferResource descriptor;
 		CopyNativeDescriptor(snapshot.buffers[i], descriptor.fields);
-		descriptors.buffers.push_back(
-		    NativeStorageBuffer(submit_id, buffer, descriptor, program.info.buffers[i]));
+		const auto view =
+		    NativeStorageBuffer(submit_id, buffer, descriptor, program.info.buffers[i]);
+		// Targeted diagnostic for the decoupled-lookback scan 0x9039cff00: its lookback poll
+		// spins forever if the publication buffer (index 2) binds with a zero range, so log each
+		// buffer's resolved descriptor and bound range once.
+		if (program.shader_hash == 0x9039cff00ull) {
+			static std::atomic_uint scan_log {0};
+			if (scan_log.fetch_add(1, std::memory_order_relaxed) < 32) {
+				const auto& b = program.info.buffers[i];
+				LOGF("ScanBufferBind 0x9039cff00: buf[%u] bindless=%d written=%d read=%d atomic=%d "
+				     "desc_base=0x%012" PRIx64 " stride=%u records=%u -> bound_range=0x%016" PRIx64
+				     " offset=0x%016" PRIx64 "\n",
+				     i, b.bindless, b.written, b.read, b.atomic, descriptor.Base48(),
+				     descriptor.Stride(), descriptor.NumRecords(),
+				     static_cast<uint64_t>(view.range), static_cast<uint64_t>(view.offset));
+			}
+		}
+		descriptors.buffers.push_back(view);
 	}
 	descriptors.images.reserve(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {

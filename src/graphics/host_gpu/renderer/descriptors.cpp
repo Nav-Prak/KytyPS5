@@ -1038,6 +1038,48 @@ BindDescriptors(uint64_t submit_id, CommandBuffer* buffer,
 				    ((program.shader_hash == 0x9039cff00ull && i == 2) || linked_list)) {
 					ScanDiagDumpOverlaps(guest_base, static_cast<uint64_t>(view.range));
 				}
+				// Trace 0x9039ba900's pointer-chasing loop in place: from each start index (the
+				// dispatch's thread ids) follow next = (buf0[i] >> 3) & 0x1ffffff, stopping when a
+				// node's value is exactly 7. An out-of-range index reads 0 (bounds-dropped load) ->
+				// next 0. A chain that does not reach value 7 within `records` steps has a cycle, so
+				// the guest loop spins forever -> the observed device loss is a GPU hang, and this
+				// names the first offending start index.
+				if (linked_list && guest_base != 0) {
+					const uint32_t records = descriptor.NumRecords();
+					if (records > 0 &&
+					    HostMemoryRangeIsMapped(
+					        guest_base, static_cast<uint64_t>(records) * sizeof(uint32_t))) {
+						const auto* list = reinterpret_cast<const uint32_t*>(guest_base);
+						const uint32_t starts = std::min(records, 64u);
+						uint32_t       terminate = 0, cycle = 0, first_cycle_start = UINT32_MAX;
+						for (uint32_t s = 0; s < starts; s++) {
+							uint32_t idx = s;
+							bool     hit7 = false;
+							for (uint32_t step = 0; step <= records; step++) {
+								const uint32_t value = idx < records ? list[idx] : 0u;
+								if (value == 7u) {
+									hit7 = true;
+									break;
+								}
+								idx = (value >> 3u) & 0x1ffffffu;
+							}
+							if (hit7) {
+								terminate++;
+							} else {
+								cycle++;
+								if (first_cycle_start == UINT32_MAX) {
+									first_cycle_start = s;
+								}
+							}
+						}
+						LOGF("ScanLinkedListTrace 0x9039ba900: records=%u starts=%u terminate=%u "
+						     "cycle=%u first_cycle_start=%d\n",
+						     records, starts, terminate, cycle,
+						     first_cycle_start == UINT32_MAX
+						         ? -1
+						         : static_cast<int>(first_cycle_start));
+					}
+				}
 			}
 		}
 		descriptors.buffers.push_back(view);

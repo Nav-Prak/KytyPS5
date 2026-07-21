@@ -304,6 +304,52 @@ that address with value 0.
 Both traces are temporary scaffolding gated only by a line cap; remove with the `ScanBufferBind`
 diagnostic once the clear path is fixed.
 
+## Run of 2026-07-19 (78 shaders) — no CP op clears buf[2], and the cap masked the late writes
+
+The retest confirmed buf[2] is still stale and produced two useful facts and one diagnostic flaw:
+
+- buf[2] is at guest `0x60a5c3b308` this run (was `…6708`), `records=41`, still all `0xffffffff`
+  across all 8 binds. buf[1]/buf[3] (payload, base `…c3b…`) are `0xffffffff` too — the whole region
+  reads as a poison-like pattern.
+- The three `FillBufferTrace` lines are unrelated 4-byte `value=1` fills; **no CP fill clears the
+  state buffer.** The emulator does not poison-fill `0xffffffff` (grep confirms), so the pattern is
+  genuine stale/prior-frame data.
+- **Diagnostic flaw:** `WriteDataTrace` hit its 96-line cap during the first frames, but the scan
+  binds only after 80 shaders compile, so the scan's own setup writes are past the cap and were
+  never logged. The captured `WriteDataTrace` lines are early, unrelated writes to other addresses
+  (`…31000`/`…45000` counter-reset clusters). So this run neither proves nor disproves a WRITE_DATA
+  clear of buf[2] — the cap hid the relevant window.
+
+A state-buffer clear via WRITE_DATA would be a burst of ~82 zero dwords (41 pairs) and games rarely
+clear that way; a `DMA_DATA` fill would show in `FillBufferTrace` (none did). So the clear is most
+likely a **compute dispatch** whose write to buf[2] is either dropped (skipped shader) or lands in a
+buffer-cache entry the scan does not share (a coherence/ownership issue, blocker 18-36 territory).
+My bind-time guest read cannot see a GPU clear that executes later, so the `0xffffffff` at bind time
+is consistent with both "no clear" and "clear-but-incoherent".
+
+### Diagnostic replaced: scan-diag write ring (`scanDiag.h` + `descriptors.cpp`)
+
+The capped traces are replaced by an uncapped ring that records **every written buffer range from
+every shader's `BindDescriptors`** (tag = shader hash) plus every CP `WriteData` (tag 1) and
+`FillBuffer` (tag 2 = cpu path, 3 = gpu path). At the scan's buf[2] bind, `ScanDiagDumpOverlaps`
+prints every ring entry whose range overlaps buf[2]'s enclosing 4 KB page:
+
+```
+ScanDiagOverlap: writer tag=0x… range=0x…..0x… value=0x… seq=…
+```
+
+Interpretation after the next run (`grep -aE "ScanBufferBind 0x9039cff00: buf\[2\]|ScanDiagOverlap"`):
+- **A writer with `tag` != `0x9039cff00` and value 0** → that is the clear. If its `tag` is a shader
+  hash, the clear is a compute dispatch that ran but is incoherent with the scan's read — fix the
+  buffer-cache ownership so the scan uploads from the cleared bytes. If `tag` is 1/2/3, a CP op
+  clears it but on the wrong path/buffer.
+- **Only `tag == 0x9039cff00` writers (the scan's own publishes), or `no recorded … write
+  overlaps`** → nothing clears buf[2] before the scan; the game relies on zero-initialized
+  allocation that the emulator is not providing, and the fix is to zero this scan-scratch on
+  allocation / first GPU use rather than to chase a clear packet.
+
+The ring holds 8192 entries (plenty for within-frame correlation) and is temporary scaffolding.
+
 ### Diagnostic added (built, ran — served its purpose; can be removed later)
 
 Added targeted logging in `descriptors.cpp` `BindDescriptors` (the buffer loop): for

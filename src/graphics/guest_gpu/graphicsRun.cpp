@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/objects/label.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/scanDiag.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/presentation/displayBuffer.h"
 #include "graphics/presentation/videoOut.h"
@@ -660,16 +661,11 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		return;
 	}
 
-	// Temporary diagnostic for the 0x9039cff00 scan hang: contrast the counter clear (observed
-	// zero) with the missing tile-state clear. Log small writes with their destination and first
-	// dword. Capped; remove once the missing state clear is understood.
-	{
-		static std::atomic_uint write_log {0};
-		if (dw_num <= 16u && write_log.fetch_add(1, std::memory_order_relaxed) < 96) {
-			LOGF("WriteDataTrace: dst=0x%016" PRIx64 " dwords=%u first=0x%08" PRIx32 "\n",
-			     reinterpret_cast<uint64_t>(dst), dw_num, src[0]);
-		}
-	}
+	// Temporary diagnostic for the 0x9039cff00 scan hang: record every WRITE_DATA into the scan-diag
+	// ring (uncapped, unlike the earlier line-capped trace) so the scan's buf[2] bind can tell
+	// whether a WRITE_DATA clears the tile-state buffer. tag 1 = WriteData.
+	ScanDiagRecordWrite(reinterpret_cast<uint64_t>(dst),
+	                    static_cast<uint64_t>(dw_num) * sizeof(uint32_t), 1u, src[0]);
 
 	memcpy(dst, src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
 }

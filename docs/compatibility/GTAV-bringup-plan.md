@@ -849,6 +849,16 @@ Deterministic compatibility blockers fixed in this phase (continuing the list):
     is a confirmed diagnosis with the fix pending that evidence; no algorithm, atomic, wave64, or
     cache-ownership behavior was changed. See `GTAV-debug-0x9039cff00.md` for the grep procedure.
 
+    The 78-shader retest showed no CP fill clears the state buffer and that the `WriteDataTrace`
+    line cap hid the scan's late setup writes, so a WRITE_DATA clear could not be ruled in or out.
+    The capped traces were replaced by an uncapped scan-diag write ring (`scanDiag.h`) that records
+    every written buffer range from every shader's `BindDescriptors` plus each CP `WriteData`/
+    `FillBuffer`; at the scan's buf[2] bind it prints `ScanDiagOverlap` lines naming every op that
+    recently wrote that memory. This distinguishes the two remaining fixes: a non-scan writer of
+    value 0 means the clear exists but is incoherent with the scan's read (buffer-cache ownership);
+    no overlapping writer means the game relies on zero-initialized scan scratch the emulator does
+    not provide.
+
 The same build also closes the three called static-import groups identified by the first Ghidra
 campaign. `ziVA3whp3p4` is registered as the alternate AGC rewind export proven by its get-size,
 packet-write, and initial-state caller sequence. The five recovered NpUtility handlers preserve the

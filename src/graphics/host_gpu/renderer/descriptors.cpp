@@ -23,6 +23,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderTargetBarriers.h"
+#include "graphics/host_gpu/renderer/scanDiag.h"
 #include "graphics/host_gpu/renderer/shaderResourceBarrier.h"
 #include "graphics/host_gpu/transfer.h"
 #include "graphics/host_gpu/vma.h"
@@ -34,6 +35,7 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <fmt/format.h>
@@ -49,6 +51,55 @@
 #endif
 
 namespace Libs::Graphics {
+
+// --- Temporary scan-state-clear diagnostic (remove with ScanBufferBind) ---------------------
+namespace {
+struct ScanDiagWrite {
+	uint64_t addr  = 0;
+	uint64_t size  = 0;
+	uint64_t tag   = 0;
+	uint32_t value = 0;
+	uint32_t seq   = 0;
+};
+constexpr uint32_t         kScanDiagRingSize = 8192;
+std::array<ScanDiagWrite, kScanDiagRingSize> g_scan_diag_ring {};
+std::atomic_uint                             g_scan_diag_seq {0};
+} // namespace
+
+void ScanDiagRecordWrite(uint64_t addr, uint64_t size, uint64_t tag, uint32_t value) {
+	if (addr == 0 || size == 0) {
+		return;
+	}
+	const auto seq          = g_scan_diag_seq.fetch_add(1, std::memory_order_relaxed);
+	g_scan_diag_ring[seq % kScanDiagRingSize] = {addr, size, tag, value, seq};
+}
+
+void ScanDiagDumpOverlaps(uint64_t addr, uint64_t size) {
+	const uint64_t q_begin = addr;
+	const uint64_t q_end   = addr + size;
+	// Widen the query to the enclosing 4 KB page so a clear of the whole tile-state region is seen.
+	const uint64_t p_begin = q_begin & ~static_cast<uint64_t>(0xfffu);
+	const uint64_t p_end   = (q_end + 0xfffu) & ~static_cast<uint64_t>(0xfffu);
+	uint32_t       hits    = 0;
+	for (const auto& w: g_scan_diag_ring) {
+		if (w.size == 0) {
+			continue;
+		}
+		const uint64_t w_end = w.addr + w.size;
+		if (w.addr < p_end && p_begin < w_end && hits < 24) {
+			LOGF("ScanDiagOverlap: writer tag=0x%016" PRIx64 " range=0x%012" PRIx64
+			     "..0x%012" PRIx64 " value=0x%08" PRIx32 " seq=%u\n",
+			     w.tag, w.addr, w_end, w.value, w.seq);
+			hits++;
+		}
+	}
+	if (hits == 0) {
+		LOGF("ScanDiagOverlap: no recorded GPU/CP write overlaps 0x%012" PRIx64 "..0x%012" PRIx64
+		     " (page 0x%012" PRIx64 "..0x%012" PRIx64 ")\n",
+		     q_begin, q_end, p_begin, p_end);
+	}
+}
+// --- end temporary diagnostic ---------------------------------------------------------------
 
 using TextureVariant = DescriptorCache::TextureVariant;
 
@@ -930,6 +981,11 @@ BindDescriptors(uint64_t submit_id, CommandBuffer* buffer,
 		CopyNativeDescriptor(snapshot.buffers[i], descriptor.fields);
 		const auto view =
 		    NativeStorageBuffer(submit_id, buffer, descriptor, program.info.buffers[i]);
+		// Record every written buffer so the scan's buf[2] bind can name who last wrote that memory.
+		if (program.info.buffers[i].written && descriptor.Base48() != 0) {
+			ScanDiagRecordWrite(descriptor.Base48(), static_cast<uint64_t>(view.range),
+			                    program.shader_hash, 0u);
+		}
 		// Targeted diagnostic for the decoupled-lookback scan 0x9039cff00: its lookback poll
 		// spins forever if the publication buffer (index 2) binds with a zero range, so log each
 		// buffer's resolved descriptor and bound range once.
@@ -966,6 +1022,12 @@ BindDescriptors(uint64_t submit_id, CommandBuffer* buffer,
 					}
 					LOGF("ScanBufferBind 0x9039cff00: buf[%u] guest@0x%012" PRIx64 " dwords:%s\n",
 					     i, guest_base, text.c_str());
+				}
+				// For the tile-state array (buf[2]), name every shader/CP op that recently wrote
+				// this memory. A clear should appear as a non-0x9039cff00 writer of value 0; its
+				// absence means nothing zeroes the state buffer before the scan.
+				if (i == 2 && guest_base != 0) {
+					ScanDiagDumpOverlaps(guest_base, static_cast<uint64_t>(view.range));
 				}
 			}
 		}

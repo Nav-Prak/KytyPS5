@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/objects/label.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/resourceMutex.h"
+#include "graphics/host_gpu/renderer/scanDiag.h"
 #include "graphics/host_gpu/renderer/textureCache.h"
 #include "graphics/host_gpu/transfer.h"
 #include "graphics/host_gpu/vma.h"
@@ -1141,19 +1142,11 @@ void BufferCache::FillBuffer(CommandBuffer* command, GraphicContext* ctx, uint64
 		const bool      buffer_overlap      = HasPageOverlap(vaddr, size);
 		const bool      buffer_gpu_modified = IsRegionGpuModified(vaddr, size);
 		// Temporary diagnostic for the 0x9039cff00 decoupled-lookback hang: its tile-state buffer
-		// must be pre-cleared to 0 but is observed stale (0xffffffff). Log small fills so a clear
-		// of that state buffer is visible and its path (CPU guest-fill vs GPU buffer-cache fill)
-		// is known. Capped; remove once the missing clear is understood.
-		{
-			static std::atomic_uint fill_log {0};
-			if (size <= 0x1000u && fill_log.fetch_add(1, std::memory_order_relaxed) < 96) {
-				LOGF("FillBufferTrace: vaddr=0x%016" PRIx64 " size=0x%" PRIx64
-				     " value=0x%08" PRIx32 " path=%s image_overlap=%d\n",
-				     vaddr, size, value,
-				     (!buffer_overlap && !buffer_gpu_modified) ? "cpu" : "gpu",
-				     static_cast<int>(image_overlap));
-			}
-		}
+		// must be pre-cleared to 0 but is observed stale (0xffffffff). Record every fill into the
+		// scan-diag ring (uncapped) so the scan's buf[2] bind can see whether a fill clears that
+		// buffer, and encode the CPU/GPU path in the tag (2 = cpu fill, 3 = gpu fill).
+		ScanDiagRecordWrite(
+		    vaddr, size, (!buffer_overlap && !buffer_gpu_modified) ? 2u : 3u, value);
 		if (!buffer_overlap && !buffer_gpu_modified) {
 			if (image_overlap) {
 				m_texture_cache->PrepareHostWrite(vaddr, size);

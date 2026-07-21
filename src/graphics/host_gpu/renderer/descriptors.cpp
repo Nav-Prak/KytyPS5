@@ -986,25 +986,26 @@ BindDescriptors(uint64_t submit_id, CommandBuffer* buffer,
 			ScanDiagRecordWrite(descriptor.Base48(), static_cast<uint64_t>(view.range),
 			                    program.shader_hash, 0u);
 		}
-		// Targeted diagnostic for the decoupled-lookback scan 0x9039cff00: its lookback poll
-		// spins forever if the publication buffer (index 2) binds with a zero range, so log each
-		// buffer's resolved descriptor and bound range once.
-		if (program.shader_hash == 0x9039cff00ull) {
+		// Targeted diagnostic for the decoupled-lookback scan 0x9039cff00 and its clear/init kernel
+		// 0x9039cfd00. The clear zeroes the counter (works) and the tile-state buffer via a
+		// runtime-assembled V# (s5 bit19 -> stride 8, s6 = partition count); the state clear is not
+		// landing, so log every buffer's raw resolved V# dwords, resolved base/stride/records, bound
+		// range, and leading guest contents to see where the state descriptor resolves.
+		if (program.shader_hash == 0x9039cff00ull || program.shader_hash == 0x9039cfd00ull) {
 			static std::atomic_uint scan_log {0};
-			if (scan_log.fetch_add(1, std::memory_order_relaxed) < 32) {
+			if (scan_log.fetch_add(1, std::memory_order_relaxed) < 80) {
 				const auto& b = program.info.buffers[i];
-				LOGF("ScanBufferBind 0x9039cff00: buf[%u] bindless=%d written=%d read=%d atomic=%d "
-				     "desc_base=0x%012" PRIx64 " stride=%u records=%u -> bound_range=0x%016" PRIx64
-				     " offset=0x%016" PRIx64 "\n",
-				     i, b.bindless, b.written, b.read, b.atomic, descriptor.Base48(),
-				     descriptor.Stride(), descriptor.NumRecords(),
-				     static_cast<uint64_t>(view.range), static_cast<uint64_t>(view.offset));
-				// Dump the leading guest dwords. The scan's ticket counter (buf[0]) and its
-				// published state/value pairs (buf[2]) have never been observed; a partition
-				// index past the record count, or a state slot that stays zero, keeps the
-				// lookback poll spinning until the GPU is lost. The CPU read enters the memory
-				// tracker's fault path, which synchronizes native bytes, so this reports the
-				// contents the dispatch actually starts from.
+				LOGF("ScanBufferBind 0x%09" PRIx64 ": buf[%u] bindless=%d written=%d read=%d "
+				     "atomic=%d fields=%08x:%08x:%08x:%08x base=0x%012" PRIx64
+				     " stride=%u records=%u -> bound_range=0x%016" PRIx64 " offset=0x%016" PRIx64
+				     "\n",
+				     program.shader_hash, i, b.bindless, b.written, b.read, b.atomic,
+				     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2],
+				     descriptor.fields[3], descriptor.Base48(), descriptor.Stride(),
+				     descriptor.NumRecords(), static_cast<uint64_t>(view.range),
+				     static_cast<uint64_t>(view.offset));
+				// The CPU read enters the memory tracker's fault path, which synchronizes native
+				// bytes, so this reports the contents the dispatch actually starts from.
 				const auto     guest_base = descriptor.Base48();
 				const uint32_t dwords     = static_cast<uint32_t>(std::min<uint64_t>(
                     static_cast<uint64_t>(view.range) / sizeof(uint32_t), 12u));
@@ -1020,13 +1021,11 @@ BindDescriptors(uint64_t submit_id, CommandBuffer* buffer,
 						    sizeof(value));
 						text += fmt::format(" {:08x}", value);
 					}
-					LOGF("ScanBufferBind 0x9039cff00: buf[%u] guest@0x%012" PRIx64 " dwords:%s\n",
-					     i, guest_base, text.c_str());
+					LOGF("ScanBufferBind 0x%09" PRIx64 ": buf[%u] guest@0x%012" PRIx64 " dwords:%s\n",
+					     program.shader_hash, i, guest_base, text.c_str());
 				}
-				// For the tile-state array (buf[2]), name every shader/CP op that recently wrote
-				// this memory. A clear should appear as a non-0x9039cff00 writer of value 0; its
-				// absence means nothing zeroes the state buffer before the scan.
-				if (i == 2 && guest_base != 0) {
+				// For the scan's tile-state array (buf[2]), name every op that recently wrote it.
+				if (program.shader_hash == 0x9039cff00ull && i == 2 && guest_base != 0) {
 					ScanDiagDumpOverlaps(guest_base, static_cast<uint64_t>(view.range));
 				}
 			}

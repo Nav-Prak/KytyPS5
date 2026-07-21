@@ -350,6 +350,57 @@ Interpretation after the next run (`grep -aE "ScanBufferBind 0x9039cff00: buf\[2
 
 The ring holds 8192 entries (plenty for within-frame correlation) and is temporary scaffolding.
 
+## ROOT CAUSE ISOLATED (2026-07-19, 79 shaders): the clear kernel 0x9039cfd00 mis-binds its state V#
+
+The write ring named the culprit. At the scan's buf[2] bind (`0x60a5c3b308`), the overlapping
+writers are all compute shaders (no CP `tag` 1/2/3). Two carry ~50 MB ranges — the degraded bindless
+union window — but the decisive one is **`0x9039cfd00`**, a tiny sibling that shares the scan's
+control buffers. Its decoded RDNA2 is the scan's **clear/init kernel**:
+
+```
+; thread 0 clears the ticket counter
+v_lshl_add_u32 v2, s12, 6, v0          ; v2 = global thread id
+... exec = (v2 == 0) ...
+buffer_store_dword 0, v0, s0           ; counter[0] = 0     (buffer at s0)
+; threads 0..s11-1 clear the tile-state array
+... exec = (v2 < s11) ...
+s_bitset1_b32 s5, 19                    ; V# dword1 bit19 -> Stride() bit3 = stride 8
+s_mov_b32 s6, s11                       ; V# dword2 = NumRecords = partition count
+s_mov_b32 s7, 0x00016204                ; V# dword3 = format/dst_sel
+buffer_store_dwordx2 {0,0}, v2, s4      ; state[v2] = {0,0}  (buffer at s4, idxen)
+```
+
+So the game **does** clear the state buffer — with this kernel — using a **V# assembled at runtime in
+registers** (`s4` base from user data, `s5` stride bit set with `s_bitset1_b32`, `s6` = partition
+count, `s7` = format). The counter clear (a plain V# at `s0`) lands — buf[0] reads 0. But the write
+ring shows `0x9039cfd00` only wrote `0x60a5c3b300..0x304` (the counter); its state store **never
+appears at `0x60a5c3b308`**. TrackResources/Materialize both report 2 buffers for it, so the state
+descriptor is bound *somewhere* — just not at the state buffer's real address. The emulator is
+mis-resolving this runtime-assembled state V#, so the clear-to-zero lands at the wrong place and
+buf[2] stays `0xffffffff`, which hangs the scan exactly as analyzed above.
+
+This is a **write-side instance of the tableless-bindless resolution** work (blockers 16/17), which
+handled runtime-assembled V#s for reads/union windows; the `s_bitset1_b32`-patched stride plus
+`idxen` store on `s4` is resolving to the wrong base/stride/records.
+
+### Diagnostic extended (pin the exact mis-resolution)
+
+`ScanBufferBind` now also logs `0x9039cfd00` and prints each buffer's **raw resolved V# dwords**
+(`fields=d0:d1:d2:d3`) alongside `base/stride/records/bound_range`. After the next run:
+
+```
+grep -aE "ScanBufferBind 0x9039cfd00" _gtav.log
+```
+
+Find the state buffer (the one with `stride=8`, `written=1`, `idxen`). Compare its resolved `base`
+to the scan's buf[2] `base` (`0x…c3b308`) and its raw `fields` to the expected V#:
+- **base wrong** → the runtime base assembly (`s4` + `s5[0:15]`) is mis-read; fix the scalar
+  provenance / materialization of that V#.
+- **stride 0 or records wrong** → the `s_bitset1_b32 s5, 19` (stride) or `s6 = s11` (records) is not
+  modeled, so the `idxen` store addresses collapse (all threads hit one slot) or bounds-reject.
+Either way the fix is to resolve `0x9039cfd00`'s state V# to the same `base=0x…c3b308, stride=8,
+records=partition-count` the scan uses for buf[2], so the clear lands and the scan starts from zero.
+
 ### Diagnostic added (built, ran — served its purpose; can be removed later)
 
 Added targeted logging in `descriptors.cpp` `BindDescriptors` (the buffer loop): for

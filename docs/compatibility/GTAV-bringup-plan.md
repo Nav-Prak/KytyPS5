@@ -859,6 +859,19 @@ Deterministic compatibility blockers fixed in this phase (continuing the list):
     no overlapping writer means the game relies on zero-initialized scan scratch the emulator does
     not provide.
 
+    The 79-shader retest resolved it: the write ring named `0x9039cfd00`, a tiny sibling that shares
+    the scan's control buffers, as the scan's clear/init kernel. Its decoded RDNA2 clears the ticket
+    counter (a plain V# at `s0`, which lands — buf[0] is 0) and clears the tile-state array with a
+    **runtime-assembled V#** (base from `s4`, `s_bitset1_b32 s5, 19` -> stride 8, `s6` = partition
+    count, `s7` = format, `idxen` store of `{0,0}`). The counter clear works but the state store
+    never reaches buf[2]'s address `0x…c3b308`: the emulator mis-resolves that runtime-assembled
+    write V#, so the clear lands elsewhere and the state buffer stays `0xffffffff`. This is a
+    write-side instance of the tableless-bindless resolution (blockers 16/17). The `ScanBufferBind`
+    diagnostic now also logs `0x9039cfd00` with each buffer's raw resolved V# dwords so the next run
+    pins whether the base, the `s_bitset1`-patched stride, or the record count is mis-read; the fix
+    is to bind `0x9039cfd00`'s state V# to the same `base/stride=8/records` the scan uses for buf[2]
+    so the clear lands and the scan starts from zero.
+
 The same build also closes the three called static-import groups identified by the first Ghidra
 campaign. `ziVA3whp3p4` is registered as the alternate AGC rewind export proven by its get-size,
 packet-write, and initial-state caller sequence. The five recovered NpUtility handlers preserve the

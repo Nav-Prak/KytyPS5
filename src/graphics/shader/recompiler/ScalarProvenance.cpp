@@ -19,6 +19,8 @@ uint32_t ScalarValueArgCount(ScalarValueOp op) {
 		case ScalarValueOp::Or:
 		case ScalarValueOp::OrNot:
 		case ScalarValueOp::Xor:
+		case ScalarValueOp::BitSet:
+		case ScalarValueOp::BitClear:
 		case ScalarValueOp::ShiftLeft:
 		case ScalarValueOp::ShiftRight:
 		case ScalarValueOp::ShiftRightArithmetic:
@@ -500,6 +502,8 @@ private:
 			case Opcode::BitwiseOrNotU32: return ScalarValueOp::OrNot;
 			case Opcode::BitwiseXorU32: return ScalarValueOp::Xor;
 			case Opcode::BitwiseNotU32: return ScalarValueOp::Not;
+			case Opcode::BitSetU32: return ScalarValueOp::BitSet;
+			case Opcode::BitClearU32: return ScalarValueOp::BitClear;
 			case Opcode::ShiftLeftLogicalU32: return ScalarValueOp::ShiftLeft;
 			case Opcode::ShiftRightLogicalU32: return ScalarValueOp::ShiftRight;
 			case Opcode::ShiftRightArithmeticI32: return ScalarValueOp::ShiftRightArithmetic;

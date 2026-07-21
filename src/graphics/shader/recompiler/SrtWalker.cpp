@@ -70,6 +70,8 @@ bool ApplyOperation(ScalarValueOp op, const uint32_t args[3], uint32_t* result) 
 		case ScalarValueOp::OrNot: *result = args[0] | ~args[1]; break;
 		case ScalarValueOp::Xor: *result = args[0] ^ args[1]; break;
 		case ScalarValueOp::Not: *result = ~args[0]; break;
+		case ScalarValueOp::BitSet: *result = args[0] | (uint32_t {1} << shift); break;
+		case ScalarValueOp::BitClear: *result = args[0] & ~(uint32_t {1} << shift); break;
 		case ScalarValueOp::ShiftLeft: *result = args[0] << shift; break;
 		case ScalarValueOp::ShiftRight: *result = args[0] >> shift; break;
 		case ScalarValueOp::ShiftRightArithmetic:

@@ -401,6 +401,33 @@ to the scan's buf[2] `base` (`0x…c3b308`) and its raw `fields` to the expected
 Either way the fix is to resolve `0x9039cfd00`'s state V# to the same `base=0x…c3b308, stride=8,
 records=partition-count` the scan uses for buf[2], so the clear lands and the scan starts from zero.
 
+## FIX (2026-07-19): model BitSetU32/BitClearU32 in scalar provenance
+
+The follow-up run gave the resolved V#: `0x9039cfd00` buf[1] (state buffer)
+`fields=…:00000060:00000004:00000000` -> `stride=0, records=4, bound_range=4 bytes`. `s5` bit 19
+(which `Stride()` reads as stride bit 3) is clear, so the `s_bitset1_b32 s5, 19` that sets stride 8
+was not applied. With stride 0 and a 4-byte range the 8-byte `idxen` state-clear store is out of
+bounds and dropped.
+
+Root cause: the descriptor's V# dwords are resolved per dword by folding scalar provenance
+(`EvaluateRuntimeSources` -> `SrtWalker`), but `s_bitset1_b32`/`s_bitset0_b32` lower to
+`BitSetU32`/`BitClearU32`, which `Operation()` (`ScalarProvenance.cpp`) did not map — it returned
+`Unknown`, so the stride dword fell back to the pre-dispatch register snapshot (`0x60`, no bit 19).
+
+Fix (four spots): add `ScalarValueOp::BitSet`/`BitClear`; map `BitSetU32`/`BitClearU32` in
+`Operation()`; give them arity 2; and fold them in `SrtWalker`'s `ApplyOperation`
+(`args[0] | (1<<shift)` / `args[0] & ~(1<<shift)`). `s5` now folds to `0x00080060` -> stride 8, so
+buf[1] binds with the right stride/range and the clear lands. Regression
+`TestBitSetDescriptorStride` builds the exact pattern (stride patched by `s_bitset1_b32`) and checks
+`dword1=0x00080060` plus the `s_bitset0` inverse; `scalar_provenance_tests`,
+`resource_tracking_tests`, `shader_stage_runtime_tests`, and `shader_recompiler_compute_tests` pass.
+
+Pending in-game: confirm `0x9039cfd00` buf[1] now logs `stride=8` and `0x9039cff00` buf[2] reads
+zero. If buf[1]'s `base` also differs from the scan's buf[2] base (the `s4` base was observed equal
+to the counter base, possibly off by 8), that is a separate residual to chase; the stride fix is
+necessary regardless. Once buf[2] reads zero and the scan clears, remove the `ScanBufferBind`,
+`scanDiag`, and CP-write diagnostics.
+
 ### Diagnostic added (built, ran — served its purpose; can be removed later)
 
 Added targeted logging in `descriptors.cpp` `BindDescriptors` (the buffer loop): for

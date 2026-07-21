@@ -872,6 +872,28 @@ Deterministic compatibility blockers fixed in this phase (continuing the list):
     is to bind `0x9039cfd00`'s state V# to the same `base/stride=8/records` the scan uses for buf[2]
     so the clear lands and the scan starts from zero.
 
+52. That diagnostic run isolated the exact mis-resolution. `0x9039cfd00`'s state buffer (buf[1])
+    resolved to `fields=…:00000060:00000004:00000000`, i.e. `stride=0`, `records=4`,
+    `bound_range=4 bytes`, because `s5` bit 19 was never set — `Stride() = (fields[1]>>16)&0x3fff`
+    reads bit 3, and the `s_bitset1_b32 s5, 19` that sets it was not modeled. With `stride=0` and a
+    4-byte range the `idxen buffer_store_dwordx2` (8 bytes) is out of bounds and dropped, so the
+    tile-state array is never cleared. The V# dwords are resolved per dword through scalar-provenance
+    folding (`EvaluateRuntimeSources` -> `SrtWalker`), and `s_bitset1_b32`/`s_bitset0_b32` lower to
+    `BitSetU32`/`BitClearU32`, which `Operation()` did not map (returned `Unknown`) and `SrtWalker`
+    could not evaluate — so the stride dword fell back to the pre-dispatch register snapshot.
+
+    Scalar provenance now models both: `BitSetU32` -> `ScalarValueOp::BitSet`
+    (`value | (1 << bit)`) and `BitClearU32` -> `BitClear` (`value & ~(1 << bit)`), with arity 2 and
+    constant folding in `SrtWalker`. `s5` now folds to `0x00080060` -> `stride 8`, so the state
+    buffer binds with the correct stride and record range and the clear stores land. A focused
+    provenance regression (`TestBitSetDescriptorStride`) builds the exact GTA pattern — a stride
+    field patched by `s_bitset1_b32` — and checks the descriptor resolves `dword1=0x00080060` and
+    `records`, plus the `s_bitset0_b32` inverse. `scalar_provenance_tests`, `resource_tracking_tests`,
+    `shader_stage_runtime_tests`, and the full `shader_recompiler_compute_tests` pass, and the Release
+    emulator builds. In-game confirmation that the state buffer is now zeroed and `0x9039cff00`
+    completes is pending; the `ScanBufferBind` diagnostic remains so the retest can verify buf[1]
+    resolves `stride=8` and buf[2] reads zero.
+
 The same build also closes the three called static-import groups identified by the first Ghidra
 campaign. `ziVA3whp3p4` is registered as the alternate AGC rewind export proven by its get-size,
 packet-write, and initial-state caller sequence. The five recovered NpUtility handlers preserve the

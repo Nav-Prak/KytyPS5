@@ -890,9 +890,23 @@ Deterministic compatibility blockers fixed in this phase (continuing the list):
     field patched by `s_bitset1_b32` — and checks the descriptor resolves `dword1=0x00080060` and
     `records`, plus the `s_bitset0_b32` inverse. `scalar_provenance_tests`, `resource_tracking_tests`,
     `shader_stage_runtime_tests`, and the full `shader_recompiler_compute_tests` pass, and the Release
-    emulator builds. In-game confirmation that the state buffer is now zeroed and `0x9039cff00`
-    completes is pending; the `ScanBufferBind` diagnostic remains so the retest can verify buf[1]
-    resolves `stride=8` and buf[2] reads zero.
+    emulator builds.
+
+    **Reverted (2026-07-20).** In game the fix is correct but destabilizes the whole GPU-driven scan
+    pipeline. Making the `s_bitset`-constructed write V#s resolve caused stores across the scan family
+    (`0x9039cfd00`, `0x9039ba900`, and the linked-list writers `0x903951200`/`0x90396a600`/
+    `0x903957400`) to *land*, and each landing store exposed the next latent runtime-V# resolution or
+    buffer-coherence bug rather than advancing. Concretely `0x9039ba900`'s pointer-chasing loop began
+    to hang: an in-emulator trace of its linked list showed all 64 chains cycling
+    (`terminate=0 cycle=64`), because the now-landing writes form cycles instead of value-7 terminals;
+    a run also hit a new null buffer view (`descriptorCache.cpp:90`). The provenance change
+    (`ScalarValueOp::BitSet`/`BitClear` mapping + folding) and `TestBitSetDescriptorStride` were rolled
+    out of the active path to restore the stable state where the run reaches `0x9039cff00` and hangs
+    on its uncleared tile-state buffer. The fix and test remain in git history (commit `f280426`) as
+    the correct model to reinstate once the GPU-scan pipeline gets a coordinated runtime-V# +
+    coherence pass; that pipeline (RAGE decoupled-lookback scan built on runtime-assembled V#s, linked
+    lists, and cross-pass shared buffers) is now a scoped project rather than an incremental target.
+    The `ScanBufferBind` scan diagnostic remains for that future work.
 
 The same build also closes the three called static-import groups identified by the first Ghidra
 campaign. `ziVA3whp3p4` is registered as the alternate AGC rewind export proven by its get-size,

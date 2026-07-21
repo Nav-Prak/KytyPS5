@@ -1039,54 +1039,11 @@ void TestBitFieldMaskDescriptor() {
 	      "maximum bit-field mask count/offset evaluated incorrectly");
 }
 
-// GTA V's GPU scan clear kernel (0x9039cfd00) assembles its tile-state buffer V# in registers:
-// dword1 starts with stride 0 and s_bitset1_b32 sets bit 19 to make the stride 8. Without modeling
-// BitSet the stride resolved to 0, so the idxen state-clear stores went out of bounds and dropped,
-// leaving the decoupled-lookback state buffer stale and hanging the scan.
-void TestBitSetDescriptorStride() {
-	Program program;
-	program.blocks.resize(1);
-	auto bitset      = MoveImmediate(4, 29, 0);
-	bitset.op        = Opcode::BitSetU32;
-	bitset.src[0]    = Imm(0x00000060u); // dword1 pre-patch: base_hi=0x60, stride bits clear
-	bitset.src[1]    = Imm(19u);         // stride bit 3 (16 + 3)
-	bitset.src_count = 2;
-	auto records      = MoveImmediate(8, 30, 0x00000004u); // dword2 = NumRecords
-	records.op        = Opcode::MoveU64;
-	program.blocks[0].instructions = {MoveImmediate(0, 28, 0x00006708u), bitset, records,
-	                                  BufferUse(12, 28)};
-
-	std::string      error;
-	const SrtRuntime runtime {{}, 0, nullptr, nullptr};
-	Check(BuildScalarProvenance(&program, &error) && BuildSrtPlan(&program, &error), error.c_str());
-	DescriptorValue descriptor;
-	Check(EvaluateDescriptorSource(program,
-	                               program.blocks[0].instructions.back().memory.resource_source,
-	                               16, runtime, &descriptor, &error),
-	      error.c_str());
-	Check(descriptor.dwords[1] == 0x00080060u,
-	      "s_bitset1_b32 stride patch was not modeled (stride resolved to 0)");
-	Check(descriptor.dwords[2] == 0x00000004u, "descriptor record count evaluated incorrectly");
-
-	// s_bitset0_b32 must clear the same bit back to stride 0.
-	bitset.op                      = Opcode::BitClearU32;
-	bitset.src[0]                  = Imm(0x00080060u);
-	program.blocks[0].instructions = {MoveImmediate(0, 28, 0x00006708u), bitset, records,
-	                                  BufferUse(12, 28)};
-	Check(BuildScalarProvenance(&program, &error) && BuildSrtPlan(&program, &error), error.c_str());
-	Check(EvaluateDescriptorSource(program,
-	                               program.blocks[0].instructions.back().memory.resource_source,
-	                               16, runtime, &descriptor, &error),
-	      error.c_str());
-	Check(descriptor.dwords[1] == 0x00000060u, "s_bitset0_b32 did not clear the stride bit");
-}
-
 } // namespace
 
 int main() {
 	try {
 		TestPerUseDescriptorDefinitions();
-		TestBitSetDescriptorStride();
 		TestCfgPhi();
 		TestDiamondReadPathsAreDynamic();
 		TestEquivalentConstantPhiIsStatic();

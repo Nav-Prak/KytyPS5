@@ -986,13 +986,12 @@ BindDescriptors(uint64_t submit_id, CommandBuffer* buffer,
 			ScanDiagRecordWrite(descriptor.Base48(), static_cast<uint64_t>(view.range),
 			                    program.shader_hash, 0u);
 		}
-		// Targeted diagnostic for the decoupled-lookback scan 0x9039cff00, its clear/init kernel
-		// 0x9039cfd00, and the sibling 0x9039ba900 whose s8 idxen store (V# stride patched by
-		// s_bitset1_b32 s9, 18 -> stride 4) started faulting once the BitSet provenance fix let it
-		// resolve. Log every buffer's raw resolved V# dwords, resolved base/stride/records, bound
-		// range, and leading guest contents to see where each runtime-assembled write V# resolves.
-		if (program.shader_hash == 0x9039cff00ull || program.shader_hash == 0x9039cfd00ull ||
-		    program.shader_hash == 0x9039ba900ull) {
+		// Targeted diagnostic for the decoupled-lookback scan 0x9039cff00 and its clear/init kernel
+		// 0x9039cfd00. The clear zeroes the counter (works) and the tile-state buffer via a
+		// runtime-assembled V# (s5 bit19 -> stride 8, s6 = partition count); the state clear is not
+		// landing, so log every buffer's raw resolved V# dwords, resolved base/stride/records, bound
+		// range, and leading guest contents to see where the state descriptor resolves.
+		if (program.shader_hash == 0x9039cff00ull || program.shader_hash == 0x9039cfd00ull) {
 			static std::atomic_uint scan_log {0};
 			if (scan_log.fetch_add(1, std::memory_order_relaxed) < 80) {
 				const auto& b = program.info.buffers[i];
@@ -1006,15 +1005,10 @@ BindDescriptors(uint64_t submit_id, CommandBuffer* buffer,
 				     descriptor.NumRecords(), static_cast<uint64_t>(view.range),
 				     static_cast<uint64_t>(view.offset));
 				// The CPU read enters the memory tracker's fault path, which synchronizes native
-				// bytes, so this reports the contents the dispatch actually starts from. For
-				// 0x9039ba900's buf[0] (the pointer-chasing loop's linked list, read-only) dump the
-				// full record range so the chain can be traced offline for a cycle (cycle => the
-				// device loss is a GPU hang, not an out-of-bounds access).
+				// bytes, so this reports the contents the dispatch actually starts from.
 				const auto     guest_base = descriptor.Base48();
-				const bool     linked_list = program.shader_hash == 0x9039ba900ull && i == 0;
-				const uint32_t dword_cap   = linked_list ? 176u : 12u;
-				const uint32_t dwords      = static_cast<uint32_t>(std::min<uint64_t>(
-                    static_cast<uint64_t>(view.range) / sizeof(uint32_t), dword_cap));
+				const uint32_t dwords     = static_cast<uint32_t>(std::min<uint64_t>(
+                    static_cast<uint64_t>(view.range) / sizeof(uint32_t), 12u));
 				if (guest_base != 0 && dwords > 0 &&
 				    HostMemoryRangeIsMapped(guest_base,
 				                            static_cast<uint64_t>(dwords) * sizeof(uint32_t))) {
@@ -1030,55 +1024,9 @@ BindDescriptors(uint64_t submit_id, CommandBuffer* buffer,
 					LOGF("ScanBufferBind 0x%09" PRIx64 ": buf[%u] guest@0x%012" PRIx64 " dwords:%s\n",
 					     program.shader_hash, i, guest_base, text.c_str());
 				}
-				// Name every op that recently wrote this buffer's memory: for the scan's tile-state
-				// array (0x9039cff00 buf[2]) and for 0x9039ba900's linked-list buf[0], whose contents
-				// determine whether the loop terminates. A now-landing write that formed a cycle
-				// would appear here as the buffer's most recent writer.
-				if (guest_base != 0 &&
-				    ((program.shader_hash == 0x9039cff00ull && i == 2) || linked_list)) {
+				// For the scan's tile-state array (buf[2]), name every op that recently wrote it.
+				if (program.shader_hash == 0x9039cff00ull && i == 2 && guest_base != 0) {
 					ScanDiagDumpOverlaps(guest_base, static_cast<uint64_t>(view.range));
-				}
-				// Trace 0x9039ba900's pointer-chasing loop in place: from each start index (the
-				// dispatch's thread ids) follow next = (buf0[i] >> 3) & 0x1ffffff, stopping when a
-				// node's value is exactly 7. An out-of-range index reads 0 (bounds-dropped load) ->
-				// next 0. A chain that does not reach value 7 within `records` steps has a cycle, so
-				// the guest loop spins forever -> the observed device loss is a GPU hang, and this
-				// names the first offending start index.
-				if (linked_list && guest_base != 0) {
-					const uint32_t records = descriptor.NumRecords();
-					if (records > 0 &&
-					    HostMemoryRangeIsMapped(
-					        guest_base, static_cast<uint64_t>(records) * sizeof(uint32_t))) {
-						const auto* list = reinterpret_cast<const uint32_t*>(guest_base);
-						const uint32_t starts = std::min(records, 64u);
-						uint32_t       terminate = 0, cycle = 0, first_cycle_start = UINT32_MAX;
-						for (uint32_t s = 0; s < starts; s++) {
-							uint32_t idx = s;
-							bool     hit7 = false;
-							for (uint32_t step = 0; step <= records; step++) {
-								const uint32_t value = idx < records ? list[idx] : 0u;
-								if (value == 7u) {
-									hit7 = true;
-									break;
-								}
-								idx = (value >> 3u) & 0x1ffffffu;
-							}
-							if (hit7) {
-								terminate++;
-							} else {
-								cycle++;
-								if (first_cycle_start == UINT32_MAX) {
-									first_cycle_start = s;
-								}
-							}
-						}
-						LOGF("ScanLinkedListTrace 0x9039ba900: records=%u starts=%u terminate=%u "
-						     "cycle=%u first_cycle_start=%d\n",
-						     records, starts, terminate, cycle,
-						     first_cycle_start == UINT32_MAX
-						         ? -1
-						         : static_cast<int>(first_cycle_start));
-					}
 				}
 			}
 		}

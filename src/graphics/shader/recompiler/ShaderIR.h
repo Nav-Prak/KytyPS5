@@ -521,8 +521,6 @@ enum class ScalarValueOp {
 	OrNot,
 	Xor,
 	Not,
-	BitSet,
-	BitClear,
 	ShiftLeft,
 	ShiftRight,
 	ShiftRightArithmetic,

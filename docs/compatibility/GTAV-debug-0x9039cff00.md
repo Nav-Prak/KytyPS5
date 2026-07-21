@@ -494,6 +494,29 @@ repeat index before reaching 7 is a cycle (confirms hang). The `ScanDiagOverlap`
 writer that formed it — the actual defect to fix (a now-landing store to buf[0]'s region, or its
 coherence).
 
+### CONFIRMED GPU HANG (2026-07-20): the s_bitset fix corrupts the linked list
+
+The in-emulator trace was decisive:
+
+```
+ScanLinkedListTrace 0x9039ba900: records=10349 starts=64 terminate=0 cycle=64 first_cycle_start=0
+```
+
+All 64 chains cycle, none reach the value-7 terminal, so `0x9039ba900`'s pointer-chasing loop spins
+forever -> GPU hang -> device loss. buf[0] is built by `0x903951200`, `0x90396a600`, and
+`0x903957400` (the `ScanDiagOverlap` writers). Since `0x9039ba900` completed before the `s_bitset`
+fix (the scan bound after it in the pre-fix run), the list terminated then and cycles now: making
+those writers' `s_bitset`-constructed write V#s resolve caused their stores to land, and the landed
+stores write pointers that form cycles instead of terminals. This run also hit a new null buffer
+view (`descriptorCache.cpp:90`) — the same cascade.
+
+**Assessment.** The `s_bitset` provenance fix is correct in isolation (unit-tested) and is required
+to clear the scan's tile-state buffer (blocker 52), but it destabilizes a tightly-coupled family of
+GPU-driven scan shaders: each landing write exposes the next latent runtime-V# resolution or buffer-
+coherence bug (corrupted linked list, null views). This is not converging shader-by-shader; the
+whole RAGE GPU-scan pipeline needs a coordinated correctness+coherence pass, or the fix should be
+held out of the active path until that work is scoped. Decision recorded per the session's choice.
+
 ### Diagnostic added (built, ran — served its purpose; can be removed later)
 
 Added targeted logging in `descriptors.cpp` `BindDescriptors` (the buffer loop): for

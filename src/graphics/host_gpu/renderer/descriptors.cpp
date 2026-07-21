@@ -986,12 +986,13 @@ BindDescriptors(uint64_t submit_id, CommandBuffer* buffer,
 			ScanDiagRecordWrite(descriptor.Base48(), static_cast<uint64_t>(view.range),
 			                    program.shader_hash, 0u);
 		}
-		// Targeted diagnostic for the decoupled-lookback scan 0x9039cff00 and its clear/init kernel
-		// 0x9039cfd00. The clear zeroes the counter (works) and the tile-state buffer via a
-		// runtime-assembled V# (s5 bit19 -> stride 8, s6 = partition count); the state clear is not
-		// landing, so log every buffer's raw resolved V# dwords, resolved base/stride/records, bound
-		// range, and leading guest contents to see where the state descriptor resolves.
-		if (program.shader_hash == 0x9039cff00ull || program.shader_hash == 0x9039cfd00ull) {
+		// Targeted diagnostic for the decoupled-lookback scan 0x9039cff00, its clear/init kernel
+		// 0x9039cfd00, and the sibling 0x9039ba900 whose s8 idxen store (V# stride patched by
+		// s_bitset1_b32 s9, 18 -> stride 4) started faulting once the BitSet provenance fix let it
+		// resolve. Log every buffer's raw resolved V# dwords, resolved base/stride/records, bound
+		// range, and leading guest contents to see where each runtime-assembled write V# resolves.
+		if (program.shader_hash == 0x9039cff00ull || program.shader_hash == 0x9039cfd00ull ||
+		    program.shader_hash == 0x9039ba900ull) {
 			static std::atomic_uint scan_log {0};
 			if (scan_log.fetch_add(1, std::memory_order_relaxed) < 80) {
 				const auto& b = program.info.buffers[i];

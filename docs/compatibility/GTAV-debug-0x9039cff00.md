@@ -428,6 +428,38 @@ to the counter base, possibly off by 8), that is a separate residual to chase; t
 necessary regardless. Once buf[2] reads zero and the scan clears, remove the `ScanBufferBind`,
 `scanDiag`, and CP-write diagnostics.
 
+## REGRESSION from the fix (2026-07-20): 0x9039ba900 now faults instead of dropping
+
+The BitSet fix retest lost the device earlier, at 76 shaders, on `0x9039ba900` (submit_seq 40646,
+`DispatchDirect(6,1,1)`) — before the scan family even bound (no `ScanBufferBind` output). This
+shader previously **completed**; the fix regressed it.
+
+Its decoded RDNA2 is a pointer-chasing loop that ends with two `idxen` stores:
+`buffer_store_dword v0, v2, s0` and `buffer_store_dword v1, v2, s8`. The **s8 store's V# dword1 is
+`s9`, patched by `s_bitset1_b32 s9, 18`** (bit 18 = stride bit 2 -> stride 4). Before the fix `s9`
+was `Unknown` -> stride 0 -> that store dropped harmlessly; the sibling `s0` store (dword1 = `s1`
+via `s_or_b32 s1,…,0x40000`, already modeled) always landed. After the fix the s8 store resolves
+stride 4 and lands. Its SPIR-V store *is* bounds-checked via `OpArrayLength` (buffers[2]/buffers[3]),
+so the fault means the bound buffer's length exceeds the real guest allocation, or the resolved
+**base** points at unmapped/wrong memory — the store passes the length check but hits bad host
+memory. My fix only changed the stride (0 -> 4); records (`s10 = s12`) and base (`s8`) are unchanged,
+so the exposed defect is in how that write buffer's base/size is resolved or clamped.
+
+The fix is correct and necessary (it clears the scan state buffer), so per the chosen path it stays
+in while the regression is diagnosed. `ScanBufferBind` now also logs `0x9039ba900` with each
+buffer's raw V# dwords, base/stride/records, bound range, and whether the base is mapped (guest
+dwords are printed only for a mapped range). Next run:
+
+```
+grep -aE "ScanBufferBind 0x9039ba900" _gtav.log
+```
+
+Compare the s0-store buffer (works) against the s8-store buffer (faults). Expected tells:
+- **base unmapped** (no `guest@… dwords:` line for it) -> the base register (`s8`) resolves to a
+  bad address; fix that V#'s base resolution.
+- **records/range huge vs a small allocation** -> the bound range exceeds the real guest buffer and
+  must be clamped to the mapped extent so a within-`OpArrayLength` store cannot fault.
+
 ### Diagnostic added (built, ran — served its purpose; can be removed later)
 
 Added targeted logging in `descriptors.cpp` `BindDescriptors` (the buffer loop): for

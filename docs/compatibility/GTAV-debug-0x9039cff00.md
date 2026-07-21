@@ -460,6 +460,40 @@ Compare the s0-store buffer (works) against the s8-store buffer (faults). Expect
 - **records/range huge vs a small allocation** -> the bound range exceeds the real guest buffer and
   must be clamped to the mapped extent so a within-`OpArrayLength` store cannot fault.
 
+### 0x9039ba900 binding dump (2026-07-20): buffers are fine — likely a GPU loop hang
+
+The retest compiled 80 shaders and dispatched `0x9039ba900` ~30 times before losing the device on
+one `DispatchDirect(1,1,1)` (submit_seq 41046). All four buffers resolve cleanly and mapped:
+
+```
+buf[0] read  base=0x60a8be05d8 stride=4 records=123 range=0x2c4  (linked list: 00000008 00000010 …)
+buf[1] read  base=0x60a5be0000 stride=64 records=61 range=0xf40
+buf[2] write base=0x60a5be1300 stride=4 records=62 range=0xf8   (guest still ffffffff)
+buf[3] write base=0x60a5be1400 stride=4 records=62 range=0xf8   (guest still ffffffff)
+```
+
+So nothing is out of bounds, and the write buffers stay `ffffffff` across every dispatch (the
+stores either drop by index/exec or write native-only). Kyty waits on each submission fence in
+order, so submit 41046 being the first to fail makes `0x9039ba900` the likely cause — and with clean
+buffers that points to a **GPU hang in its pointer-chasing loop** (guest PC `0x24`-`0x58`: it loads
+`buf[0][v1]`, takes `v1 = value[3:29]` as the next index, and loops until a node's value is exactly
+7). A cycle in that linked list spins forever -> TDR. buf[0] is read-only here and its V# is not
+`s_bitset`-built, so the hang must come from buf[0]'s *contents* changing — a now-landing write
+elsewhere forming a cycle.
+
+Diagnostic extended: `0x9039ba900` buf[0] now dumps its full record range (up to 176 dwords) so the
+chain can be traced offline for a cycle, and `ScanDiagDumpOverlaps` runs on buf[0] to name whatever
+recently wrote `0x…be05d8`. Next run:
+
+```
+grep -aE "ScanBufferBind 0x9039ba900: buf\[0\]|ScanDiagOverlap" _gtav.log | head -60
+```
+
+Trace the chain from each start index following `next = (value>>3)&0x1ffffff` until value==7; a
+repeat index before reaching 7 is a cycle (confirms hang). The `ScanDiagOverlap` lines name the
+writer that formed it — the actual defect to fix (a now-landing store to buf[0]'s region, or its
+coherence).
+
 ### Diagnostic added (built, ran — served its purpose; can be removed later)
 
 Added targeted logging in `descriptors.cpp` `BindDescriptors` (the buffer loop): for

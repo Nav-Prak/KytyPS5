@@ -1006,10 +1006,15 @@ BindDescriptors(uint64_t submit_id, CommandBuffer* buffer,
 				     descriptor.NumRecords(), static_cast<uint64_t>(view.range),
 				     static_cast<uint64_t>(view.offset));
 				// The CPU read enters the memory tracker's fault path, which synchronizes native
-				// bytes, so this reports the contents the dispatch actually starts from.
+				// bytes, so this reports the contents the dispatch actually starts from. For
+				// 0x9039ba900's buf[0] (the pointer-chasing loop's linked list, read-only) dump the
+				// full record range so the chain can be traced offline for a cycle (cycle => the
+				// device loss is a GPU hang, not an out-of-bounds access).
 				const auto     guest_base = descriptor.Base48();
-				const uint32_t dwords     = static_cast<uint32_t>(std::min<uint64_t>(
-                    static_cast<uint64_t>(view.range) / sizeof(uint32_t), 12u));
+				const bool     linked_list = program.shader_hash == 0x9039ba900ull && i == 0;
+				const uint32_t dword_cap   = linked_list ? 176u : 12u;
+				const uint32_t dwords      = static_cast<uint32_t>(std::min<uint64_t>(
+                    static_cast<uint64_t>(view.range) / sizeof(uint32_t), dword_cap));
 				if (guest_base != 0 && dwords > 0 &&
 				    HostMemoryRangeIsMapped(guest_base,
 				                            static_cast<uint64_t>(dwords) * sizeof(uint32_t))) {
@@ -1025,8 +1030,12 @@ BindDescriptors(uint64_t submit_id, CommandBuffer* buffer,
 					LOGF("ScanBufferBind 0x%09" PRIx64 ": buf[%u] guest@0x%012" PRIx64 " dwords:%s\n",
 					     program.shader_hash, i, guest_base, text.c_str());
 				}
-				// For the scan's tile-state array (buf[2]), name every op that recently wrote it.
-				if (program.shader_hash == 0x9039cff00ull && i == 2 && guest_base != 0) {
+				// Name every op that recently wrote this buffer's memory: for the scan's tile-state
+				// array (0x9039cff00 buf[2]) and for 0x9039ba900's linked-list buf[0], whose contents
+				// determine whether the loop terminates. A now-landing write that formed a cycle
+				// would appear here as the buffer's most recent writer.
+				if (guest_base != 0 &&
+				    ((program.shader_hash == 0x9039cff00ull && i == 2) || linked_list)) {
 					ScanDiagDumpOverlaps(guest_base, static_cast<uint64_t>(view.range));
 				}
 			}
